@@ -12,10 +12,11 @@ pub struct GitVersion {
 impl GitVersion {
     pub fn parse(output: &[u8]) -> Result<GitVersion> {
         let text = String::from_utf8_lossy(output);
-        let rest = text
-            .split_whitespace()
-            .nth(2)
-            .ok_or_else(|| GroveError::failure("cannot parse `git --version` output"))?;
+        let mut words = text.split_whitespace();
+        let rest = match (words.next(), words.next(), words.next()) {
+            (Some("git"), Some("version"), Some(rest)) => rest,
+            _ => return Err(GroveError::failure("cannot parse `git --version` output")),
+        };
         let mut parts = rest.split('.');
         let mut number = |name: &str| -> Result<u32> {
             parts.next().and_then(|p| p.parse().ok()).ok_or_else(|| {
@@ -24,7 +25,12 @@ impl GitVersion {
         };
         let major = number("major")?;
         let minor = number("minor")?;
-        let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let patch = match parts.next() {
+            Some(patch) => patch
+                .parse()
+                .map_err(|_| GroveError::failure("cannot parse the patch of `git --version`"))?,
+            None => 0,
+        };
         Ok(GitVersion {
             major,
             minor,
@@ -64,6 +70,18 @@ mod tests {
     #[test]
     fn rejects_unparsable_output() {
         let err = GitVersion::parse(b"not a version").unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Failure);
+    }
+
+    #[test]
+    fn rejects_nonnumeric_patch() {
+        let err = GitVersion::parse(b"git version 2.47.not-a-version\n").unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Failure);
+    }
+
+    #[test]
+    fn rejects_invalid_version_prefix() {
+        let err = GitVersion::parse(b"anything else 2.47.3\n").unwrap_err();
         assert_eq!(err.class, crate::error::ExitClass::Failure);
     }
 
