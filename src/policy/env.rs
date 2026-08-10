@@ -69,7 +69,8 @@ pub fn scan<I>(vars: I) -> Vec<Finding>
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    vars.into_iter()
+    let mut findings = vars
+        .into_iter()
         .filter_map(|(name, value)| {
             reason_for(&name).map(|reason| Finding {
                 name,
@@ -77,7 +78,13 @@ where
                 reason,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    findings.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    findings
 }
 
 pub fn sanitize(cmd: &mut Command) {
@@ -155,6 +162,30 @@ mod tests {
         assert_eq!(
             names,
             ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]
+        );
+    }
+
+    #[test]
+    fn returns_findings_in_stable_name_and_value_order() {
+        let findings = scan(vars(&[
+            ("GIT_WORK_TREE", "/worktree"),
+            ("GIT_CONFIG_KEY_1", "z.value"),
+            ("GIT_DIR", "/repository/.git"),
+            ("GIT_CONFIG_KEY_1", "a.value"),
+        ]));
+        let names_and_values: Vec<_> = findings
+            .into_iter()
+            .map(|finding| (finding.name, finding.value))
+            .collect();
+
+        assert_eq!(
+            names_and_values,
+            [
+                ("GIT_CONFIG_KEY_1".to_string(), "a.value".to_string()),
+                ("GIT_CONFIG_KEY_1".to_string(), "z.value".to_string()),
+                ("GIT_DIR".to_string(), "/repository/.git".to_string()),
+                ("GIT_WORK_TREE".to_string(), "/worktree".to_string()),
+            ]
         );
     }
 
