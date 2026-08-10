@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -9,6 +10,7 @@ use tempfile::TempDir;
 pub struct Sandbox {
     home: TempDir,
     work: TempDir,
+    path: OsString,
 }
 
 impl Sandbox {
@@ -16,6 +18,7 @@ impl Sandbox {
         Sandbox {
             home: TempDir::new().unwrap(),
             work: TempDir::new().unwrap(),
+            path: std::env::var_os("PATH").expect("PATH must be set"),
         }
     }
 
@@ -24,7 +27,9 @@ impl Sandbox {
     }
 
     fn apply_env(&self, cmd: &mut Command) {
-        cmd.env("HOME", self.home.path())
+        cmd.env_clear()
+            .env("PATH", &self.path)
+            .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -63,7 +68,9 @@ impl Sandbox {
     pub fn grove_in(&self, cwd: &Path, args: &[&str]) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::cargo_bin("git-grove").unwrap();
         cmd.current_dir(cwd).args(args);
-        cmd.env("HOME", self.home.path())
+        cmd.env_clear()
+            .env("PATH", &self.path)
+            .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
