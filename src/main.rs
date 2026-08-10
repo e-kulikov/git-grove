@@ -1,7 +1,7 @@
 pub mod error;
 
 use clap::Parser;
-use error::{ExitClass, GroveError};
+use error::{ExitClass, GroveError, Result};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -13,8 +13,20 @@ use std::process::ExitCode;
 struct Cli {}
 
 fn main() -> ExitCode {
-    let _cli = Cli::parse();
-    match run() {
+    let _cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if !err.use_stderr() {
+                err.exit();
+            }
+            return render(Err(GroveError::usage(err.to_string().trim_end())));
+        }
+    };
+    render(run())
+}
+
+fn render(result: Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::from(ExitClass::Ok.code()),
         Err(err) => {
             eprintln!("git-grove: {err}");
@@ -23,6 +35,6 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), GroveError> {
+fn run() -> Result<()> {
     Ok(())
 }

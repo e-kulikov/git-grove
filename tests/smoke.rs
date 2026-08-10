@@ -12,6 +12,16 @@ fn reports_its_version() {
 }
 
 #[test]
+fn reports_usage_errors_with_documented_exit_code_and_prefix() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["--definitely-invalid"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::starts_with("git-grove:"));
+}
+
+#[test]
 fn bare_origin_ignores_parent_git_configuration() {
     let sandbox = Sandbox::new();
     let origin = sandbox.bare_origin("origin");
