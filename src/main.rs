@@ -1,5 +1,7 @@
 pub mod error;
 #[allow(dead_code)]
+mod fsx;
+#[allow(dead_code)]
 mod git;
 #[allow(dead_code)]
 mod policy;
