@@ -1,4 +1,6 @@
 pub mod error;
+#[allow(dead_code)]
+mod policy;
 
 use clap::Parser;
 use error::{ExitClass, GroveError, Result};
