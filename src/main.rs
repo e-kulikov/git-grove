@@ -4,6 +4,8 @@ mod fsx;
 #[allow(dead_code)]
 mod git;
 #[allow(dead_code)]
+mod grove;
+#[allow(dead_code)]
 mod policy;
 
 use clap::Parser;

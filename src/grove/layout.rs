@@ -1,0 +1,385 @@
+use crate::error::{GroveError, Result};
+use crate::fsx;
+use rustix::fs::{fstat, mkdirat, openat, statat, AtFlags, Mode, OFlags, CWD};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
+
+pub const POINTER_CONTENTS: &str = "gitdir: ./.bare\n";
+pub const RESERVED: &[&str] = &[".bare", ".git", "AGENTS.md", "CLAUDE.md"];
+
+pub fn write_pointer(root: &Path) -> Result<()> {
+    fsx::write_atomic(&root.join(".git"), POINTER_CONTENTS.as_bytes())
+}
+
+/// A lexically contained, vacant worktree path tied to an open grove root.
+///
+/// Call [`Self::validate_vacant`] immediately before passing [`Self::path`] to
+/// a mutating Git command.
+#[derive(Debug)]
+pub struct ValidatedWorktreePath {
+    root_directory: File,
+    root_path: PathBuf,
+    relative: PathBuf,
+}
+
+impl ValidatedWorktreePath {
+    pub fn path(&self) -> PathBuf {
+        self.root_path.join(&self.relative)
+    }
+
+    pub fn relative(&self) -> &Path {
+        &self.relative
+    }
+
+    /// Repeat the descriptor-relative symlink and vacancy checks.
+    pub fn validate_vacant(&self) -> Result<()> {
+        validate_root_identity(&self.root_directory, &self.root_path)?;
+        validate_vacant_from(&self.root_directory, &self.path(), &self.relative)
+    }
+
+    /// Create only missing parent directories, relative to the held grove
+    /// descriptor, and finish by repeating the vacancy check.
+    pub fn create_parent_directories(&self) -> Result<()> {
+        validate_root_identity(&self.root_directory, &self.root_path)?;
+        let mut current = self.root_directory.try_clone().map_err(|error| {
+            GroveError::failure(format!(
+                "cannot duplicate grove directory descriptor: {error}"
+            ))
+        })?;
+        let mut components = self.relative.iter().peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                break;
+            }
+            current = match open_directory_at(&current, component) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match mkdirat(&current, component, Mode::from_raw_mode(0o755)) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                        Err(error) => {
+                            return Err(GroveError::failure(format!(
+                                "cannot create a worktree parent under {}: {error}",
+                                self.root_path.display()
+                            )))
+                        }
+                    }
+                    open_directory_at(&current, component).map_err(|error| {
+                        GroveError::usage(format!(
+                            "{} has a non-directory or symlinked ancestor: {error}",
+                            self.path().display()
+                        ))
+                    })?
+                }
+                Err(error) => {
+                    return Err(GroveError::usage(format!(
+                        "{} has a non-directory or symlinked ancestor: {error}",
+                        self.path().display()
+                    )))
+                }
+            };
+        }
+        self.validate_vacant()
+    }
+}
+
+pub fn contained_worktree_path(root: &Path, requested: &Path) -> Result<PathBuf> {
+    Ok(validate_worktree_path(root, requested)?.path())
+}
+
+/// Validate a worktree path and retain the grove directory descriptor so later
+/// callers can safely create parents and perform a final pre-mutation check.
+pub fn validate_worktree_path(root: &Path, requested: &Path) -> Result<ValidatedWorktreePath> {
+    let relative = contained_relative_path(root, requested)?;
+    let root_directory = openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        GroveError::usage(format!(
+            "cannot open grove root {} without following symlinks: {error}",
+            root.display()
+        ))
+    })?;
+    let validated = ValidatedWorktreePath {
+        root_directory,
+        root_path: root.to_path_buf(),
+        relative,
+    };
+    validated.validate_vacant()?;
+    Ok(validated)
+}
+
+fn contained_relative_path(root: &Path, requested: &Path) -> Result<PathBuf> {
+    let relative = if requested.is_absolute() {
+        requested.strip_prefix(root).map_err(|_| {
+            GroveError::usage(format!("{} is outside the grove", requested.display()))
+                .with_detail("worktrees must live under the grove root")
+        })?
+    } else {
+        requested
+    };
+
+    let mut cleaned = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(part) => {
+                if RESERVED.iter().any(|reserved| part == OsStr::new(reserved)) {
+                    return Err(GroveError::usage(format!(
+                        "{} is reserved by the grove layout",
+                        Path::new(part).display()
+                    )));
+                }
+                if part.as_bytes().starts_with(b".grove-adopt-") {
+                    return Err(GroveError::usage(
+                        "that name is reserved for adoption transactions",
+                    ));
+                }
+                cleaned.push(part);
+            }
+            _ => {
+                return Err(GroveError::usage(format!(
+                    "{} must be a plain path inside the grove",
+                    requested.display()
+                )))
+            }
+        }
+    }
+    if cleaned.as_os_str().is_empty() {
+        return Err(GroveError::usage(
+            "the worktree path must be a strict descendant of the grove root",
+        ));
+    }
+
+    Ok(cleaned)
+}
+
+fn validate_vacant_from(root: &File, absolute: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.try_clone().map_err(|error| {
+        GroveError::failure(format!(
+            "cannot duplicate grove directory descriptor: {error}"
+        ))
+    })?;
+    let mut components = relative.iter().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            return match statat(&current, component, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(_) => Err(GroveError::needs_decision(format!(
+                    "{} already exists",
+                    absolute.display()
+                ))
+                .with_detail(
+                    "pass an explicit directory argument to place the worktree elsewhere",
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(GroveError::failure(format!(
+                    "cannot inspect {}: {error}",
+                    absolute.display()
+                ))),
+            };
+        }
+
+        current = match open_directory_at(&current, component) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(GroveError::usage(format!(
+                    "{} has a non-directory or symlinked ancestor: {error}",
+                    absolute.display()
+                )))
+            }
+        };
+    }
+    unreachable!("contained paths always have a final component")
+}
+
+fn validate_root_identity(root: &File, root_path: &Path) -> Result<()> {
+    let held = fstat(root).map_err(|error| {
+        GroveError::failure(format!("cannot inspect held grove directory: {error}"))
+    })?;
+    let named = statat(CWD, root_path, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+        GroveError::usage(format!(
+            "grove root {} changed while preparing the worktree: {error}",
+            root_path.display()
+        ))
+    })?;
+    if held.st_dev != named.st_dev || held.st_ino != named.st_ino {
+        return Err(GroveError::usage(format!(
+            "grove root {} changed while preparing the worktree",
+            root_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn root() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".bare")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn accepts_a_plain_branch_directory() {
+        let dir = root();
+        let path = contained_worktree_path(dir.path(), Path::new("main")).unwrap();
+        assert_eq!(path, dir.path().join("main"));
+    }
+
+    #[test]
+    fn accepts_nested_absolute_and_non_utf8_descendants() {
+        let dir = root();
+        let nested = contained_worktree_path(dir.path(), Path::new("release/1.0")).unwrap();
+        assert_eq!(nested, dir.path().join("release/1.0"));
+
+        let absolute = dir.path().join("feature/main");
+        assert_eq!(
+            contained_worktree_path(dir.path(), &absolute).unwrap(),
+            absolute
+        );
+
+        let bytes = std::ffi::OsString::from_vec(vec![b'b', 0xff, b'r']);
+        let requested = PathBuf::from(bytes);
+        let accepted = contained_worktree_path(dir.path(), &requested).unwrap();
+        assert_eq!(
+            accepted.as_os_str().as_bytes(),
+            dir.path().join(requested).as_os_str().as_bytes()
+        );
+    }
+
+    #[test]
+    fn writes_the_exact_grove_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pointer(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join(".git")).unwrap(),
+            POINTER_CONTENTS.as_bytes()
+        );
+    }
+
+    #[test]
+    fn rejects_paths_that_are_not_strict_descendants() {
+        let dir = root();
+        let root = dir.path();
+        let outside = root.parent().unwrap().join("outside");
+        for bad in [
+            PathBuf::from(""),
+            PathBuf::from("."),
+            PathBuf::from(".."),
+            PathBuf::from("../outside"),
+            PathBuf::from("main/../.."),
+            root.to_path_buf(),
+            outside,
+        ] {
+            let err = contained_worktree_path(root, &bad).unwrap_err();
+            assert_eq!(
+                err.class,
+                crate::error::ExitClass::Usage,
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_layout_and_transaction_names_in_any_component() {
+        let dir = root();
+        for bad in [
+            ".bare",
+            ".git",
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".grove-adopt-main",
+            "nested/.git/worktree",
+            "nested/.grove-adopt-release/worktree",
+        ] {
+            let err = contained_worktree_path(dir.path(), Path::new(bad)).unwrap_err();
+            assert_eq!(err.class, crate::error::ExitClass::Usage, "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn rejects_any_occupied_final_entry_including_a_broken_symlink() {
+        for kind in ["directory", "file", "broken-symlink"] {
+            let dir = root();
+            let final_path = dir.path().join("main");
+            match kind {
+                "directory" => std::fs::create_dir(&final_path).unwrap(),
+                "file" => std::fs::write(&final_path, b"occupied").unwrap(),
+                "broken-symlink" => std::os::unix::fs::symlink("missing", &final_path).unwrap(),
+                _ => unreachable!(),
+            }
+
+            let err = contained_worktree_path(dir.path(), Path::new("main")).unwrap_err();
+            assert_eq!(
+                err.class,
+                crate::error::ExitClass::NeedsDecision,
+                "accepted {kind}"
+            );
+            assert!(err.message.contains("main"));
+        }
+    }
+
+    #[test]
+    fn rejects_a_symlinked_or_non_directory_ancestor() {
+        let dir = root();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("link")).unwrap();
+        let err = contained_worktree_path(dir.path(), Path::new("link/wt")).unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
+
+        std::fs::write(dir.path().join("file"), b"not a directory").unwrap();
+        let err = contained_worktree_path(dir.path(), Path::new("file/wt")).unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn final_validation_rejects_a_replaced_grove_root() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("grove");
+        std::fs::create_dir(&root).unwrap();
+        let validated = validate_worktree_path(&root, Path::new("main")).unwrap();
+
+        std::fs::rename(&root, base.path().join("moved")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let err = validated.validate_vacant().unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn creates_missing_parents_without_following_a_replacement_symlink() {
+        let dir = root();
+        let validated = validate_worktree_path(dir.path(), Path::new("release/1.0/main")).unwrap();
+        validated.create_parent_directories().unwrap();
+        assert!(dir.path().join("release/1.0").is_dir());
+        assert!(!dir.path().join("release/1.0/main").exists());
+
+        let attacked = root();
+        let outside = tempfile::tempdir().unwrap();
+        let validated = validate_worktree_path(attacked.path(), Path::new("release/main")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), attacked.path().join("release")).unwrap();
+        let err = validated.create_parent_directories().unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
+        assert!(!outside.path().join("main").exists());
+    }
+}
