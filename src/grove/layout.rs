@@ -35,8 +35,14 @@ impl ValidatedWorktreePath {
 
     /// Repeat the descriptor-relative symlink and vacancy checks.
     pub fn validate_vacant(&self) -> Result<()> {
+        self.validate_vacant_with_post_walk(|| {})
+    }
+
+    fn validate_vacant_with_post_walk(&self, post_walk: impl FnOnce()) -> Result<()> {
         validate_root_identity(&self.root_directory, &self.root_path)?;
-        validate_vacant_from(&self.root_directory, &self.path(), &self.relative)
+        validate_vacant_from(&self.root_directory, &self.path(), &self.relative)?;
+        post_walk();
+        validate_root_identity(&self.root_directory, &self.root_path)
     }
 
     /// Create only missing parent directories, relative to the held grove
@@ -363,6 +369,25 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
 
         let err = validated.validate_vacant().unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn final_validation_rechecks_root_identity_after_descendant_walk() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("grove");
+        let replacement = base.path().join("replacement");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        let validated = validate_worktree_path(&root, Path::new("main")).unwrap();
+
+        let err = validated
+            .validate_vacant_with_post_walk(|| {
+                std::fs::rename(&root, base.path().join("moved")).unwrap();
+                std::fs::rename(&replacement, &root).unwrap();
+            })
+            .unwrap_err();
+
         assert_eq!(err.class, crate::error::ExitClass::Usage);
     }
 
