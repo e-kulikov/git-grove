@@ -12,7 +12,7 @@ anstyle = "1"
 anyhow = "1"
 bstr = "1"
 clap = { version = "4", features = ["derive"] }
-getrandom = "0.4"
+getrandom = "0.2"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
