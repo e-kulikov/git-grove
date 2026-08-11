@@ -92,6 +92,8 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
         .collect();
     assert_eq!(actual, expected);
 
+    assert_archive_metadata(&first.join(archive_name), prefix);
+
     let modes = Command::new("tar")
         .args(["-tvzf", archive_name])
         .current_dir(&first)
@@ -120,6 +122,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
 
 fn run_packager(binary: &Path, destination: &Path) {
     let output = Command::new(repo_root().join("scripts/package-release.sh"))
+        .env("SOURCE_DATE_EPOCH", "946684800")
         .args([
             "0.1.0",
             binary.to_str().unwrap(),
@@ -132,4 +135,46 @@ fn run_packager(binary: &Path, destination: &Path) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn assert_archive_metadata(archive: &Path, prefix: &str) {
+    let output = Command::new("tar")
+        .env("LC_ALL", "C")
+        .env("TZ", "UTC")
+        .args([
+            "--numeric-owner",
+            "--full-time",
+            "-tvzf",
+            archive.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for line in String::from_utf8(output.stdout).unwrap().lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert!(fields.len() >= 6, "malformed tar listing: {line}");
+        let mode = fields[0];
+        let owner = fields[1];
+        let date = fields[3];
+        let time = fields[4];
+        let name = fields[5];
+
+        assert_eq!(owner, "0/0", "wrong archive owner: {line}");
+        assert_eq!(date, "2000-01-01", "wrong archive date: {line}");
+        assert_eq!(time, "00:00:00", "wrong archive time: {line}");
+
+        let expected_mode = if name.ends_with('/') {
+            "drwxr-xr-x"
+        } else if name == format!("{prefix}/git-grove") {
+            "-rwxr-xr-x"
+        } else {
+            "-rw-r--r--"
+        };
+        assert_eq!(mode, expected_mode, "wrong archive mode: {line}");
+    }
 }
