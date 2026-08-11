@@ -102,10 +102,28 @@ fn detached(
             OsString::from("worktree"),
             OsString::from("add"),
             OsString::from("--detach"),
+            OsString::from("--"),
             path.into_os_string(),
             revision,
         ],
     )
+}
+
+fn resolve_start(runner: &dyn GitRunner, grove: &Grove, revision: OsString) -> Result<OsString> {
+    let mut commit = revision;
+    commit.push("^{commit}");
+    let resolved = run_required(
+        runner,
+        Invocation::new().git_dir(grove.bare_dir()).args([
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--end-of-options"),
+            commit.as_os_str(),
+        ]),
+        "rev-parse --verify",
+    )?;
+    let oid = one_line(resolved.stdout, "start revision")?;
+    Ok(OsString::from_vec(oid.to_vec()))
 }
 
 fn add_branch(
@@ -142,6 +160,7 @@ fn add_branch(
         vec![
             OsString::from("worktree"),
             OsString::from("add"),
+            OsString::from("--"),
             path.into_os_string(),
             branch,
         ]
@@ -161,6 +180,7 @@ fn add_branch(
                 OsString::from("--track"),
                 OsString::from("-b"),
                 branch,
+                OsString::from("--"),
                 path.into_os_string(),
                 OsString::from_vec(candidate.to_vec()),
             ],
@@ -176,20 +196,25 @@ fn add_branch(
                 ))
                 .with_detail("choose a remote branch explicitly before retrying"));
             }
-            ([], Some(start)) => vec![
-                OsString::from("worktree"),
-                OsString::from("add"),
-                OsString::from("-b"),
-                branch,
-                path.into_os_string(),
-                start,
-            ],
+            ([], Some(start)) => {
+                let start = resolve_start(runner, grove, start)?;
+                vec![
+                    OsString::from("worktree"),
+                    OsString::from("add"),
+                    OsString::from("-b"),
+                    branch,
+                    OsString::from("--"),
+                    path.into_os_string(),
+                    start,
+                ]
+            }
             ([], None) if !query::has_any_commit(runner, grove)? => vec![
                 OsString::from("worktree"),
                 OsString::from("add"),
                 OsString::from("--orphan"),
                 OsString::from("-b"),
                 branch,
+                OsString::from("--"),
                 path.into_os_string(),
             ],
             ([], None) => {
@@ -258,6 +283,7 @@ mod tests {
                 },
                 OsString::from("worktree"),
                 OsString::from("add"),
+                OsString::from("--"),
                 grove.root.join("nested/worktree").into_os_string(),
                 OsString::from("release/1"),
             ]
@@ -300,6 +326,7 @@ mod tests {
                 OsString::from("--track"),
                 OsString::from("-b"),
                 OsString::from("topic"),
+                OsString::from("--"),
                 grove.root.join("topic").into_os_string(),
                 OsString::from("origin/topic"),
             ]
@@ -334,6 +361,7 @@ mod tests {
                 OsString::from("worktree"),
                 OsString::from("add"),
                 OsString::from("--detach"),
+                OsString::from("--"),
                 grove.root.join("detached-deadbee").into_os_string(),
                 OsString::from("main~2"),
             ]
@@ -348,8 +376,9 @@ mod tests {
                 vec![
                     OsString::from("-b"),
                     OsString::from("topic"),
+                    OsString::from("--"),
                     OsString::from("PATH"),
-                    OsString::from("main~1"),
+                    OsString::from("cafebabe"),
                 ],
             ),
             (
@@ -358,6 +387,7 @@ mod tests {
                     OsString::from("--orphan"),
                     OsString::from("-b"),
                     OsString::from("topic"),
+                    OsString::from("--"),
                     OsString::from("PATH"),
                 ],
             ),
@@ -367,14 +397,7 @@ mod tests {
             fake.push_response(output(0, b""));
             fake.push_response(output(1, b""));
             fake.push_response(output(0, b""));
-            fake.push_response(output(
-                0,
-                if has_commit {
-                    b"refs/heads/main\n"
-                } else {
-                    b""
-                },
-            ));
+            fake.push_response(output(0, if has_commit { b"cafebabe\n" } else { b"" }));
             fake.push_response(output(0, b""));
 
             run(
@@ -405,6 +428,22 @@ mod tests {
                 }
             }));
             assert_eq!(fake.calls().last().unwrap().argv_os(), expected);
+            if has_commit {
+                assert_eq!(
+                    fake.calls()[3].argv_os(),
+                    [
+                        {
+                            let mut flag = OsString::from("--git-dir=");
+                            flag.push(grove.bare_dir());
+                            flag
+                        },
+                        OsString::from("rev-parse"),
+                        OsString::from("--verify"),
+                        OsString::from("--end-of-options"),
+                        OsString::from("main~1^{commit}"),
+                    ]
+                );
+            }
         }
     }
 

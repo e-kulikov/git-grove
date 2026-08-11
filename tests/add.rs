@@ -503,3 +503,90 @@ fn preserves_non_utf8_branch_and_path_bytes() {
     );
     assert_eq!(head.stdout, b"topic-\xff\n");
 }
+
+fn install_option_shaped_revision(sandbox: &Sandbox, root: &Path) -> Vec<u8> {
+    let seed = sandbox.root().join("upstream-seed");
+    let older = sandbox.git(&seed, &["rev-parse", "HEAD"]).stdout;
+    std::fs::write(seed.join("README.md"), "newer\n").unwrap();
+    sandbox.git(&seed, &["add", "README.md"]);
+    sandbox.git(&seed, &["commit", "--quiet", "-m", "newer"]);
+    sandbox.git(&seed, &["push", "--quiet", "origin", "main"]);
+    sandbox.git(
+        root,
+        &[
+            "--git-dir",
+            root.join(".bare").to_str().unwrap(),
+            "fetch",
+            "--quiet",
+            "origin",
+        ],
+    );
+    sandbox.git(
+        root,
+        &[
+            "--git-dir",
+            root.join(".bare").to_str().unwrap(),
+            "update-ref",
+            "refs/heads/main",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let older_text = std::str::from_utf8(&older).unwrap().trim();
+    sandbox.git(
+        root,
+        &[
+            "--git-dir",
+            root.join(".bare").to_str().unwrap(),
+            "update-ref",
+            "refs/heads/--force",
+            older_text,
+        ],
+    );
+    older
+}
+
+#[test]
+fn treats_option_shaped_start_as_a_revision_after_the_path() {
+    let sandbox = Sandbox::new();
+    let root = grove_from_origin(&sandbox);
+    let older = install_option_shaped_revision(&sandbox, &root);
+
+    sandbox
+        .grove_in(&root, &["add", "topic", "--start=--force"])
+        .assert()
+        .success();
+
+    let head = sandbox.git(&root.join("topic"), &["rev-parse", "HEAD"]);
+    assert_eq!(head.stdout, older);
+}
+
+#[test]
+fn treats_option_shaped_detached_value_as_a_revision_after_the_path() {
+    let sandbox = Sandbox::new();
+    let root = grove_from_origin(&sandbox);
+    let older = install_option_shaped_revision(&sandbox, &root);
+
+    sandbox
+        .grove_in(&root, &["add", "--detach=--force", "detached-option"])
+        .assert()
+        .success();
+
+    let head = sandbox.git(&root.join("detached-option"), &["rev-parse", "HEAD"]);
+    assert_eq!(head.stdout, older);
+}
+
+#[test]
+fn reports_an_invalid_option_shaped_start_as_an_invalid_revision() {
+    let sandbox = Sandbox::new();
+    let root = grove_from_origin(&sandbox);
+
+    sandbox
+        .grove_in(&root, &["add", "topic", "--start=--not-a-ref"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("git rev-parse --verify"))
+        .stderr(predicates::str::contains(
+            r"Needed\x20a\x20single\x20revision",
+        ));
+    assert!(!root.join("topic").exists());
+}
