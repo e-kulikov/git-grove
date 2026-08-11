@@ -1,3 +1,6 @@
+use bstr::ByteSlice;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 
 pub const UNSAFE_VARIABLES: &[(&str, &str)] = &[
@@ -75,6 +78,29 @@ where
             reason_for(&name).map(|reason| Finding {
                 name,
                 value,
+                reason,
+            })
+        })
+        .collect::<Vec<_>>();
+    findings.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    findings
+}
+
+pub fn scan_os<I>(vars: I) -> Vec<Finding>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    let mut findings = vars
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = std::str::from_utf8(name.as_bytes()).ok()?;
+            reason_for(name).map(|reason| Finding {
+                name: name.to_string(),
+                value: value.as_bytes().escape_bytes().to_string(),
                 reason,
             })
         })
@@ -198,6 +224,19 @@ mod tests {
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
         ]));
         assert!(found.is_empty(), "unexpected findings: {found:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scans_non_utf8_values_without_panicking_or_losing_bytes() {
+        let findings = scan_os([(
+            OsString::from("GIT_DIR"),
+            OsString::from_vec(b"/redirected/\xff".to_vec()),
+        )]);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].name, "GIT_DIR");
+        assert_eq!(findings[0].value, r"/redirected/\xFF");
     }
 
     #[test]

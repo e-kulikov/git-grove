@@ -13,6 +13,10 @@ pub fn write_pointer(root: &Path) -> Result<()> {
     fsx::write_atomic(&root.join(".git"), POINTER_CONTENTS.as_bytes())
 }
 
+pub fn write_pointer_if_absent(root: &Path) -> Result<bool> {
+    fsx::write_atomic_if_absent(&root.join(".git"), POINTER_CONTENTS.as_bytes())
+}
+
 /// A lexically contained, vacant worktree path tied to an open grove root.
 ///
 /// Call [`Self::validate_vacant`] immediately before passing [`Self::path`] to
@@ -281,6 +285,16 @@ mod tests {
             std::fs::read(dir.path().join(".git")).unwrap(),
             POINTER_CONTENTS.as_bytes()
         );
+    }
+
+    #[test]
+    fn pointer_creation_never_replaces_a_concurrent_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let pointer = dir.path().join(".git");
+        std::fs::write(&pointer, b"foreign").unwrap();
+
+        assert!(!write_pointer_if_absent(dir.path()).unwrap());
+        assert_eq!(std::fs::read(pointer).unwrap(), b"foreign");
     }
 
     #[test]

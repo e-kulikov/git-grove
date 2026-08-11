@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 pub mod error;
 #[allow(dead_code)]
 mod fsx;
@@ -42,10 +43,22 @@ fn render(result: Result<()>) -> ExitCode {
 }
 
 fn run(cli: cli::Cli) -> Result<()> {
-    policy::platform::check_platform()?;
-    match cli.command {
+    let cli::Cli {
+        ignore_unsupported,
+        command,
+    } = cli;
+    match command {
         cli::Command::Clone { .. } => Err(GroveError::failure("clone is not implemented yet")),
-        cli::Command::Init { .. } => Err(GroveError::failure("init is not implemented yet")),
+        cli::Command::Init { dir, branch } => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            commands::init::run(&runner, dir, branch, &cwd).map(|_| ())
+        }
         cli::Command::Add(args) => {
             let _mode = args.resolve()?;
             Err(GroveError::failure("add is not implemented yet"))

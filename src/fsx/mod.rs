@@ -177,6 +177,26 @@ pub fn symlink_relative(link: &Path, target: &str) -> Result<()> {
     fsync_directory(&directory, parent)
 }
 
+/// Atomically create a relative symlink without replacing any directory entry.
+pub fn symlink_relative_if_absent(link: &Path, target: &str) -> Result<bool> {
+    match std::fs::symlink_metadata(link) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(link, "inspect existing path", error)),
+    }
+
+    let (parent, name) = split_path(link)?;
+    let directory = File::open(parent).map_err(|error| io(parent, "open directory", error))?;
+    match symlinkat(target, &directory, name) {
+        Ok(()) => {
+            fsync_directory(&directory, parent)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(io(link, "create symlink at", error)),
+    }
+}
+
 fn split_path(path: &Path) -> Result<(&Path, &OsStr)> {
     let name = path
         .file_name()
@@ -363,6 +383,16 @@ mod tests {
         assert!(!write_atomic_if_absent(&target, b"replacement").unwrap());
 
         assert_eq!(std::fs::read(&target).unwrap(), b"ours");
+    }
+
+    #[test]
+    fn creates_a_relative_symlink_only_when_the_destination_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+
+        assert!(symlink_relative_if_absent(&target, "AGENTS.md").unwrap());
+        assert!(!symlink_relative_if_absent(&target, "elsewhere").unwrap());
+        assert_eq!(std::fs::read_link(target).unwrap(), Path::new("AGENTS.md"));
     }
 
     #[test]
