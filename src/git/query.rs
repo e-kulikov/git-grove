@@ -340,7 +340,11 @@ pub fn worktrees(runner: &dyn GitRunner, grove: &Grove) -> Result<Vec<WorktreeRe
     let expected_bare = grove.bare_dir();
     let mut bare_records = records.iter().filter(|record| record.bare);
     match (bare_records.next(), bare_records.next()) {
-        (Some(record), None) if record.path == expected_bare => Ok(records),
+        (Some(record), None)
+            if record.path.as_os_str().as_bytes() == expected_bare.as_os_str().as_bytes() =>
+        {
+            Ok(records)
+        }
         _ => Err(GroveError::failure(
             "git returned an invalid bare pseudo-worktree record",
         )),
@@ -960,6 +964,9 @@ mod tests {
     fn rejects_wrong_duplicate_or_missing_canonical_bare_pseudo_rows() {
         for raw in [
             b"worktree /g/main\0bare\0\0".as_slice(),
+            b"worktree /g/.bare/\0bare\0\0",
+            b"worktree /g//.bare\0bare\0\0",
+            b"worktree /g/./.bare\0bare\0\0",
             b"worktree /g/.bare\0bare\0\0worktree /g/.bare\0bare\0\0",
             b"worktree /g/main\0HEAD abc\0branch refs/heads/main\0\0",
         ] {
