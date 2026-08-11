@@ -1,3 +1,4 @@
+pub mod clone_options;
 pub mod env;
 pub mod platform;
 
