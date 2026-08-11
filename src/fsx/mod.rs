@@ -1,5 +1,8 @@
 use crate::error::{GroveError, Result};
-use rustix::fs::{linkat, openat, readlinkat, renameat, symlinkat, AtFlags, Mode, OFlags};
+use rustix::fs::{
+    linkat, openat, readlinkat, renameat, renameat_with, symlinkat, AtFlags, Mode, OFlags,
+    RenameFlags,
+};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Write;
@@ -31,6 +34,86 @@ pub fn fsync_dir(path: &Path) -> Result<()> {
 
 pub fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
     write_atomic_with_strategy(path, contents, TempStrategy::Auto)
+}
+
+/// Atomically create `path` when it has no directory entry.
+///
+/// Returns `Ok(false)` when an entry was already present before the creation
+/// attempt. If an entry appears while creating the temporary file, the final
+/// no-replace operation preserves it and returns an error.
+pub fn write_atomic_if_absent(path: &Path, contents: &[u8]) -> Result<bool> {
+    write_atomic_if_absent_with_strategy(path, contents, TempStrategy::Auto, || {})
+}
+
+fn write_atomic_if_absent_with_strategy<F>(
+    path: &Path,
+    contents: &[u8],
+    strategy: TempStrategy,
+    before_install: F,
+) -> Result<bool>
+where
+    F: FnOnce(),
+{
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io(path, "inspect existing path", error)),
+    }
+
+    let (parent, destination) = split_path(path)?;
+    let directory = File::open(parent).map_err(|error| io(parent, "open directory", error))?;
+    let mut temporary = create_temporary(&directory, parent, strategy)?;
+
+    if let Err(error) = temporary.file.write_all(contents) {
+        return Err(retain_temporary(
+            io(path, "write temporary file", error),
+            &temporary,
+            &directory,
+            parent,
+        ));
+    }
+    if let Err(error) = temporary.file.sync_all() {
+        return Err(retain_temporary(
+            io(path, "fsync temporary file", error),
+            &temporary,
+            &directory,
+            parent,
+        ));
+    }
+
+    before_install();
+    match &temporary.name {
+        None => {
+            if let Err(error) = linkat(
+                &temporary.file,
+                "",
+                &directory,
+                destination,
+                AtFlags::EMPTY_PATH,
+            ) {
+                return Err(io(path, "create without replacing an existing path", error));
+            }
+        }
+        Some(name) => {
+            if let Err(error) = renameat_with(
+                &directory,
+                name,
+                &directory,
+                destination,
+                RenameFlags::NOREPLACE,
+            ) {
+                return Err(retain_temporary(
+                    io(path, "rename into place without replacement", error),
+                    &temporary,
+                    &directory,
+                    parent,
+                ));
+            }
+        }
+    }
+
+    fsync_directory(&directory, parent)?;
+    Ok(true)
 }
 
 fn write_atomic_with_strategy(path: &Path, contents: &[u8], strategy: TempStrategy) -> Result<()> {
@@ -269,6 +352,47 @@ mod tests {
         write_atomic(&target, b"two").unwrap();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"two");
+    }
+
+    #[test]
+    fn creates_a_file_only_when_the_destination_remains_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+
+        assert!(write_atomic_if_absent(&target, b"ours").unwrap());
+        assert!(!write_atomic_if_absent(&target, b"replacement").unwrap());
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"ours");
+    }
+
+    #[test]
+    fn no_replace_creation_preserves_an_entry_created_after_its_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+
+        let error =
+            write_atomic_if_absent_with_strategy(&target, b"ours", TempStrategy::NamedOnly, || {
+                std::fs::write(&target, b"foreign").unwrap()
+            })
+            .unwrap_err();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+        assert!(error
+            .message
+            .contains("rename into place without replacement"));
+    }
+
+    #[test]
+    fn no_replace_creation_preserves_a_broken_link_created_after_its_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("AGENTS.md");
+
+        write_atomic_if_absent_with_strategy(&target, b"ours", TempStrategy::NamedOnly, || {
+            std::os::unix::fs::symlink("foreign", &target).unwrap()
+        })
+        .unwrap_err();
+
+        assert_eq!(std::fs::read_link(&target).unwrap(), Path::new("foreign"));
     }
 
     #[test]

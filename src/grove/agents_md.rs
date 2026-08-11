@@ -19,12 +19,38 @@ fn display(bytes: &BString) -> String {
     bytes.as_slice().escape_bytes().to_string()
 }
 
+fn is_scp_style_url(bytes: &[u8]) -> bool {
+    let Some(at) = bytes.iter().position(|byte| *byte == b'@') else {
+        return false;
+    };
+    let (user, host_and_path) = bytes.split_at(at);
+    let host_and_path = &host_and_path[1..];
+    let Some(colon) = host_and_path.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    let (host, path) = host_and_path.split_at(colon);
+    let path = &path[1..];
+
+    !user.is_empty()
+        && !user.contains(&b':')
+        && !user.contains(&b'/')
+        && !host.is_empty()
+        && !host.contains(&b'/')
+        && !path.is_empty()
+}
+
 fn display_remote(remote: &BString) -> String {
-    let remote = display(remote);
-    if remote.contains("://") || remote.contains('@') {
+    let bytes = remote.as_slice();
+    if bytes.windows(3).any(|part| part == b"://")
+        || bytes
+            .iter()
+            .position(|byte| *byte == b'@')
+            .is_some_and(|at| bytes[..at].contains(&b':'))
+        || is_scp_style_url(bytes)
+    {
         "[redacted remote]".to_string()
     } else {
-        remote
+        display(remote)
     }
 }
 
@@ -105,9 +131,7 @@ fn path_is_absent(path: &Path) -> Result<bool> {
 
 pub fn write(grove: &Grove, facts: &Facts) -> Result<()> {
     let agents = grove.root.join("AGENTS.md");
-    if path_is_absent(&agents)? {
-        fsx::write_atomic(&agents, render(facts).as_bytes())?;
-    }
+    fsx::write_atomic_if_absent(&agents, render(facts).as_bytes())?;
 
     let claude = grove.root.join("CLAUDE.md");
     if path_is_absent(&claude)? {
@@ -183,6 +207,14 @@ mod tests {
     }
 
     #[test]
+    fn preserves_a_valid_remote_name_containing_an_at_sign() {
+        let mut facts = facts();
+        facts.remote = Some(BString::from("origin@mirror"));
+
+        assert!(render(&facts).contains("origin@mirror/<branch>"));
+    }
+
+    #[test]
     fn states_when_a_grove_is_unpublished_without_a_tracking_expression() {
         let mut facts = facts();
         facts.published = false;
@@ -210,6 +242,28 @@ mod tests {
 
         assert!(!text.contains("://"));
         assert!(!text.contains("alice:secret"));
+    }
+
+    #[test]
+    fn redacts_a_credential_shaped_remote_without_redacting_an_at_sign() {
+        let mut facts = facts();
+        facts.remote = Some(BString::from("alice:secret@mirror"));
+
+        let text = render(&facts);
+
+        assert!(!text.contains("alice:secret"));
+        assert!(text.contains("[redacted remote]"));
+    }
+
+    #[test]
+    fn redacts_an_scp_style_url_without_redacting_an_at_sign() {
+        let mut facts = facts();
+        facts.remote = Some(BString::from("git@github.example:owner/repository"));
+
+        let text = render(&facts);
+
+        assert!(!text.contains("github.example"));
+        assert!(text.contains("[redacted remote]"));
     }
 
     #[test]
