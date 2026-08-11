@@ -46,7 +46,10 @@ fn run(cli: cli::Cli) -> Result<()> {
     match cli.command {
         cli::Command::Clone { .. } => Err(GroveError::failure("clone is not implemented yet")),
         cli::Command::Init { .. } => Err(GroveError::failure("init is not implemented yet")),
-        cli::Command::Add { .. } => Err(GroveError::failure("add is not implemented yet")),
+        cli::Command::Add(args) => {
+            let _mode = args.resolve()?;
+            Err(GroveError::failure("add is not implemented yet"))
+        }
         cli::Command::List { .. } => Err(GroveError::failure("list is not implemented yet")),
         cli::Command::Completion { shell } => {
             let mut command = cli::Cli::command();

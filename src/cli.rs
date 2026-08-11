@@ -1,6 +1,6 @@
 use crate::error::{GroveError, Result};
 use crate::grove::discover::Grove;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -74,16 +74,7 @@ pub enum Command {
     },
     /// Add a worktree for a branch
     #[command(visible_alias = "sprout")]
-    Add {
-        branch: Option<OsString>,
-        dir: Option<PathBuf>,
-        /// Start point for a branch that does not exist yet
-        #[arg(long = "start")]
-        start: Option<OsString>,
-        /// Check out a revision without a branch
-        #[arg(long = "detach", conflicts_with = "start")]
-        detach: Option<OsString>,
-    },
+    Add(AddArgs),
     /// Show the grove and the state of every worktree
     #[command(visible_alias = "survey")]
     List {
@@ -93,6 +84,60 @@ pub enum Command {
     },
     /// Generate shell completion code
     Completion { shell: CompletionShell },
+}
+
+#[derive(Args, Debug)]
+pub struct AddArgs {
+    #[arg(value_name = "BRANCH_OR_DIR", num_args = 0..=2)]
+    positionals: Vec<OsString>,
+    /// Start point for a branch that does not exist yet
+    #[arg(long = "start", conflicts_with = "detach")]
+    start: Option<OsString>,
+    /// Check out a revision without a branch
+    #[arg(long = "detach", value_name = "REVISION")]
+    detach: Option<OsString>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AddMode {
+    Branch {
+        branch: OsString,
+        dir: Option<PathBuf>,
+        start: Option<OsString>,
+    },
+    Detached {
+        revision: OsString,
+        dir: Option<PathBuf>,
+    },
+}
+
+impl AddArgs {
+    pub fn resolve(self) -> Result<AddMode> {
+        if let Some(revision) = self.detach {
+            let dir = match self.positionals.as_slice() {
+                [] => None,
+                [dir] => Some(PathBuf::from(dir)),
+                _ => {
+                    return Err(GroveError::usage(
+                        "`add --detach <revision>` accepts at most one directory",
+                    ))
+                }
+            };
+            return Ok(AddMode::Detached { revision, dir });
+        }
+
+        let (branch, dir) = match self.positionals.as_slice() {
+            [] => return Err(GroveError::usage("`add` requires a branch")),
+            [branch] => (branch.clone(), None),
+            [branch, dir] => (branch.clone(), Some(PathBuf::from(dir))),
+            _ => unreachable!("clap limits add to two positional arguments"),
+        };
+        Ok(AddMode::Branch {
+            branch,
+            dir,
+            start: self.start,
+        })
+    }
 }
 
 fn is_known(arg: &OsStr) -> bool {
@@ -136,51 +181,84 @@ fn is_scp_locator(bytes: &[u8]) -> bool {
 
 fn is_explicit_path(bytes: &[u8], path: &Path) -> bool {
     path.is_absolute()
-        || bytes == b"~"
-        || bytes.starts_with(b"~/")
+        || bytes.starts_with(b"~")
         || bytes.starts_with(b"./")
         || bytes.starts_with(b"../")
 }
 
-fn is_existing_repository(path: &Path) -> bool {
-    path.join(".git").exists() || (path.join("HEAD").is_file() && path.join("objects").is_dir())
+fn is_real_directory(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
-fn looks_like_locator(arg: &OsStr, cwd: &Path) -> bool {
+fn is_real_file(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn has_git_structure(git_dir: &Path) -> bool {
+    is_real_directory(git_dir)
+        && is_real_file(&git_dir.join("HEAD"))
+        && is_real_directory(&git_dir.join("objects"))
+}
+
+fn is_existing_repository(path: &Path) -> bool {
+    is_real_directory(path) && (has_git_structure(&path.join(".git")) || has_git_structure(path))
+}
+
+fn looks_like_explicit_locator(arg: &OsStr) -> bool {
     let bytes = locator_bytes(arg);
     let path = Path::new(arg);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    has_scheme(bytes)
-        || is_scp_locator(bytes)
-        || is_explicit_path(bytes, path)
-        || is_existing_repository(&candidate)
+    has_scheme(bytes) || is_scp_locator(bytes) || is_explicit_path(bytes, path)
 }
 
 /// Apply the default-action rules before clap sees the arguments.
 pub fn normalize(argv: Vec<OsString>) -> Result<Vec<OsString>> {
-    let cwd = std::env::current_dir().map_err(|error| {
-        GroveError::failure(format!("cannot determine current directory: {error}"))
-    })?;
-    normalize_from(argv, &cwd)
+    normalize_with(argv, || {
+        std::env::current_dir().map_err(|error| {
+            GroveError::failure(format!("cannot determine current directory: {error}"))
+        })
+    })
 }
 
-fn normalize_from(mut argv: Vec<OsString>, cwd: &Path) -> Result<Vec<OsString>> {
-    match argv.get(1) {
+#[cfg(test)]
+fn normalize_from(argv: Vec<OsString>, cwd: &Path) -> Result<Vec<OsString>> {
+    normalize_with(argv, || Ok(cwd.to_path_buf()))
+}
+
+fn normalize_with<F>(mut argv: Vec<OsString>, cwd: F) -> Result<Vec<OsString>>
+where
+    F: FnOnce() -> Result<PathBuf>,
+{
+    let command_index = argv
+        .iter()
+        .skip(1)
+        .take_while(|arg| *arg == OsStr::new("--ignore-unsupported"))
+        .count()
+        + 1;
+    match argv.get(command_index) {
         None => {
-            Grove::discover(cwd)?;
+            Grove::discover(&cwd()?)?;
             argv.push(OsString::from("list"));
             Ok(argv)
         }
         Some(first) if first.as_encoded_bytes().starts_with(b"-") || is_known(first) => Ok(argv),
-        Some(first) if looks_like_locator(first, cwd) => {
-            argv.insert(1, OsString::from("clone"));
+        Some(first) if looks_like_explicit_locator(first) => {
+            argv.insert(command_index, OsString::from("clone"));
             Ok(argv)
         }
         Some(first) => {
+            let cwd = cwd()?;
+            let path = Path::new(first);
+            let candidate = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            if is_existing_repository(&candidate) {
+                argv.insert(command_index, OsString::from("clone"));
+                return Ok(argv);
+            }
             let display = first.to_string_lossy();
             Err(GroveError::usage(format!(
                 "`{display}` is neither a command nor a repository location"
@@ -239,6 +317,7 @@ mod tests {
             "./r",
             "../r",
             "~/src/r",
+            "~other/src/r",
         ] {
             assert_eq!(
                 norm(cwd.path(), &[locator]),
@@ -254,14 +333,42 @@ mod tests {
         let repository = cwd.path().join("repository");
         std::fs::create_dir(&repository).unwrap();
         std::fs::create_dir(repository.join(".git")).unwrap();
-        let input = vec![
-            OsString::from("git-grove"),
-            repository.as_os_str().to_owned(),
-        ];
+        std::fs::write(repository.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(repository.join(".git/objects")).unwrap();
+        let input = vec![OsString::from("git-grove"), OsString::from("repository")];
         let mut expected = input.clone();
         expected.insert(1, OsString::from("clone"));
 
         assert_eq!(normalize_from(input, cwd.path()).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_empty_and_symlinked_git_markers_as_existing_repositories() {
+        let cwd = tempfile::tempdir().unwrap();
+
+        let empty = cwd.path().join("empty");
+        std::fs::create_dir_all(empty.join(".git")).unwrap();
+        let empty_err = normalize_from(
+            vec![OsString::from("git-grove"), OsString::from("empty")],
+            cwd.path(),
+        )
+        .unwrap_err();
+        assert_eq!(empty_err.class, crate::error::ExitClass::Usage);
+
+        let target = cwd.path().join("git-target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(target.join("objects")).unwrap();
+        let linked = cwd.path().join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::os::unix::fs::symlink(&target, linked.join(".git")).unwrap();
+        let linked_err = normalize_from(
+            vec![OsString::from("git-grove"), OsString::from("linked")],
+            cwd.path(),
+        )
+        .unwrap_err();
+        assert_eq!(linked_err.class, crate::error::ExitClass::Usage);
     }
 
     #[test]
@@ -299,6 +406,37 @@ mod tests {
     }
 
     #[test]
+    fn help_and_version_do_not_look_up_the_current_directory() {
+        for flag in ["--help", "-h", "--version", "-V"] {
+            let normalized = normalize_with(argv(&[flag]), || {
+                panic!("help and version must not inspect the current directory")
+            })
+            .unwrap();
+            assert_eq!(normalized, argv(&[flag]));
+        }
+    }
+
+    #[test]
+    fn expands_implicit_actions_after_the_leading_global_override() {
+        let cwd = tempfile::tempdir().unwrap();
+        assert_eq!(
+            norm(cwd.path(), &["--ignore-unsupported", "https://host/x.git"]),
+            argv(&["--ignore-unsupported", "clone", "https://host/x.git"])
+        );
+
+        std::fs::create_dir(cwd.path().join(".bare")).unwrap();
+        std::fs::write(
+            cwd.path().join(".git"),
+            crate::grove::layout::POINTER_CONTENTS,
+        )
+        .unwrap();
+        assert_eq!(
+            norm(cwd.path(), &["--ignore-unsupported"]),
+            argv(&["--ignore-unsupported", "list"])
+        );
+    }
+
+    #[test]
     fn accepts_the_global_policy_override_for_every_lifecycle_command() {
         for args in [
             vec!["clone", "origin", "--ignore-unsupported"],
@@ -319,6 +457,55 @@ mod tests {
             assert!(Cli::try_parse_from(["git-grove", "completion", shell]).is_ok());
         }
         assert!(Cli::try_parse_from(["git-grove", "completion", "powershell"]).is_err());
+    }
+
+    fn parsed_add(args: &[&str]) -> AddArgs {
+        let parsed =
+            Cli::try_parse_from(std::iter::once("git-grove").chain(args.iter().copied())).unwrap();
+        match parsed.command {
+            Command::Add(args) => args,
+            other => panic!("parsed the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolves_branch_add_with_an_optional_directory() {
+        assert_eq!(
+            parsed_add(&["add", "topic", "worktrees/topic"])
+                .resolve()
+                .unwrap(),
+            AddMode::Branch {
+                branch: OsString::from("topic"),
+                dir: Some(PathBuf::from("worktrees/topic")),
+                start: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resolves_detached_add_without_consuming_its_directory_as_a_branch() {
+        assert_eq!(
+            parsed_add(&["add", "--detach", "HEAD~1", "inspections/previous"])
+                .resolve()
+                .unwrap(),
+            AddMode::Detached {
+                revision: OsString::from("HEAD~1"),
+                dir: Some(PathBuf::from("inspections/previous")),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_missing_or_ambiguous_add_positionals() {
+        let missing_branch = parsed_add(&["add"]).resolve().unwrap_err();
+        assert_eq!(missing_branch.class, crate::error::ExitClass::Usage);
+
+        let detached_excess = parsed_add(&["add", "--detach", "HEAD", "one", "two"])
+            .resolve()
+            .unwrap_err();
+        assert_eq!(detached_excess.class, crate::error::ExitClass::Usage);
+
+        assert!(Cli::try_parse_from(["git-grove", "add", "one", "two", "three"]).is_err());
     }
 
     #[cfg(unix)]

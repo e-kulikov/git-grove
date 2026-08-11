@@ -80,6 +80,64 @@ fn defaults_to_list_only_when_inside_a_grove() {
 }
 
 #[test]
+fn applies_implicit_actions_after_the_global_policy_override() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["--ignore-unsupported", "https://host/example.git"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("clone is not implemented yet"));
+
+    std::fs::create_dir(sandbox.root().join(".bare")).unwrap();
+    std::fs::write(sandbox.root().join(".git"), "gitdir: ./.bare\n").unwrap();
+    sandbox
+        .grove(&["--ignore-unsupported"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("list is not implemented yet"));
+}
+
+#[test]
+fn rejects_invalid_add_shapes_with_usage_code() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["add"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("requires a branch"));
+    sandbox
+        .grove(&["add", "--detach", "HEAD", "one", "two"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("accepts at most one directory"));
+}
+
+#[test]
+fn does_not_treat_an_empty_git_marker_as_an_existing_repository() {
+    let sandbox = Sandbox::new();
+    let candidate = sandbox.root().join("candidate");
+    std::fs::create_dir(&candidate).unwrap();
+    std::fs::write(candidate.join(".git"), "").unwrap();
+    sandbox
+        .grove(&["candidate"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains(
+            "neither a command nor a repository location",
+        ));
+}
+
+#[test]
+fn accepts_a_tilde_user_locator_as_an_implicit_clone() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["~other/src/repository"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("clone is not implemented yet"));
+}
+
+#[test]
 fn bare_origin_ignores_parent_git_configuration() {
     let sandbox = Sandbox::new();
     let origin = sandbox.bare_origin("origin");
