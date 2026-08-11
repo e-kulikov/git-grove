@@ -556,6 +556,55 @@ fn remote_head_branch(runner: &dyn GitRunner, bare: &Path, remote: &OsStr) -> Re
             escaped(&target),
         ));
     }
+
+    let exact = runner.run(Invocation::new().git_dir(bare).args([
+        OsStr::new("show-ref"),
+        OsStr::new("--verify"),
+        OsStr::new("--hash"),
+        OsStr::new("--"),
+        OsStr::from_bytes(&target),
+    ]))?;
+    if exact.status == 1 {
+        return Err(GroveError::failure(format!(
+            "remote HEAD target {} does not exist",
+            escaped(&target)
+        )));
+    }
+    if !exact.ok() {
+        return Err(GroveError::failure(format!(
+            "git show-ref failed while verifying remote HEAD target {}",
+            escaped(&target)
+        ))
+        .with_detail(escaped(&exact.stderr)));
+    }
+    let expected_oid = trim_one_line(exact.stdout, "remote HEAD target object ID")?;
+    let mut commit = OsString::from_vec(target.clone());
+    commit.push("^{commit}");
+    let resolved_oid = trim_one_line(
+        required(
+            runner,
+            Invocation::new().git_dir(bare).args([
+                OsStr::new("rev-parse"),
+                OsStr::new("--verify"),
+                OsStr::new("--end-of-options"),
+                commit.as_os_str(),
+            ]),
+            "rev-parse remote HEAD target",
+        )?
+        .stdout,
+        "resolved remote HEAD target object ID",
+    )?;
+    if resolved_oid != expected_oid {
+        return Err(GroveError::failure(format!(
+            "remote HEAD target {} resolved to an unexpected object",
+            escaped(&target)
+        ))
+        .with_detail(format!(
+            "expected {}, found {}",
+            escaped(&expected_oid),
+            escaped(&resolved_oid)
+        )));
+    }
     Ok(OsString::from_vec(branch.to_vec()))
 }
 
@@ -916,19 +965,29 @@ mod tests {
         );
     }
 
-    struct AfterClone {
+    #[derive(Clone, Copy)]
+    enum Trigger {
+        Clone,
+        RemoteSetHead,
+    }
+
+    struct AfterGit {
         real: RealGit,
+        trigger: Trigger,
         action: RefCell<Option<Box<dyn FnOnce()>>>,
     }
 
-    impl GitRunner for AfterClone {
+    impl GitRunner for AfterGit {
         fn run(&self, invocation: Invocation) -> Result<GitOutput> {
-            let is_clone = invocation
-                .argv_os()
-                .first()
-                .is_some_and(|argument| argument == "clone");
+            let argv = invocation.argv_os();
+            let matches = match self.trigger {
+                Trigger::Clone => argv.first().is_some_and(|argument| argument == "clone"),
+                Trigger::RemoteSetHead => argv
+                    .windows(2)
+                    .any(|arguments| arguments[0] == "remote" && arguments[1] == "set-head"),
+            };
             let output = self.real.run(invocation)?;
-            if is_clone && output.ok() {
+            if matches && output.ok() {
                 if let Some(action) = self.action.borrow_mut().take() {
                     action();
                 }
@@ -997,14 +1056,16 @@ mod tests {
         origin
     }
 
-    fn run_with_after_clone(
+    fn execute_with_action(
         parent: &Path,
         target: &Path,
+        trigger: Trigger,
         action: impl FnOnce() + 'static,
-    ) -> GroveError {
+    ) -> Result<Grove> {
         let origin = origin(parent);
-        let runner = AfterClone {
+        let runner = AfterGit {
             real: RealGit::new(),
+            trigger,
             action: RefCell::new(Some(Box::new(action))),
         };
         run(
@@ -1015,7 +1076,21 @@ mod tests {
             clone_options::classify(&[]).unwrap(),
             parent,
         )
-        .unwrap_err()
+    }
+
+    fn run_with_after_clone(
+        parent: &Path,
+        target: &Path,
+        action: impl FnOnce() + 'static,
+    ) -> GroveError {
+        execute_with_action(parent, target, Trigger::Clone, action).unwrap_err()
+    }
+
+    fn assert_layout_was_not_written(target: &Path) {
+        assert!(!target.join(".git").exists());
+        assert!(!target.join("AGENTS.md").exists());
+        assert!(!target.join("CLAUDE.md").exists());
+        assert!(!target.join("main").exists());
     }
 
     #[test]
@@ -1091,5 +1166,179 @@ mod tests {
         assert_eq!(error.class, crate::error::ExitClass::NeedsDecision);
         assert!(error.message.contains("object directory outside .bare"));
         assert!(external.is_dir());
+    }
+
+    #[test]
+    fn dangling_remote_head_target_stops_before_layout_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("grove");
+        let action_target = target.clone();
+        let error =
+            execute_with_action(parent.path(), &target, Trigger::RemoteSetHead, move || {
+                git(
+                    &action_target,
+                    &[
+                        OsStr::new("--git-dir"),
+                        action_target.join(".bare").as_os_str(),
+                        OsStr::new("update-ref"),
+                        OsStr::new("-d"),
+                        OsStr::new("refs/remotes/origin/main"),
+                    ],
+                );
+            })
+            .unwrap_err();
+
+        assert_eq!(error.class, crate::error::ExitClass::Failure);
+        assert!(error.message.contains("remote HEAD target"));
+        assert_layout_was_not_written(&target);
+    }
+
+    #[test]
+    fn malformed_clone_postconditions_stop_before_layout_writes() {
+        #[derive(Clone, Copy, Debug)]
+        enum Fault {
+            WrongRemote,
+            MultipleRemotes,
+            WrongUrl,
+            InvalidRefspec,
+            WrongRemoteHead,
+            ExtraWorktree,
+        }
+
+        for fault in [
+            Fault::WrongRemote,
+            Fault::MultipleRemotes,
+            Fault::WrongUrl,
+            Fault::InvalidRefspec,
+            Fault::WrongRemoteHead,
+            Fault::ExtraWorktree,
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let target = parent.path().join("grove");
+            let action_target = target.clone();
+            let external_worktree = parent.path().join("foreign-worktree");
+            let trigger = if matches!(fault, Fault::WrongRemoteHead) {
+                Trigger::RemoteSetHead
+            } else {
+                Trigger::Clone
+            };
+            let error = execute_with_action(parent.path(), &target, trigger, move || {
+                let bare = action_target.join(".bare");
+                let config = bare.join("config");
+                match fault {
+                    Fault::WrongRemote => git(
+                        &action_target,
+                        &[
+                            OsStr::new("--git-dir"),
+                            bare.as_os_str(),
+                            OsStr::new("remote"),
+                            OsStr::new("rename"),
+                            OsStr::new("origin"),
+                            OsStr::new("elsewhere"),
+                        ],
+                    ),
+                    Fault::MultipleRemotes => git(
+                        &action_target,
+                        &[
+                            OsStr::new("--git-dir"),
+                            bare.as_os_str(),
+                            OsStr::new("remote"),
+                            OsStr::new("add"),
+                            OsStr::new("extra"),
+                            OsStr::new("/unused"),
+                        ],
+                    ),
+                    Fault::WrongUrl => git(
+                        &action_target,
+                        &[
+                            OsStr::new("config"),
+                            OsStr::new("--file"),
+                            config.as_os_str(),
+                            OsStr::new("remote.origin.url"),
+                            OsStr::new("/wrong"),
+                        ],
+                    ),
+                    Fault::InvalidRefspec => git(
+                        &action_target,
+                        &[
+                            OsStr::new("config"),
+                            OsStr::new("--file"),
+                            config.as_os_str(),
+                            OsStr::new("remote.origin.fetch"),
+                            OsStr::new("+refs/heads/*:refs/heads/*"),
+                        ],
+                    ),
+                    Fault::WrongRemoteHead => git(
+                        &action_target,
+                        &[
+                            OsStr::new("--git-dir"),
+                            bare.as_os_str(),
+                            OsStr::new("symbolic-ref"),
+                            OsStr::new("refs/remotes/origin/HEAD"),
+                            OsStr::new("refs/heads/main"),
+                        ],
+                    ),
+                    Fault::ExtraWorktree => git(
+                        &action_target,
+                        &[
+                            OsStr::new("--git-dir"),
+                            bare.as_os_str(),
+                            OsStr::new("worktree"),
+                            OsStr::new("add"),
+                            OsStr::new("--detach"),
+                            external_worktree.as_os_str(),
+                            OsStr::new("HEAD"),
+                        ],
+                    ),
+                }
+            })
+            .unwrap_err();
+
+            assert!(
+                matches!(
+                    error.class,
+                    crate::error::ExitClass::Failure | crate::error::ExitClass::NeedsDecision
+                ),
+                "fault {fault:?}: {error}"
+            );
+            assert_layout_was_not_written(&target);
+        }
+    }
+
+    #[test]
+    fn preserves_a_valid_preexisting_fetch_refspec() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("grove");
+        let action_target = target.clone();
+        execute_with_action(parent.path(), &target, Trigger::Clone, move || {
+            let config = action_target.join(".bare/config");
+            git(
+                &action_target,
+                &[
+                    OsStr::new("config"),
+                    OsStr::new("--file"),
+                    config.as_os_str(),
+                    OsStr::new("remote.origin.fetch"),
+                    OsStr::new("+refs/heads/main:refs/remotes/origin/main"),
+                ],
+            );
+        })
+        .unwrap();
+
+        let values = std::process::Command::new("git")
+            .args([
+                OsStr::new("config"),
+                OsStr::new("--file"),
+                target.join(".bare/config").as_os_str(),
+                OsStr::new("--get-all"),
+                OsStr::new("remote.origin.fetch"),
+            ])
+            .output()
+            .unwrap();
+        assert!(values.status.success());
+        assert_eq!(
+            values.stdout,
+            b"+refs/heads/main:refs/remotes/origin/main\n"
+        );
     }
 }
