@@ -111,6 +111,26 @@ impl Sandbox {
         self.grove_in(self.root(), args)
     }
 
+    #[cfg(unix)]
+    pub fn grove_os(&self, args: &[OsString]) -> assert_cmd::Command {
+        let mut cmd = assert_cmd::Command::cargo_bin("git-grove").unwrap();
+        cmd.current_dir(self.root()).args(args);
+        cmd.env_clear()
+            .env("PATH", &self.path)
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC");
+        cmd
+    }
+
     /// A bare repository with one commit on branch `main`, usable as a clone source.
     pub fn bare_origin(&self, name: &str) -> PathBuf {
         let origin = self.root().join(format!("{name}.git"));

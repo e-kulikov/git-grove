@@ -16,15 +16,15 @@ use std::path::{Component, Path, PathBuf};
 
 const REPOSITORY_NEUTRAL_CWD: &str = "/proc";
 
-fn escaped_path(path: &Path) -> String {
+pub(crate) fn escaped_path(path: &Path) -> String {
     path.as_os_str().as_bytes().escape_bytes().to_string()
 }
 
-fn state_conflict(message: impl Into<String>, detail: impl Into<String>) -> GroveError {
+pub(crate) fn state_conflict(message: impl Into<String>, detail: impl Into<String>) -> GroveError {
     GroveError::needs_decision(message).with_detail(detail)
 }
 
-fn normalize_absolute(path: &Path) -> Result<PathBuf> {
+pub(crate) fn normalize_absolute(path: &Path) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(GroveError::failure("internal root path is not absolute"));
     }
@@ -49,22 +49,22 @@ fn normalize_absolute(path: &Path) -> Result<PathBuf> {
 }
 
 #[derive(Debug)]
-struct HeldDirectory {
-    file: File,
-    named_path: PathBuf,
-    anchored_path: PathBuf,
+pub(crate) struct HeldDirectory {
+    pub(crate) file: File,
+    pub(crate) named_path: PathBuf,
+    pub(crate) anchored_path: PathBuf,
 }
 
 #[derive(Clone, Copy)]
-struct DirectoryIdentity {
+pub(crate) struct DirectoryIdentity {
     device: u64,
     inode: u64,
 }
 
 #[derive(Default)]
-struct RecoveryState {
-    root: Option<DirectoryIdentity>,
-    bare: Option<DirectoryIdentity>,
+pub(crate) struct RecoveryState {
+    pub(crate) root: Option<DirectoryIdentity>,
+    pub(crate) bare: Option<DirectoryIdentity>,
 }
 
 impl HeldDirectory {
@@ -83,7 +83,7 @@ impl HeldDirectory {
         Ok(held)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let held = fstat(&self.file).map_err(|error| {
             GroveError::failure(format!("cannot inspect held directory: {error}"))
         })?;
@@ -108,7 +108,7 @@ impl HeldDirectory {
         Ok(())
     }
 
-    fn identity(&self) -> Result<DirectoryIdentity> {
+    pub(crate) fn identity(&self) -> Result<DirectoryIdentity> {
         let stat = fstat(&self.file).map_err(|error| {
             GroveError::failure(format!("cannot inspect held directory: {error}"))
         })?;
@@ -118,7 +118,7 @@ impl HeldDirectory {
         })
     }
 
-    fn ensure_empty(&self) -> Result<()> {
+    pub(crate) fn ensure_empty(&self) -> Result<()> {
         self.validate()?;
         let mut entries = std::fs::read_dir(&self.anchored_path).map_err(|error| {
             GroveError::failure(format!(
@@ -135,7 +135,7 @@ impl HeldDirectory {
         self.validate()
     }
 
-    fn ensure_only_entry(&self, expected: &OsStr) -> Result<()> {
+    pub(crate) fn ensure_only_entry(&self, expected: &OsStr) -> Result<()> {
         self.validate()?;
         let entries = std::fs::read_dir(&self.anchored_path).map_err(|error| {
             GroveError::failure(format!(
@@ -176,7 +176,7 @@ fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
     .map_err(Into::into)
 }
 
-fn open_or_create_root(root: &Path, mutated: &mut bool) -> Result<HeldDirectory> {
+pub(crate) fn open_or_create_root(root: &Path, mutated: &mut bool) -> Result<HeldDirectory> {
     let mut missing = Vec::new();
     let mut current = root;
     let ancestor = loop {
@@ -251,7 +251,7 @@ fn open_or_create_root(root: &Path, mutated: &mut bool) -> Result<HeldDirectory>
     Ok(held)
 }
 
-fn create_bare(root: &HeldDirectory, mutated: &mut bool) -> Result<HeldDirectory> {
+pub(crate) fn create_bare(root: &HeldDirectory, mutated: &mut bool) -> Result<HeldDirectory> {
     create_bare_with(root, mutated, || {})
 }
 
@@ -296,10 +296,10 @@ fn create_bare_with(
     Ok(bare)
 }
 
-struct GuardedRunner<'a> {
-    runner: &'a dyn GitRunner,
-    root: &'a HeldDirectory,
-    bare: &'a HeldDirectory,
+pub(crate) struct GuardedRunner<'a> {
+    pub(crate) runner: &'a dyn GitRunner,
+    pub(crate) root: &'a HeldDirectory,
+    pub(crate) bare: &'a HeldDirectory,
 }
 
 impl GitRunner for GuardedRunner<'_> {
@@ -365,7 +365,7 @@ fn preflight_branch(runner: &dyn GitRunner, branch: Option<OsString>) -> Result<
     })
 }
 
-fn post_mutation_layout_error(error: GroveError) -> GroveError {
+pub(crate) fn post_mutation_layout_error(error: GroveError) -> GroveError {
     if error.class == crate::error::ExitClass::Usage {
         state_conflict(
             error.message,
@@ -383,10 +383,19 @@ fn identity_matches(path: &Path, expected: DirectoryIdentity) -> bool {
         .is_ok_and(|stat| stat.st_dev == expected.device && stat.st_ino == expected.inode)
 }
 
-fn retain_partial(
+pub(crate) fn retain_partial(
+    error: GroveError,
+    root: &Path,
+    recovery_state: &RecoveryState,
+) -> GroveError {
+    retain_partial_for(error, root, recovery_state, "initialization")
+}
+
+pub(crate) fn retain_partial_for(
     mut error: GroveError,
     root: &Path,
     recovery_state: &RecoveryState,
+    operation: &str,
 ) -> GroveError {
     let root_matches = recovery_state
         .root
@@ -397,7 +406,7 @@ fn retain_partial(
         .unwrap_or(true);
     let recovery = if root_matches && bare_matches {
         format!(
-            "partial initialization retained at {}; inspect it and remove only confirmed invocation-created entries by hand before retrying",
+            "partial {operation} retained at {}; inspect it and remove only confirmed invocation-created entries by hand before retrying",
             escaped_path(root)
         )
     } else {

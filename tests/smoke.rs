@@ -84,21 +84,21 @@ fn defaults_to_list_only_when_inside_a_grove() {
 #[test]
 fn applies_implicit_actions_after_the_global_policy_override() {
     let sandbox = Sandbox::new();
+    let origin = sandbox.bare_origin("implicit");
     sandbox
-        .grove(&["--ignore-unsupported", "https://host/example.git"])
-        .assert()
-        .code(1)
-        .stderr(predicates::str::contains("clone is not implemented yet"));
-
-    sandbox
-        .grove(&["init", ".", "--branch", "main"])
+        .grove(&["--ignore-unsupported", origin.to_str().unwrap(), "cloned"])
         .assert()
         .success();
+    assert!(sandbox.root().join("cloned/.bare").is_dir());
+
     sandbox
-        .grove(&["--ignore-unsupported"])
+        .grove_in(
+            &sandbox.root().join("cloned/main"),
+            &["--ignore-unsupported"],
+        )
         .assert()
         .success()
-        .stdout(predicates::str::contains("UNBORN"));
+        .stdout(predicates::str::contains("main"));
 }
 
 #[test]
@@ -152,7 +152,7 @@ fn accepts_a_tilde_user_locator_as_an_implicit_clone() {
         .grove(&["~other/src/repository"])
         .assert()
         .code(1)
-        .stderr(predicates::str::contains("clone is not implemented yet"));
+        .stderr(predicates::str::contains("git clone --bare failed"));
 }
 
 #[test]

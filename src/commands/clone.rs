@@ -1,0 +1,1095 @@
+use super::init::{
+    create_bare, escaped_path, normalize_absolute, open_or_create_root, post_mutation_layout_error,
+    retain_partial_for, state_conflict, GuardedRunner, RecoveryState,
+};
+use crate::error::{GroveError, Result};
+use crate::fsx;
+use crate::git::query;
+use crate::git::runner::{GitOutput, GitRunner, Invocation};
+use crate::grove::agents_md::{self, Facts};
+use crate::grove::discover::Grove;
+use crate::grove::layout;
+use crate::grove::metadata::{self, Metadata, PublishState, FORMAT_VERSION};
+use crate::policy::clone_options::Verdict;
+use bstr::ByteSlice;
+use std::ffi::{OsStr, OsString};
+use std::io::ErrorKind;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
+
+pub(crate) trait HomeResolver {
+    fn current_home(&self) -> Option<PathBuf>;
+    fn named_home(&self, user: &OsStr) -> Result<Option<PathBuf>>;
+}
+
+struct SystemHomes;
+
+impl HomeResolver for SystemHomes {
+    fn current_home(&self) -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    fn named_home(&self, user: &OsStr) -> Result<Option<PathBuf>> {
+        let passwd = std::fs::read("/etc/passwd")
+            .map_err(|error| GroveError::failure(format!("cannot read /etc/passwd: {error}")))?;
+        for line in passwd.split(|byte| *byte == b'\n') {
+            let fields = line.split(|byte| *byte == b':').collect::<Vec<_>>();
+            if fields.len() >= 7 && fields[0] == user.as_bytes() {
+                let home = PathBuf::from(OsString::from_vec(fields[5].to_vec()));
+                return Ok(Some(home));
+            }
+        }
+        Ok(None)
+    }
+}
+
+pub fn derive_directory_name(url: &OsStr) -> Option<OsString> {
+    let mut bytes = url.as_bytes();
+    while bytes.last() == Some(&b'/') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    if let Some(stripped) = bytes.strip_suffix(b"/.git") {
+        bytes = stripped;
+    } else if let Some(stripped) = bytes.strip_suffix(b".git") {
+        bytes = stripped;
+    }
+    while bytes.last() == Some(&b'/') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    let base = bytes.rsplit(|byte| matches!(byte, b'/' | b':')).next()?;
+    if base.is_empty() || matches!(base, b"." | b"..") {
+        None
+    } else {
+        Some(OsString::from_vec(base.to_vec()))
+    }
+}
+
+pub(crate) fn expand_user_path_with(path: &Path, resolver: &dyn HomeResolver) -> Result<PathBuf> {
+    let bytes = path.as_os_str().as_bytes();
+    if !bytes.starts_with(b"~") {
+        return Ok(path.to_path_buf());
+    }
+    let (user, rest) = match bytes.iter().position(|byte| *byte == b'/') {
+        Some(slash) => (&bytes[1..slash], &bytes[slash + 1..]),
+        None => (&bytes[1..], &b""[..]),
+    };
+    if rest.starts_with(b"/") || user.iter().any(|byte| matches!(byte, b':' | b'\0' | b'\\')) {
+        return Err(GroveError::usage(format!(
+            "cannot expand malformed user path {}",
+            bytes.escape_bytes()
+        )));
+    }
+    let home = if user.is_empty() {
+        resolver.current_home()
+    } else {
+        resolver.named_home(OsStr::from_bytes(user))?
+    }
+    .ok_or_else(|| {
+        GroveError::usage(format!(
+            "cannot find a home directory for {}",
+            if user.is_empty() {
+                "the current user".to_string()
+            } else {
+                user.escape_bytes().to_string()
+            }
+        ))
+    })?;
+    if rest.is_empty() {
+        Ok(home)
+    } else {
+        Ok(home.join(OsStr::from_bytes(rest)))
+    }
+}
+
+fn escaped(bytes: &[u8]) -> String {
+    bytes.escape_bytes().to_string()
+}
+
+fn required(runner: &dyn GitRunner, invocation: Invocation, operation: &str) -> Result<GitOutput> {
+    let output = runner.run(invocation)?;
+    if !output.ok() {
+        return Err(GroveError::failure(format!(
+            "git {operation} failed with exit status {}",
+            output.status
+        ))
+        .with_detail(escaped(&output.stderr)));
+    }
+    Ok(output)
+}
+
+fn trim_one_line(mut bytes: Vec<u8>, description: &str) -> Result<Vec<u8>> {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err(GroveError::failure(format!(
+            "git returned an invalid {description}"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn config_key(prefix: &[u8], name: &OsStr, suffix: &[u8]) -> OsString {
+    let mut key = Vec::with_capacity(prefix.len() + name.as_bytes().len() + suffix.len());
+    key.extend_from_slice(prefix);
+    key.extend_from_slice(name.as_bytes());
+    key.extend_from_slice(suffix);
+    OsString::from_vec(key)
+}
+
+fn config_values(runner: &dyn GitRunner, config: &Path, key: &OsStr) -> Result<Vec<Vec<u8>>> {
+    let output = runner.run(Invocation::new().args([
+        OsStr::new("config"),
+        OsStr::new("--null"),
+        OsStr::new("--file"),
+        config.as_os_str(),
+        OsStr::new("--get-all"),
+        key,
+    ]))?;
+    if output.status == 1 {
+        return Ok(Vec::new());
+    }
+    if !output.ok() {
+        return Err(GroveError::failure(format!(
+            "git config --get-all {} failed with exit status {}",
+            escaped(key.as_bytes()),
+            output.status
+        ))
+        .with_detail(escaped(&output.stderr)));
+    }
+    if output.stdout.last() != Some(&b'\0') {
+        return Err(GroveError::failure(
+            "git config returned a truncated NUL-delimited value",
+        ));
+    }
+    Ok(output.stdout[..output.stdout.len() - 1]
+        .split(|byte| *byte == b'\0')
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+fn set_config(
+    runner: &dyn GitRunner,
+    config: &Path,
+    key: &OsStr,
+    value: &OsStr,
+    add: bool,
+) -> Result<()> {
+    let mut args = vec![
+        OsString::from("config"),
+        OsString::from("--file"),
+        config.as_os_str().to_os_string(),
+    ];
+    if add {
+        args.push(OsString::from("--add"));
+    }
+    args.push(key.to_os_string());
+    args.push(value.to_os_string());
+    required(runner, Invocation::new().args(args), "config write")?;
+    Ok(())
+}
+
+fn list_local_heads(runner: &dyn GitRunner, bare: &Path) -> Result<Vec<Vec<u8>>> {
+    let output = required(
+        runner,
+        Invocation::new().git_dir(bare).args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "--",
+            "refs/heads",
+        ]),
+        "for-each-ref local heads",
+    )?;
+    let mut heads = Vec::new();
+    for line in output.stdout.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(b"refs/heads/") || line.contains(&b'\r') {
+            return Err(GroveError::failure(
+                "git returned an invalid local branch ref",
+            ));
+        }
+        heads.push(line.to_vec());
+    }
+    Ok(heads)
+}
+
+fn refspec_destination(spec: &[u8], source: &[u8]) -> Option<Vec<u8>> {
+    let spec = spec.strip_prefix(b"+").unwrap_or(spec);
+    if spec.starts_with(b"^") {
+        return None;
+    }
+    let colon = spec.iter().position(|byte| *byte == b':')?;
+    let (from, to_with_colon) = spec.split_at(colon);
+    let to = &to_with_colon[1..];
+    match (
+        from.iter().position(|byte| *byte == b'*'),
+        to.iter().position(|byte| *byte == b'*'),
+    ) {
+        (None, None) if from == source => Some(to.to_vec()),
+        (Some(from_star), Some(to_star))
+            if !from[from_star + 1..].contains(&b'*') && !to[to_star + 1..].contains(&b'*') =>
+        {
+            let matched = source
+                .strip_prefix(&from[..from_star])?
+                .strip_suffix(&from[from_star + 1..])?;
+            let mut destination = Vec::with_capacity(to.len() + matched.len());
+            destination.extend_from_slice(&to[..to_star]);
+            destination.extend_from_slice(matched);
+            destination.extend_from_slice(&to[to_star + 1..]);
+            Some(destination)
+        }
+        _ => None,
+    }
+}
+
+fn validate_refspec_destinations(refspecs: &[Vec<u8>], remote: &OsStr) -> Result<()> {
+    let mut prefix = b"refs/remotes/".to_vec();
+    prefix.extend_from_slice(remote.as_bytes());
+    prefix.push(b'/');
+    for refspec in refspecs {
+        let Some(colon) = refspec.iter().position(|byte| *byte == b':') else {
+            return Err(state_conflict(
+                "the clone wrote an invalid fetch refspec",
+                escaped(refspec),
+            ));
+        };
+        let destination = &refspec[colon + 1..];
+        if !destination.starts_with(&prefix) || destination == prefix {
+            return Err(state_conflict(
+                "the clone wrote a fetch refspec outside the grove remote namespace",
+                escaped(refspec),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_clone_postconditions(
+    runner: &dyn GitRunner,
+    bare: &Path,
+    requested_url: &OsStr,
+    remote: &OsStr,
+) -> Result<Vec<Vec<u8>>> {
+    let is_bare = trim_one_line(
+        required(
+            runner,
+            Invocation::new()
+                .git_dir(bare)
+                .args(["rev-parse", "--is-bare-repository"]),
+            "rev-parse --is-bare-repository",
+        )?
+        .stdout,
+        "bare-repository result",
+    )?;
+    if is_bare != b"true" {
+        return Err(state_conflict(
+            "the cloned repository is not bare",
+            "the partial clone was retained for inspection",
+        ));
+    }
+
+    let remotes = required(
+        runner,
+        Invocation::new().git_dir(bare).args(["remote"]),
+        "remote list",
+    )?;
+    let names = remotes
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if names.as_slice() != [remote.as_bytes()] {
+        return Err(state_conflict(
+            "the clone did not create exactly the requested remote",
+            format!(
+                "expected {}, found {}",
+                escaped(remote.as_bytes()),
+                escaped(&remotes.stdout)
+            ),
+        ));
+    }
+    let config = bare.join("config");
+    let url_key = config_key(b"remote.", remote, b".url");
+    let urls = config_values(runner, &config, &url_key)?;
+    if urls.as_slice() != [requested_url.as_bytes()] {
+        return Err(state_conflict(
+            "the clone changed the requested remote URL",
+            format!(
+                "expected {}, found {}",
+                escaped(requested_url.as_bytes()),
+                urls.iter()
+                    .map(|value| escaped(value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ));
+    }
+
+    let fetch_key = config_key(b"remote.", remote, b".fetch");
+    let refspecs = config_values(runner, &config, &fetch_key)?;
+    validate_refspec_destinations(&refspecs, remote)?;
+
+    required(
+        runner,
+        Invocation::new()
+            .git_dir(bare)
+            .args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        "rev-parse --verify HEAD",
+    )?;
+
+    let object_path = trim_one_line(
+        required(
+            runner,
+            Invocation::new()
+                .git_dir(bare)
+                .args(["rev-parse", "--git-path", "objects"]),
+            "rev-parse --git-path objects",
+        )?
+        .stdout,
+        "object directory",
+    )?;
+    let object_path = PathBuf::from(OsString::from_vec(object_path));
+    let actual_objects = object_path.canonicalize().map_err(|error| {
+        GroveError::failure(format!("cannot resolve cloned object directory: {error}"))
+    })?;
+    let expected_objects = bare.join("objects").canonicalize().map_err(|error| {
+        GroveError::failure(format!(
+            "cannot resolve held .bare object directory: {error}"
+        ))
+    })?;
+    let canonical_bare = bare
+        .canonicalize()
+        .map_err(|error| GroveError::failure(format!("cannot resolve held .bare: {error}")))?;
+    if actual_objects != expected_objects
+        || actual_objects == canonical_bare
+        || !actual_objects.starts_with(&canonical_bare)
+    {
+        return Err(state_conflict(
+            "the clone redirected its object directory outside .bare",
+            "the partial clone was retained for inspection",
+        ));
+    }
+    match std::fs::symlink_metadata(bare.join("objects/info/alternates")) {
+        Ok(_) => {
+            return Err(state_conflict(
+                "the clone retained an alternate object database",
+                "retry with --dissociate or without --reference",
+            ))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(GroveError::failure(format!(
+                "cannot inspect clone alternates: {error}"
+            )))
+        }
+    }
+
+    let worktrees = required(
+        runner,
+        Invocation::new()
+            .git_dir(bare)
+            .args(["worktree", "list", "--porcelain", "-z"]),
+        "worktree list --porcelain -z",
+    )?;
+    let fields = worktrees
+        .stdout
+        .split(|byte| *byte == b'\0')
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() != 2 || !fields[0].starts_with(b"worktree ") || fields[1] != b"bare" {
+        return Err(state_conflict(
+            "the cloned repository has incompatible worktree registrations",
+            escaped(&worktrees.stdout),
+        ));
+    }
+    let registered = PathBuf::from(OsString::from_vec(fields[0][b"worktree ".len()..].to_vec()));
+    if registered.canonicalize().ok().as_ref() != bare.canonicalize().ok().as_ref() {
+        return Err(state_conflict(
+            "the cloned bare worktree registration points elsewhere",
+            escaped(fields[0]),
+        ));
+    }
+    Ok(refspecs)
+}
+
+fn repair_refspecs(
+    runner: &dyn GitRunner,
+    bare: &Path,
+    remote: &OsStr,
+    narrowed: bool,
+    existing: Vec<Vec<u8>>,
+) -> Result<Vec<Vec<u8>>> {
+    if !existing.is_empty() {
+        return Ok(existing);
+    }
+    let config = bare.join("config");
+    let key = config_key(b"remote.", remote, b".fetch");
+    let values = if narrowed {
+        let heads = list_local_heads(runner, bare)?;
+        if heads.is_empty() {
+            return Err(state_conflict(
+                "the narrowed clone retained no local branches",
+                "the partial clone was retained for inspection",
+            ));
+        }
+        heads
+            .into_iter()
+            .map(|source| {
+                let branch = source.strip_prefix(b"refs/heads/").expect("validated head");
+                let mut value = b"+refs/heads/".to_vec();
+                value.extend_from_slice(branch);
+                value.extend_from_slice(b":refs/remotes/");
+                value.extend_from_slice(remote.as_bytes());
+                value.push(b'/');
+                value.extend_from_slice(branch);
+                value
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let mut value = b"+refs/heads/*:refs/remotes/".to_vec();
+        value.extend_from_slice(remote.as_bytes());
+        value.extend_from_slice(b"/*");
+        vec![value]
+    };
+    for value in &values {
+        set_config(runner, &config, &key, OsStr::from_bytes(value), true)?;
+    }
+    let written = config_values(runner, &config, &key)?;
+    if written != values {
+        return Err(GroveError::failure("fetch refspec verification failed"));
+    }
+    validate_refspec_destinations(&written, remote)?;
+    Ok(written)
+}
+
+fn configure_upstreams(
+    runner: &dyn GitRunner,
+    bare: &Path,
+    remote: &OsStr,
+    refspecs: &[Vec<u8>],
+) -> Result<()> {
+    let config = bare.join("config");
+    for local in list_local_heads(runner, bare)? {
+        let branch = local.strip_prefix(b"refs/heads/").expect("validated head");
+        let candidates = refspecs
+            .iter()
+            .filter_map(|spec| refspec_destination(spec, &local))
+            .collect::<Vec<_>>();
+        let Some(destination) = candidates.first() else {
+            continue;
+        };
+        if candidates.iter().any(|candidate| candidate != destination) {
+            return Err(state_conflict(
+                "fetch refspecs map a branch to several destinations",
+                escaped(&local),
+            ));
+        }
+        let exists = runner.run(Invocation::new().git_dir(bare).args([
+            OsStr::new("show-ref"),
+            OsStr::new("--verify"),
+            OsStr::new("--quiet"),
+            OsStr::from_bytes(destination),
+        ]))?;
+        match exists.status {
+            0 => {}
+            1 => continue,
+            _ => {
+                return Err(
+                    GroveError::failure("git show-ref failed while configuring upstreams")
+                        .with_detail(escaped(&exists.stderr)),
+                )
+            }
+        }
+        let branch_os = OsStr::from_bytes(branch);
+        let remote_key = config_key(b"branch.", branch_os, b".remote");
+        let merge_key = config_key(b"branch.", branch_os, b".merge");
+        set_config(runner, &config, &remote_key, remote, false)?;
+        set_config(
+            runner,
+            &config,
+            &merge_key,
+            OsStr::from_bytes(&local),
+            false,
+        )?;
+        if config_values(runner, &config, &remote_key)? != [remote.as_bytes()]
+            || config_values(runner, &config, &merge_key)? != [local.as_slice()]
+        {
+            return Err(GroveError::failure(
+                "upstream configuration verification failed",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remote_head_branch(runner: &dyn GitRunner, bare: &Path, remote: &OsStr) -> Result<OsString> {
+    let mut head = b"refs/remotes/".to_vec();
+    head.extend_from_slice(remote.as_bytes());
+    head.extend_from_slice(b"/HEAD");
+    let target = trim_one_line(
+        required(
+            runner,
+            Invocation::new().git_dir(bare).args([
+                OsStr::new("symbolic-ref"),
+                OsStr::new("--quiet"),
+                OsStr::from_bytes(&head),
+            ]),
+            "symbolic-ref remote HEAD",
+        )?
+        .stdout,
+        "remote HEAD",
+    )?;
+    let mut prefix = b"refs/remotes/".to_vec();
+    prefix.extend_from_slice(remote.as_bytes());
+    prefix.push(b'/');
+    let branch = target.strip_prefix(prefix.as_slice()).ok_or_else(|| {
+        state_conflict(
+            "the remote HEAD points outside its remote namespace",
+            escaped(&target),
+        )
+    })?;
+    if branch.is_empty() || branch == b"HEAD" {
+        return Err(state_conflict(
+            "the remote HEAD does not name a branch",
+            escaped(&target),
+        ));
+    }
+    Ok(OsString::from_vec(branch.to_vec()))
+}
+
+fn resolve_target(url: &OsStr, dir: Option<PathBuf>, cwd: &Path) -> Result<PathBuf> {
+    let requested = match dir {
+        Some(path) => expand_user_path_with(&path, &SystemHomes)?,
+        None => PathBuf::from(derive_directory_name(url).ok_or_else(|| {
+            GroveError::usage(format!(
+                "cannot derive a directory name from {}",
+                escaped(url.as_bytes())
+            ))
+            .with_detail("pass the directory explicitly")
+        })?),
+    };
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        cwd.join(requested)
+    };
+    normalize_absolute(&requested)
+}
+
+struct ClonePlan<'a> {
+    url: &'a OsStr,
+    root: &'a Path,
+    explicit_branch: Option<OsString>,
+    verdict: Verdict,
+    cwd: &'a Path,
+}
+
+fn run_transaction(
+    runner: &dyn GitRunner,
+    plan: ClonePlan<'_>,
+    mutated: &mut bool,
+    recovery: &mut RecoveryState,
+) -> Result<Grove> {
+    let ClonePlan {
+        url,
+        root: root_path,
+        explicit_branch,
+        verdict,
+        cwd,
+    } = plan;
+    let root = open_or_create_root(root_path, mutated)?;
+    recovery.root = Some(root.identity()?);
+    let bare = create_bare(&root, mutated)?;
+    recovery.bare = Some(bare.identity()?);
+    let guarded = GuardedRunner {
+        runner,
+        root: &root,
+        bare: &bare,
+    };
+
+    let mut clone_args = vec![OsString::from("clone"), OsString::from("--bare")];
+    clone_args.extend(verdict.forwarded.iter().cloned());
+    clone_args.push(OsString::from("--"));
+    clone_args.push(url.to_os_string());
+    clone_args.push(bare.anchored_path.as_os_str().to_os_string());
+    required(
+        &guarded,
+        Invocation::new().cwd(cwd).args(clone_args),
+        "clone --bare",
+    )?;
+    root.ensure_only_entry(OsStr::new(".bare"))?;
+    bare.validate()?;
+
+    let existing =
+        validate_clone_postconditions(&guarded, &bare.anchored_path, url, &verdict.remote_name)?;
+    let refspecs = repair_refspecs(
+        &guarded,
+        &bare.anchored_path,
+        &verdict.remote_name,
+        verdict.narrowed,
+        existing,
+    )?;
+    let config = bare.anchored_path.join("config");
+    set_config(
+        &guarded,
+        &config,
+        OsStr::new("worktree.guessRemote"),
+        OsStr::new("true"),
+        false,
+    )?;
+    if config_values(&guarded, &config, OsStr::new("worktree.guessRemote"))? != [b"true".as_slice()]
+    {
+        return Err(GroveError::failure(
+            "worktree.guessRemote configuration verification failed",
+        ));
+    }
+    required(
+        &guarded,
+        Invocation::new().git_dir(&bare.anchored_path).args([
+            OsStr::new("fetch"),
+            OsStr::new("--prune"),
+            OsStr::new("--"),
+            verdict.remote_name.as_os_str(),
+        ]),
+        "fetch --prune",
+    )?;
+    required(
+        &guarded,
+        Invocation::new().git_dir(&bare.anchored_path).args([
+            OsStr::new("remote"),
+            OsStr::new("set-head"),
+            verdict.remote_name.as_os_str(),
+            OsStr::new("--auto"),
+        ]),
+        "remote set-head --auto",
+    )?;
+    let default_branch = remote_head_branch(&guarded, &bare.anchored_path, &verdict.remote_name)?;
+    configure_upstreams(
+        &guarded,
+        &bare.anchored_path,
+        &verdict.remote_name,
+        &refspecs,
+    )?;
+
+    let selected = explicit_branch.unwrap_or(default_branch);
+    query::validate_branch_name(&guarded, &selected)?;
+    if !query::local_branch_exists(
+        &guarded,
+        &Grove {
+            root: root.anchored_path.clone(),
+        },
+        &selected,
+    )? {
+        return Err(state_conflict(
+            format!(
+                "branch {} was not retained by the clone",
+                escaped(selected.as_bytes())
+            ),
+            "choose a branch present in the cloned repository",
+        ));
+    }
+    let relative_worktree = layout::validate_relative_worktree_path(Path::new(&selected))
+        .map_err(post_mutation_layout_error)?;
+
+    let pointer_created = layout::write_pointer_if_absent(&root.anchored_path)?;
+    if !pointer_created {
+        return Err(state_conflict(
+            format!(
+                "{} already exists",
+                escaped_path(&root.named_path.join(".git"))
+            ),
+            "the foreign entry was preserved",
+        ));
+    }
+    metadata::write_to_config(
+        &guarded,
+        &config,
+        &Metadata {
+            version: Some(FORMAT_VERSION),
+            default_branch: Some(selected.as_bytes().to_vec().into()),
+            remote: Some(verdict.remote_name.as_bytes().to_vec().into()),
+            publish_state: PublishState::Published,
+        },
+    )?;
+    let facts = Facts {
+        remote: Some(verdict.remote_name.as_bytes().to_vec().into()),
+        default_branch: selected.as_bytes().to_vec().into(),
+        published: true,
+        narrowed: verdict.narrowed,
+    };
+    if !fsx::write_atomic_if_absent(
+        &root.anchored_path.join("AGENTS.md"),
+        agents_md::render(&facts).as_bytes(),
+    )? {
+        return Err(state_conflict(
+            format!(
+                "{} already exists",
+                escaped_path(&root.named_path.join("AGENTS.md"))
+            ),
+            "the foreign entry was preserved",
+        ));
+    }
+    if !fsx::symlink_relative_if_absent(&root.anchored_path.join("CLAUDE.md"), "AGENTS.md")? {
+        return Err(state_conflict(
+            format!(
+                "{} already exists",
+                escaped_path(&root.named_path.join("CLAUDE.md"))
+            ),
+            "the foreign entry was preserved",
+        ));
+    }
+
+    let validated =
+        layout::validate_worktree_path_at(&root.file, &root.named_path, &relative_worktree)
+            .map_err(post_mutation_layout_error)?;
+    validated
+        .create_parent_directories()
+        .map_err(post_mutation_layout_error)?;
+    root.validate()?;
+    bare.validate()?;
+    let worktree_path = validated.path();
+    let anchored_worktree = root.anchored_path.join(validated.relative());
+    validated
+        .validate_vacant()
+        .map_err(post_mutation_layout_error)?;
+    required(
+        &guarded,
+        Invocation::new().git_dir(&bare.anchored_path).args([
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--"),
+            anchored_worktree.as_os_str(),
+            selected.as_os_str(),
+        ]),
+        "worktree add",
+    )?;
+    root.validate()?;
+    bare.validate()?;
+    let grove = Grove::at(&root.named_path).map_err(|error| {
+        state_conflict(
+            format!("{} changed during cloning", escaped_path(&root.named_path)),
+            error.to_string(),
+        )
+    })?;
+    println!("ready: {}", escaped_path(&grove.root));
+    println!("next: cd {}", escaped_path(&worktree_path));
+    Ok(grove)
+}
+
+pub fn run(
+    runner: &dyn GitRunner,
+    url: &OsStr,
+    dir: Option<PathBuf>,
+    branch: Option<OsString>,
+    verdict: Verdict,
+    cwd: &Path,
+) -> Result<Grove> {
+    if url.as_bytes().is_empty() {
+        return Err(GroveError::usage("the repository URL is empty"));
+    }
+    let root = resolve_target(url, dir, cwd)?;
+    if let Some(branch) = &branch {
+        query::validate_branch_name(runner, branch)?;
+        layout::validate_relative_worktree_path(Path::new(branch))?;
+    }
+    let mut mutated = false;
+    let mut recovery = RecoveryState::default();
+    let plan = ClonePlan {
+        url,
+        root: &root,
+        explicit_branch: branch,
+        verdict,
+        cwd,
+    };
+    match run_transaction(runner, plan, &mut mutated, &mut recovery) {
+        Err(error) if mutated => Err(retain_partial_for(error, &root, &recovery, "clone")),
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::runner::{GitRunner, Invocation, RealGit};
+    use crate::policy::clone_options;
+    use std::cell::RefCell;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::process::Command;
+
+    struct Homes;
+
+    impl HomeResolver for Homes {
+        fn current_home(&self) -> Option<PathBuf> {
+            Some(PathBuf::from("/home/current"))
+        }
+
+        fn named_home(&self, user: &OsStr) -> Result<Option<PathBuf>> {
+            Ok((user == "alice").then(|| PathBuf::from("/srv/alice")))
+        }
+    }
+
+    #[test]
+    fn derives_raw_directory_names_like_git_without_dot_git() {
+        for (url, expected) in [
+            (
+                b"git@github.com:user/repo.git".as_slice(),
+                b"repo".as_slice(),
+            ),
+            (b"https://host/group/repo/", b"repo"),
+            (b"ssh://host/group/repo.git/", b"repo"),
+            (b"/srv/repo.git", b"repo"),
+            (b"file:///srv/repo/.git", b"repo"),
+            (b"host:path/repo-\xff.git", b"repo-\xff"),
+        ] {
+            assert_eq!(
+                derive_directory_name(OsStr::from_bytes(url))
+                    .unwrap()
+                    .as_bytes(),
+                expected
+            );
+        }
+        for invalid in [b"".as_slice(), b"/", b"/.git", b".", b".."] {
+            assert!(derive_directory_name(OsStr::from_bytes(invalid)).is_none());
+        }
+    }
+
+    #[test]
+    fn expands_current_and_named_users_without_process_global_state() {
+        assert_eq!(
+            expand_user_path_with(Path::new("~/src"), &Homes).unwrap(),
+            Path::new("/home/current/src")
+        );
+        assert_eq!(
+            expand_user_path_with(Path::new("~alice/src"), &Homes).unwrap(),
+            Path::new("/srv/alice/src")
+        );
+        assert_eq!(
+            expand_user_path_with(Path::new("./src"), &Homes).unwrap(),
+            Path::new("./src")
+        );
+        assert_eq!(
+            expand_user_path_with(Path::new(OsStr::from_bytes(b"~/x-\xff")), &Homes)
+                .unwrap()
+                .as_os_str()
+                .as_bytes(),
+            b"/home/current/x-\xff"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_malformed_user_expansions() {
+        assert_eq!(
+            expand_user_path_with(Path::new("~alice"), &Homes).unwrap(),
+            Path::new("/srv/alice")
+        );
+        for path in ["~missing/x", "~alice//x", "~a:b/x"] {
+            assert_eq!(
+                expand_user_path_with(Path::new(path), &Homes)
+                    .unwrap_err()
+                    .class,
+                crate::error::ExitClass::Usage
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_non_utf8_named_user_lookup() {
+        struct Raw;
+        impl HomeResolver for Raw {
+            fn current_home(&self) -> Option<PathBuf> {
+                None
+            }
+            fn named_home(&self, user: &OsStr) -> Result<Option<PathBuf>> {
+                assert_eq!(user.as_bytes(), b"u\xff");
+                Ok(Some(PathBuf::from(OsString::from_vec(
+                    b"/raw/home".to_vec(),
+                ))))
+            }
+        }
+
+        let path = PathBuf::from(OsString::from_vec(b"~u\xff/repo".to_vec()));
+        assert_eq!(
+            expand_user_path_with(&path, &Raw).unwrap(),
+            Path::new("/raw/home/repo")
+        );
+    }
+
+    struct AfterClone {
+        real: RealGit,
+        action: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    impl GitRunner for AfterClone {
+        fn run(&self, invocation: Invocation) -> Result<GitOutput> {
+            let is_clone = invocation
+                .argv_os()
+                .first()
+                .is_some_and(|argument| argument == "clone");
+            let output = self.real.run(invocation)?;
+            if is_clone && output.ok() {
+                if let Some(action) = self.action.borrow_mut().take() {
+                    action();
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    fn git(cwd: &Path, args: &[&OsStr]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(["-c", "init.defaultBranch=main", "-c", "core.hooksPath="])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", output.stderr.escape_bytes());
+    }
+
+    fn origin(parent: &Path) -> PathBuf {
+        let origin = parent.join("origin.git");
+        let seed = parent.join("seed");
+        git(
+            parent,
+            &[
+                OsStr::new("init"),
+                OsStr::new("--quiet"),
+                OsStr::new("--bare"),
+                origin.as_os_str(),
+            ],
+        );
+        git(
+            parent,
+            &[
+                OsStr::new("clone"),
+                OsStr::new("--quiet"),
+                origin.as_os_str(),
+                seed.as_os_str(),
+            ],
+        );
+        std::fs::write(seed.join("README"), b"seed\n").unwrap();
+        git(&seed, &[OsStr::new("add"), OsStr::new("README")]);
+        git(
+            &seed,
+            &[
+                OsStr::new("commit"),
+                OsStr::new("--quiet"),
+                OsStr::new("-m"),
+                OsStr::new("seed"),
+            ],
+        );
+        git(
+            &seed,
+            &[
+                OsStr::new("push"),
+                OsStr::new("--quiet"),
+                OsStr::new("origin"),
+                OsStr::new("main"),
+            ],
+        );
+        origin
+    }
+
+    fn run_with_after_clone(
+        parent: &Path,
+        target: &Path,
+        action: impl FnOnce() + 'static,
+    ) -> GroveError {
+        let origin = origin(parent);
+        let runner = AfterClone {
+            real: RealGit::new(),
+            action: RefCell::new(Some(Box::new(action))),
+        };
+        run(
+            &runner,
+            origin.as_os_str(),
+            Some(target.to_path_buf()),
+            None,
+            clone_options::classify(&[]).unwrap(),
+            parent,
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn replacing_the_named_root_cannot_redirect_clone_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("grove");
+        let moved = parent.path().join("moved-grove");
+        let action_target = target.clone();
+        let action_moved = moved.clone();
+        let error = run_with_after_clone(parent.path(), &target, move || {
+            std::fs::rename(&action_target, &action_moved).unwrap();
+            std::fs::create_dir(&action_target).unwrap();
+            std::fs::write(action_target.join("foreign"), b"mine").unwrap();
+        });
+
+        assert_eq!(error.class, crate::error::ExitClass::NeedsDecision);
+        assert_eq!(std::fs::read(target.join("foreign")).unwrap(), b"mine");
+        assert!(moved.join(".bare/HEAD").is_file());
+        assert!(error.to_string().contains("not a safe cleanup target"));
+    }
+
+    #[test]
+    fn replacing_the_named_bare_cannot_redirect_clone_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("grove");
+        let action_target = target.clone();
+        let error = run_with_after_clone(parent.path(), &target, move || {
+            std::fs::rename(
+                action_target.join(".bare"),
+                action_target.join("moved-bare"),
+            )
+            .unwrap();
+            std::fs::create_dir(action_target.join(".bare")).unwrap();
+            std::fs::write(action_target.join(".bare/foreign"), b"mine").unwrap();
+        });
+
+        assert_eq!(error.class, crate::error::ExitClass::NeedsDecision);
+        assert_eq!(
+            std::fs::read(target.join(".bare/foreign")).unwrap(),
+            b"mine"
+        );
+        assert!(target.join("moved-bare/HEAD").is_file());
+        assert!(error.to_string().contains("not a safe cleanup target"));
+    }
+
+    #[test]
+    fn concurrent_foreign_root_entry_is_preserved_and_stops_layout_writes() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("grove");
+        let action_target = target.clone();
+        let error = run_with_after_clone(parent.path(), &target, move || {
+            std::fs::write(action_target.join("foreign"), b"mine").unwrap();
+        });
+
+        assert_eq!(error.class, crate::error::ExitClass::NeedsDecision);
+        assert_eq!(std::fs::read(target.join("foreign")).unwrap(), b"mine");
+        assert!(!target.join(".git").exists());
+    }
+
+    #[test]
+    fn rejects_an_object_directory_symlinked_outside_held_bare() {
+        let parent = tempfile::tempdir().unwrap();
+        let target = parent.path().join("grove");
+        let external = parent.path().join("external-objects");
+        let action_target = target.clone();
+        let action_external = external.clone();
+        let error = run_with_after_clone(parent.path(), &target, move || {
+            std::fs::rename(action_target.join(".bare/objects"), &action_external).unwrap();
+            std::os::unix::fs::symlink(&action_external, action_target.join(".bare/objects"))
+                .unwrap();
+        });
+
+        assert_eq!(error.class, crate::error::ExitClass::NeedsDecision);
+        assert!(error.message.contains("object directory outside .bare"));
+        assert!(external.is_dir());
+    }
+}

@@ -49,7 +49,22 @@ fn run(cli: cli::Cli) -> Result<()> {
         command,
     } = cli;
     match command {
-        cli::Command::Clone { .. } => Err(GroveError::failure("clone is not implemented yet")),
+        cli::Command::Clone {
+            url,
+            dir,
+            branch,
+            git_options,
+        } => {
+            let verdict = policy::clone_options::classify(&git_options)?;
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            commands::clone::run(&runner, &url, dir, branch, verdict, &cwd).map(|_| ())
+        }
         cli::Command::Init { dir, branch } => {
             let runner = git::runner::RealGit::new();
             let findings = policy::env::scan_os(std::env::vars_os());
