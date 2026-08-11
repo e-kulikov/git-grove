@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use bstr::BString;
+use bstr::{BString, ByteSlice};
 
 use crate::error::{GroveError, Result};
 use crate::git::runner::{GitRunner, Invocation};
@@ -71,8 +71,15 @@ fn get(runner: &dyn GitRunner, grove: &Grove, key: &str) -> Result<Option<BStrin
         OsStr::new("--get"),
         OsStr::new(key),
     ]))?;
-    if !output.ok() {
+    if output.status == 1 {
         return Ok(None);
+    }
+    if !output.ok() {
+        return Err(GroveError::failure(format!(
+            "git config --get {key} failed with exit status {}",
+            output.status
+        ))
+        .with_detail(output.stderr.as_slice().escape_bytes().to_string()));
     }
 
     let mut value = output.stdout;
@@ -297,6 +304,41 @@ mod tests {
             ]))
         );
         assert_eq!(metadata.publish_state, PublishState::Published);
+    }
+
+    #[test]
+    fn rejects_a_malformed_version() {
+        let fake = RecordingFake::new();
+        fake.push_response(GitOutput {
+            status: 0,
+            stdout: b"one\n".to_vec(),
+            stderr: Vec::new(),
+        });
+
+        let error = read(&fake, &grove()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert_eq!(error.message, "grove.version must be an ASCII u32");
+    }
+
+    #[test]
+    fn propagates_an_unexpected_config_read_failure_with_escaped_stderr() {
+        let fake = RecordingFake::new();
+        fake.push_response(GitOutput {
+            status: 3,
+            stdout: Vec::new(),
+            stderr: b"cannot read config: \xff\n".to_vec(),
+        });
+
+        let error = read(&fake, &grove()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.message.contains("grove.version"));
+        assert!(error.message.contains("exit status 3"));
+        assert_eq!(
+            error.detail.as_deref(),
+            Some(r"cannot\x20read\x20config:\x20\xFF\n")
+        );
     }
 
     #[test]
