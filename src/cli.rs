@@ -73,7 +73,10 @@ pub enum Command {
         branch: Option<OsString>,
     },
     /// Add a worktree for a branch
-    #[command(visible_alias = "sprout")]
+    #[command(
+        visible_alias = "sprout",
+        after_help = "Forms:\n  git-grove add <branch> [dir]\n  git-grove add --detach <revision> [dir]\n\nThe branch form accepts at most two positional arguments; the detached form accepts at most one."
+    )]
     Add(AddArgs),
     /// Show the grove and the state of every worktree
     #[command(visible_alias = "survey")]
@@ -196,14 +199,84 @@ fn is_real_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
-fn has_git_structure(git_dir: &Path) -> bool {
-    is_real_directory(git_dir)
-        && is_real_file(&git_dir.join("HEAD"))
-        && is_real_directory(&git_dir.join("objects"))
+fn read_path_file(path: &Path, prefix: &[u8]) -> Option<PathBuf> {
+    use rustix::fs::{open, Mode, OFlags};
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::unix::ffi::OsStringExt;
+
+    const MAX_PATH_FILE_BYTES: u64 = 4096;
+
+    let file = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_PATH_FILE_BYTES
+    {
+        return None;
+    }
+    let mut contents = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_PATH_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .ok()?;
+    if contents.len() as u64 > MAX_PATH_FILE_BYTES {
+        return None;
+    }
+    let line = contents.strip_suffix(b"\n").unwrap_or(&contents);
+    if line.is_empty()
+        || line
+            .iter()
+            .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r'))
+    {
+        return None;
+    }
+    let value = line.strip_prefix(prefix)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_vec(value.to_vec())))
+}
+
+fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+fn has_git_admin_structure(git_dir: &Path) -> bool {
+    if !is_real_directory(git_dir) || !is_real_file(&git_dir.join("HEAD")) {
+        return false;
+    }
+    if is_real_directory(&git_dir.join("objects")) {
+        return true;
+    }
+    let Some(common_dir) = read_path_file(&git_dir.join("commondir"), b"") else {
+        return false;
+    };
+    let common_dir = resolve_path(git_dir, common_dir);
+    is_real_directory(&common_dir) && is_real_directory(&common_dir.join("objects"))
 }
 
 fn is_existing_repository(path: &Path) -> bool {
-    is_real_directory(path) && (has_git_structure(&path.join(".git")) || has_git_structure(path))
+    if !is_real_directory(path) {
+        return false;
+    }
+    let marker = path.join(".git");
+    if has_git_admin_structure(&marker) || has_git_admin_structure(path) {
+        return true;
+    }
+    let Some(admin_dir) = read_path_file(&marker, b"gitdir: ") else {
+        return false;
+    };
+    has_git_admin_structure(&resolve_path(path, admin_dir))
 }
 
 fn looks_like_explicit_locator(arg: &OsStr) -> bool {
@@ -340,6 +413,102 @@ mod tests {
         expected.insert(1, OsString::from("clone"));
 
         assert_eq!(normalize_from(input, cwd.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn expands_a_relative_gitfile_repository_path_into_clone() {
+        let cwd = tempfile::tempdir().unwrap();
+        let repository = cwd.path().join("repository");
+        let admin = cwd.path().join("admin");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(&admin).unwrap();
+        std::fs::write(repository.join(".git"), "gitdir: ../admin\n").unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(admin.join("objects")).unwrap();
+
+        assert_eq!(
+            norm(cwd.path(), &["repository"]),
+            argv(&["clone", "repository"])
+        );
+    }
+
+    #[test]
+    fn expands_a_real_linked_worktree_path_into_clone() {
+        fn git(cwd: &Path, args: &[&str]) {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let cwd = tempfile::tempdir().unwrap();
+        let primary = cwd.path().join("primary");
+        let linked = cwd.path().join("linked");
+        git(
+            cwd.path(),
+            &["init", "--quiet", "--initial-branch=main", "primary"],
+        );
+        git(
+            &primary,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        assert_eq!(norm(cwd.path(), &["linked"]), argv(&["clone", "linked"]));
+    }
+
+    #[test]
+    fn refuses_malformed_or_dangling_gitfile_markers() {
+        let cwd = tempfile::tempdir().unwrap();
+        let admin = cwd.path().join("admin");
+        std::fs::create_dir(&admin).unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(admin.join("objects")).unwrap();
+
+        for (name, marker) in [
+            ("empty", b"".as_slice()),
+            ("missing-prefix", b"../admin\n".as_slice()),
+            ("missing-path", b"gitdir: \n".as_slice()),
+            ("extra-line", b"gitdir: ../admin\nextra\n".as_slice()),
+            ("embedded-nul", b"gitdir: ../admin\0\n".as_slice()),
+            ("dangling", b"gitdir: ../missing\n".as_slice()),
+        ] {
+            let repository = cwd.path().join(name);
+            std::fs::create_dir(&repository).unwrap();
+            std::fs::write(repository.join(".git"), marker).unwrap();
+            let err = normalize_from(
+                vec![OsString::from("git-grove"), OsString::from(name)],
+                cwd.path(),
+            )
+            .unwrap_err();
+            assert_eq!(err.class, crate::error::ExitClass::Usage, "marker {name}");
+        }
     }
 
     #[cfg(unix)]
@@ -506,6 +675,20 @@ mod tests {
         assert_eq!(detached_excess.class, crate::error::ExitClass::Usage);
 
         assert!(Cli::try_parse_from(["git-grove", "add", "one", "two", "three"]).is_err());
+    }
+
+    #[test]
+    fn add_help_explains_both_positional_forms_and_limits() {
+        use clap::CommandFactory;
+
+        let help = Cli::command()
+            .find_subcommand_mut("add")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("add <branch> [dir]"));
+        assert!(help.contains("add --detach <revision> [dir]"));
+        assert!(help.contains("at most two positional arguments"));
     }
 
     #[cfg(unix)]

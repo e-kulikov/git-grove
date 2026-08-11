@@ -113,6 +113,20 @@ fn rejects_invalid_add_shapes_with_usage_code() {
 }
 
 #[test]
+fn add_help_describes_branch_and_detached_forms() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["add", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("add <branch> [dir]"))
+        .stdout(predicates::str::contains("add --detach <revision> [dir]"))
+        .stdout(predicates::str::contains(
+            "at most two positional arguments",
+        ));
+}
+
+#[test]
 fn does_not_treat_an_empty_git_marker_as_an_existing_repository() {
     let sandbox = Sandbox::new();
     let candidate = sandbox.root().join("candidate");
