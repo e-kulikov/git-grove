@@ -33,6 +33,40 @@ fn release_version_requires_a_strict_matching_tag() {
 }
 
 #[test]
+fn release_docs_describe_real_metadata_and_the_narrow_environment_consent() {
+    for relative in ["README.md", "man/git-grove.1"] {
+        let document = fs::read_to_string(repo_root().join(relative)).unwrap();
+        let rendered_words = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !document.contains(".grove.toml"),
+            "{relative} advertises a metadata file that does not exist"
+        );
+        for required in [
+            ".bare/config",
+            "grove.version",
+            "grove.defaultBranch",
+            "grove.remote",
+            "grove.publishState",
+        ] {
+            assert!(
+                document.contains(required),
+                "{relative} omits metadata contract {required}"
+            );
+        }
+        assert!(
+            rendered_words.contains(
+                "does not bypass the platform check, minimum Git version, or refused clone options"
+            ),
+            "{relative} does not bound --ignore-unsupported precisely"
+        );
+        assert!(
+            !document.contains("Report unsupported platform, Git version"),
+            "{relative} claims the environment consent overrides hard gates"
+        );
+    }
+}
+
+#[test]
 fn release_package_is_deterministic_and_has_the_install_contract() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("git-grove");

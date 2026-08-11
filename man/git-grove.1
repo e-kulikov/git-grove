@@ -17,7 +17,9 @@ A grove is a directory holding a bare repository in
 a
 .B .git
 pointer file, format metadata in
-.BR .grove.toml ,
+.B grove.*
+keys in
+.BR .bare/config ,
 an
 .B AGENTS.md
 guide with
@@ -84,10 +86,14 @@ Write completion source for the selected shell to standard output.
 .SH OPTIONS
 .TP
 .B --ignore-unsupported
-Report unsupported platform, Git version, or environment findings and
-continue only after explicit approval on a terminal.  With nonterminal input,
-the flag itself is the explicit approval.  Repository-redirecting variables
-are still removed from child Git processes.
+Report unsafe Git environment findings and consent to continuing with those
+variables removed from child Git processes.  On a terminal, continuation also
+requires the exact response
+.B y
+or
+.BR yes ;
+with nonterminal input, the flag itself records consent.  It does not bypass
+the platform check, minimum Git version, or refused clone options.
 .TP
 .BR -h , " --help"
 Show command help.
@@ -103,8 +109,16 @@ The bare repository and shared Git administration directory.
 A regular pointer file whose content is exactly
 .BR "gitdir: ./.bare" .
 .TP
-.B .grove.toml
-Versioned grove metadata.  Version 0.1 refuses a newer format before writing.
+.B .bare/config
+The real Git configuration also stores metadata under
+.BR grove.version ,
+.BR grove.defaultBranch ,
+.BR grove.remote ,
+and
+.BR grove.publishState .
+Version 0.1 refuses a newer
+.B grove.version
+before writing.
 .TP
 .BR AGENTS.md " and " CLAUDE.md
 Generated repository facts and command guidance.  The latter is a relative

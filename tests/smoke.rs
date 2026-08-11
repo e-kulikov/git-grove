@@ -52,6 +52,21 @@ fn lists_only_the_supported_lifecycle_aliases_in_help() {
 }
 
 #[test]
+fn global_help_limits_the_override_to_unsafe_git_environment() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "unsafe Git environment variables",
+        ))
+        .stdout(predicates::str::contains("incompatible options").not())
+        .stdout(predicates::str::contains("unsupported platform").not())
+        .stdout(predicates::str::contains("Git version").not());
+}
+
+#[test]
 fn emits_runtime_zsh_completion() {
     let sandbox = Sandbox::new();
     sandbox

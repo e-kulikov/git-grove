@@ -26,7 +26,7 @@ pub const KNOWN: &[&str] = &[
     after_help = "Aliases: plant=clone  seed=init  sprout=add  survey=list"
 )]
 pub struct Cli {
-    /// Report incompatible options and environment, then continue
+    /// Consent to sanitizing unsafe Git environment variables
     #[arg(long, global = true)]
     pub ignore_unsupported: bool,
 

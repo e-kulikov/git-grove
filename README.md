@@ -86,12 +86,15 @@ named `detached-<short-oid>`.
 project/
 ├── .bare/       bare Git repository and shared administration
 ├── .git         pointer containing: gitdir: ./.bare
-├── .grove.toml  grove format metadata
 ├── AGENTS.md    generated repository facts and 0.1 command guide
 ├── CLAUDE.md    relative link to AGENTS.md
 ├── main/        worktree
 └── feature/     another worktree
 ```
+
+Grove metadata is stored in the real Git configuration at `.bare/config`, not
+in a separate metadata file. Version 0.1 uses `grove.version`,
+`grove.defaultBranch`, `grove.remote`, and `grove.publishState`.
 
 All managed worktree paths must remain strictly below the grove root. Existing
 files, symlinks, nonempty destinations, ambiguous remote branches, and
@@ -103,8 +106,9 @@ Before lifecycle operations, `git-grove` verifies the platform and Git
 version. It refuses repository-redirecting environment variables such as
 `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, object-directory overrides, and
 Git configuration overlays. `--ignore-unsupported` reports each finding and
-allows an explicit override; unsafe variables are still removed from every Git
-child process.
+records explicit consent to continue with those variables removed from every
+Git child process. It does not bypass the platform check, minimum Git version,
+or refused clone options.
 
 Exit status `0` means success, `1` means an unexpected Git/filesystem/I/O
 failure, `2` means repository state needs a human decision, and `64` means a
