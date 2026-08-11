@@ -421,6 +421,7 @@ fn valid_remote_name(remote: &OsStr) -> bool {
     let remote = remote.as_bytes();
     if remote.is_empty()
         || remote.starts_with(b"/")
+        || remote.starts_with(b"-")
         || remote.ends_with(b"/")
         || remote
             .windows(2)
@@ -585,9 +586,18 @@ fn process_option(
     };
 
     state.observe(spec, enabled, value.as_deref())?;
-    forwarded.push(canonical_name(spec, enabled));
-    if let Some(value) = value {
-        forwarded.push(value);
+    if spec.argument == ArgKind::Optional {
+        let mut canonical = canonical_name(spec, enabled).into_vec();
+        if let Some(value) = value {
+            canonical.push(b'=');
+            canonical.extend_from_slice(value.as_bytes());
+        }
+        forwarded.push(OsString::from_vec(canonical));
+    } else {
+        forwarded.push(canonical_name(spec, enabled));
+        if let Some(value) = value {
+            forwarded.push(value);
+        }
     }
     Ok(())
 }
@@ -701,6 +711,8 @@ mod tests {
     use crate::error::ExitClass;
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::process::Command;
+    use tempfile::TempDir;
 
     fn opts(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
@@ -735,12 +747,9 @@ mod tests {
             (&["--no-hardlinks"], &["--no-hardlinks"]),
             (&["--no-no-hardlinks"], &["--hardlinks"]),
             (&["--recurse-submodules"], &["--recurse-submodules"]),
-            (
-                &["--recurse-submodules=lib"],
-                &["--recurse-submodules", "lib"],
-            ),
+            (&["--recurse-submodules=lib"], &["--recurse-submodules=lib"]),
             (&["--no-recurse-submodules"], &["--no-recurse-submodules"]),
-            (&["--recursive=lib"], &["--recurse-submodules", "lib"]),
+            (&["--recursive=lib"], &["--recurse-submodules=lib"]),
             (&["--no-recursive"], &["--no-recurse-submodules"]),
             (&["--jobs", "2"], &["--jobs", "2"]),
             (&["--no-jobs"], &["--no-jobs"]),
@@ -845,7 +854,7 @@ mod tests {
     #[test]
     fn resolves_exact_names_semantic_aliases_and_unique_abbreviations() {
         assert_forwarded(&["--verb"], &["--verbose"]);
-        assert_forwarded(&["--rec=lib"], &["--recurse-submodules", "lib"]);
+        assert_forwarded(&["--rec=lib"], &["--recurse-submodules=lib"]);
         assert_forwarded(&["--no-rec"], &["--no-recurse-submodules"]);
         assert_forwarded(&["--hard"], &["--hardlinks"]);
         assert_forwarded(&["--no-hard"], &["--no-hardlinks"]);
@@ -866,6 +875,59 @@ mod tests {
             assert_eq!(error.class, ExitClass::Usage, "accepted {input}");
             assert!(error.message.contains("ambiguous"), "{error}");
         }
+    }
+
+    #[test]
+    fn keeps_optional_pathspecs_attached_in_canonical_and_real_git_argv() {
+        let ascii_verdict = classify(&opts(&["--rec=lib"])).unwrap();
+        assert_eq!(ascii_verdict.forwarded, opts(&["--recurse-submodules=lib"]));
+
+        let raw = OsString::from_vec(b"--recurse-submodules=lib-\xff".to_vec());
+        let raw_verdict = classify(&[raw]).unwrap();
+        assert_eq!(
+            raw_verdict.forwarded[0].as_bytes(),
+            b"--recurse-submodules=lib-\xff"
+        );
+
+        let sandbox = TempDir::new().unwrap();
+        let origin = sandbox.path().join("origin.git");
+        let target = sandbox.path().join("clone");
+        let path = std::env::var_os("PATH").expect("PATH must be set for the Git probe");
+        let configure = |command: &mut Command| {
+            command
+                .env_clear()
+                .env("PATH", &path)
+                .env("HOME", sandbox.path())
+                .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("LC_ALL", "C");
+        };
+
+        let mut init = Command::new("git");
+        configure(&mut init);
+        let init = init
+            .args(["init", "--quiet", "--bare"])
+            .arg(&origin)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{}", display_bytes(&init.stderr));
+
+        let mut clone = Command::new("git");
+        configure(&mut clone);
+        let clone = clone
+            .arg("clone")
+            .args(&ascii_verdict.forwarded)
+            .arg("--")
+            .arg(&origin)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "canonical optional argument was rejected by Git: {}",
+            display_bytes(&clone.stderr)
+        );
     }
 
     #[test]
@@ -1057,6 +1119,25 @@ mod tests {
         let verdict = classify(&[OsString::from("--origin"), raw.clone()]).unwrap();
         assert_eq!(verdict.remote_name.as_bytes(), raw.as_bytes());
         assert_eq!(verdict.forwarded[1].as_bytes(), raw.as_bytes());
+    }
+
+    #[test]
+    fn refuses_remote_names_that_can_be_reparsed_as_options() {
+        for input in [
+            &["--origin=-help"][..],
+            &["--origin", "--help"][..],
+            &["-o-help"][..],
+            &["-o", "--help"][..],
+        ] {
+            let error = classify(&opts(input)).unwrap_err();
+            assert_eq!(error.class, ExitClass::Usage, "accepted {input:?}");
+            assert!(error.message.contains("-help"), "{error}");
+        }
+
+        let raw = OsString::from_vec(b"--origin=-\xff".to_vec());
+        let error = classify(&[raw]).unwrap_err();
+        assert_eq!(error.class, ExitClass::Usage);
+        assert!(error.message.contains(r"-\xFF"), "{error}");
     }
 
     #[test]
