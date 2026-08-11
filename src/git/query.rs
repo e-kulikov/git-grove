@@ -336,7 +336,15 @@ pub fn worktrees(runner: &dyn GitRunner, grove: &Grove) -> Result<Vec<WorktreeRe
     if !output.ok() {
         return Err(failure("worktree list --porcelain -z", &output));
     }
-    parse_worktrees(&output.stdout)
+    let records = parse_worktrees(&output.stdout)?;
+    let expected_bare = grove.bare_dir();
+    let mut bare_records = records.iter().filter(|record| record.bare);
+    match (bare_records.next(), bare_records.next()) {
+        (Some(record), None) if record.path == expected_bare => Ok(records),
+        _ => Err(GroveError::failure(
+            "git returned an invalid bare pseudo-worktree record",
+        )),
+    }
 }
 
 fn worktree_invocation(record: &WorktreeRecord, admin_dir: &Path) -> Invocation {
@@ -946,5 +954,22 @@ mod tests {
                 "-z"
             ]
         );
+    }
+
+    #[test]
+    fn rejects_wrong_duplicate_or_missing_canonical_bare_pseudo_rows() {
+        for raw in [
+            b"worktree /g/main\0bare\0\0".as_slice(),
+            b"worktree /g/.bare\0bare\0\0worktree /g/.bare\0bare\0\0",
+            b"worktree /g/main\0HEAD abc\0branch refs/heads/main\0\0",
+        ] {
+            let fake = RecordingFake::new();
+            fake.push_response(output(0, raw, b""));
+
+            let error = worktrees(&fake, &grove()).unwrap_err();
+
+            assert_eq!(error.class, ExitClass::Failure, "accepted {raw:?}");
+            assert!(error.message.contains("bare pseudo-worktree"));
+        }
     }
 }
