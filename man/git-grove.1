@@ -1,0 +1,181 @@
+.TH GIT-GROVE 1 "2026-08-11" "git-grove 0.1.0" "Git Extensions"
+.SH NAME
+git-grove \- manage repositories as a bare clone surrounded by Git worktrees
+.SH SYNOPSIS
+.B git grove
+.RB [ --ignore-unsupported ]
+.I command
+.RI [ options ]
+.PP
+.B git-grove
+.RB [ --ignore-unsupported ]
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+A grove is a directory holding a bare repository in
+.BR .bare ,
+a
+.B .git
+pointer file, format metadata in
+.BR .grove.toml ,
+an
+.B AGENTS.md
+guide with
+.B CLAUDE.md
+beside it, and one directory per Git worktree.
+.PP
+Inside a grove, invocation without a command runs
+.BR list .
+A repository locator in command position selects
+.BR clone .
+The command aliases are
+.BR plant = clone ,
+.BR seed = init ,
+.BR sprout = add ,
+and
+.BR survey = list .
+.SH COMMANDS
+.TP
+.B clone \fR[\fB-b\fR|\fB--branch \fIbranch\fR] \fIurl\fR [\fIdir\fR] [\fB--\fR \fIgit-options\fR...]
+Clone a repository as
+.I dir/.bare
+and create its first worktree.  The default directory is derived from the
+repository locator.  The selected branch also names the first worktree.
+Options following
+.B --
+are forwarded only when they preserve the grove layout and repository
+identity.  Options which choose another Git directory, worktree, object
+directory, configuration overlay, mirror layout, separate Git directory, or
+unsafe reference relationship are refused.  A reference repository requires
+.BR --dissociate .
+.TP
+.B init \fR[\fB-b\fR|\fB--branch \fIbranch\fR] [\fIdir\fR]
+Create an empty repository directly as a grove.  The destination must be
+missing or an existing empty directory.  If a branch is supplied it becomes
+the unborn initial branch and the first worktree name; otherwise Git's initial
+branch setting is used.
+.TP
+.B add \fIbranch\fR [\fIdir\fR]
+Add a worktree for an existing local branch or a branch found through exactly
+one remote fetch refspec.  If
+.I dir
+is omitted, the branch name is used as the worktree path.
+.TP
+.B add \fR[\fB--start \fIrevision\fR] \fIbranch\fR [\fIdir\fR]
+Create a branch from
+.I revision
+when it exists neither locally nor on a remote.  In an unborn repository, an
+absent
+.B --start
+creates an orphan branch.  The option is refused if the branch already exists.
+.TP
+.B add \fB--detach \fIrevision\fR [\fIdir\fR]
+Add a detached worktree.  The default directory is
+.BR detached- <short-object-name>.
+.TP
+.B list \fR[\fB--porcelain\fR]
+Show each non-bare worktree, branch, upstream, ahead/behind state, dirtiness,
+and lock or recovery state.  Human output escapes non-printing bytes
+reversibly.  Missing, invalid, or prunable worktrees are reported and cause
+exit status 2.
+.TP
+.B completion \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR}
+Write completion source for the selected shell to standard output.
+.SH OPTIONS
+.TP
+.B --ignore-unsupported
+Report unsupported platform, Git version, or environment findings and
+continue only after explicit approval on a terminal.  With nonterminal input,
+the flag itself is the explicit approval.  Repository-redirecting variables
+are still removed from child Git processes.
+.TP
+.BR -h , " --help"
+Show command help.
+.TP
+.BR -V , " --version"
+Show the program version.
+.SH GROVE LAYOUT
+.TP
+.B .bare/
+The bare repository and shared Git administration directory.
+.TP
+.B .git
+A regular pointer file whose content is exactly
+.BR "gitdir: ./.bare" .
+.TP
+.B .grove.toml
+Versioned grove metadata.  Version 0.1 refuses a newer format before writing.
+.TP
+.BR AGENTS.md " and " CLAUDE.md
+Generated repository facts and command guidance.  The latter is a relative
+symbolic link to the former.
+.TP
+.I worktree directories
+Each managed worktree is a strict descendant of the grove root.  Final path
+components must be vacant regular path names, not symbolic links.
+.SH ENVIRONMENT
+Lifecycle commands require 64-bit Linux and Git 2.47 or newer.
+.PP
+Variables which redirect the repository, index, worktree, object database,
+namespace, or configuration are refused before mutation.  These include
+.BR GIT_DIR ,
+.BR GIT_COMMON_DIR ,
+.BR GIT_WORK_TREE ,
+.BR GIT_INDEX_FILE ,
+.BR GIT_OBJECT_DIRECTORY ,
+.BR GIT_ALTERNATE_OBJECT_DIRECTORIES ,
+.BR GIT_NAMESPACE ,
+.BR GIT_CONFIG ,
+.BR GIT_CONFIG_COUNT ,
+.BR GIT_CONFIG_PARAMETERS ,
+and numbered
+.B GIT_CONFIG_KEY_*
+and
+.B GIT_CONFIG_VALUE_*
+overlays.  Regardless of an override, all of them are removed from every Git
+process started by git-grove.  Transport variables such as
+.B GIT_SSH_COMMAND
+are preserved.
+.SH PORCELAIN OUTPUT
+.B list --porcelain
+starts with the NUL-terminated identifier
+.BR git-grove-list-v1 .
+Each worktree is a sequence of NUL-terminated key/value pairs followed by an
+empty key.  The keys, in order, are
+.BR worktree ,
+.BR status ,
+.BR branch ,
+.BR upstream ,
+.BR ahead ,
+.BR behind ,
+.BR dirty ,
+and
+.BR locked .
+Paths and Git names are emitted as their original bytes.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Unexpected Git, filesystem, standard-output, or other I/O failure.
+.TP
+.B 2
+Repository state needs a human decision; for example, ambiguous remote
+branches, an occupied destination, or an invalid worktree record.
+.TP
+.B 64
+Usage error, refused option or environment, unsupported context without an
+override, or no grove where one is required.
+.SH FILES
+.TP
+.I git-grove_0.1.0_linux_x86_64.tar.gz
+Static Linux x86_64 release archive containing the executable, license,
+README, this manual, and generated Bash, Zsh, and Fish completions.
+.TP
+.I SHA256SUMS
+SHA-256 checksum file for the release archive.
+.SH SEE ALSO
+.BR git (1),
+.BR git-clone (1),
+.BR git-worktree (1)
