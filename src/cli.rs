@@ -244,6 +244,7 @@ fn read_path_file(path: &Path, prefix: &[u8]) -> Option<PathBuf> {
 }
 
 fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
+    let path: PathBuf = path.components().collect();
     if path.is_absolute() {
         path
     } else {
@@ -422,7 +423,7 @@ mod tests {
         let admin = cwd.path().join("admin");
         std::fs::create_dir(&repository).unwrap();
         std::fs::create_dir(&admin).unwrap();
-        std::fs::write(repository.join(".git"), "gitdir: ../admin\n").unwrap();
+        std::fs::write(repository.join(".git"), "gitdir: ../admin/\n").unwrap();
         std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir(admin.join("objects")).unwrap();
 
@@ -509,6 +510,51 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.class, crate::error::ExitClass::Usage, "marker {name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_gitfile_targeting_a_symlink_with_a_trailing_separator() {
+        let cwd = tempfile::tempdir().unwrap();
+        let repository = cwd.path().join("repository");
+        let real_admin = cwd.path().join("real-admin");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(&real_admin).unwrap();
+        std::fs::write(real_admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(real_admin.join("objects")).unwrap();
+        std::os::unix::fs::symlink(&real_admin, cwd.path().join("admin-link")).unwrap();
+        std::fs::write(repository.join(".git"), "gitdir: ../admin-link/\n").unwrap();
+
+        let err = normalize_from(
+            vec![OsString::from("git-grove"), OsString::from("repository")],
+            cwd.path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_common_dir_symlink_hidden_by_a_trailing_separator() {
+        let cwd = tempfile::tempdir().unwrap();
+        let repository = cwd.path().join("repository");
+        let admin = cwd.path().join("admin");
+        let real_common = cwd.path().join("real-common");
+        std::fs::create_dir(&repository).unwrap();
+        std::fs::create_dir(&admin).unwrap();
+        std::fs::create_dir(&real_common).unwrap();
+        std::fs::write(repository.join(".git"), "gitdir: ../admin\n").unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(admin.join("commondir"), "../common-link/\n").unwrap();
+        std::fs::create_dir(real_common.join("objects")).unwrap();
+        std::os::unix::fs::symlink(&real_common, cwd.path().join("common-link")).unwrap();
+
+        let err = normalize_from(
+            vec![OsString::from("git-grove"), OsString::from("repository")],
+            cwd.path(),
+        )
+        .unwrap_err();
+        assert_eq!(err.class, crate::error::ExitClass::Usage);
     }
 
     #[cfg(unix)]
