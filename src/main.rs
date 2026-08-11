@@ -60,8 +60,18 @@ fn run(cli: cli::Cli) -> Result<()> {
             commands::init::run(&runner, dir, branch, &cwd).map(|_| ())
         }
         cli::Command::Add(args) => {
-            let _mode = args.resolve()?;
-            Err(GroveError::failure("add is not implemented yet"))
+            let mode = args.resolve()?;
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let grove = grove::discover::Grove::discover(&cwd)?;
+            let metadata = grove::metadata::read(&runner, &grove)?;
+            grove::metadata::ensure_supported(&metadata)?;
+            commands::add::run(&runner, &grove, mode).map(|_| ())
         }
         cli::Command::List { .. } => Err(GroveError::failure("list is not implemented yet")),
         cli::Command::Completion { shell } => {

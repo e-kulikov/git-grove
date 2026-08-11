@@ -65,6 +65,29 @@ impl Sandbox {
         out
     }
 
+    #[cfg(unix)]
+    pub fn git_os(&self, cwd: &Path, args: &[OsString]) -> Output {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(cwd)
+            .args([
+                OsString::from("-c"),
+                OsString::from("init.defaultBranch=main"),
+                OsString::from("-c"),
+                OsString::from("core.hooksPath="),
+                OsString::from("-c"),
+                OsString::from("commit.gpgSign=false"),
+            ])
+            .args(args);
+        self.apply_env(&mut cmd);
+        let out = cmd.output().expect("git must be installed");
+        assert!(
+            out.status.success(),
+            "git with OS arguments failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
     pub fn grove_in(&self, cwd: &Path, args: &[&str]) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::cargo_bin("git-grove").unwrap();
         cmd.current_dir(cwd).args(args);
