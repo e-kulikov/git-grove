@@ -7,6 +7,7 @@ mod fsx;
 mod git;
 #[allow(dead_code)]
 mod grove;
+mod output;
 #[allow(dead_code)]
 mod policy;
 
@@ -73,7 +74,27 @@ fn run(cli: cli::Cli) -> Result<()> {
             grove::metadata::ensure_supported(&metadata)?;
             commands::add::run(&runner, &grove, mode).map(|_| ())
         }
-        cli::Command::List { .. } => Err(GroveError::failure("list is not implemented yet")),
+        cli::Command::List { porcelain } => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let grove = grove::discover::Grove::discover(&cwd)?;
+            let metadata = grove::metadata::read(&runner, &grove)?;
+            grove::metadata::ensure_supported(&metadata)?;
+            match commands::list::run(&runner, &grove, porcelain)? {
+                ExitClass::Ok => Ok(()),
+                ExitClass::NeedsDecision => Err(GroveError::needs_decision(
+                    "some registered worktrees need attention",
+                )),
+                ExitClass::Failure | ExitClass::Usage => {
+                    unreachable!("list returns only success or needs-decision classes")
+                }
+            }
+        }
         cli::Command::Completion { shell } => {
             let mut command = cli::Cli::command();
             clap_complete::generate(

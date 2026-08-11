@@ -70,13 +70,15 @@ fn defaults_to_list_only_when_inside_a_grove() {
         .code(64)
         .stderr(predicates::str::contains("not inside a grove"));
 
-    std::fs::create_dir(sandbox.root().join(".bare")).unwrap();
-    std::fs::write(sandbox.root().join(".git"), "gitdir: ./.bare\n").unwrap();
+    sandbox
+        .grove(&["init", ".", "--branch", "main"])
+        .assert()
+        .success();
     sandbox
         .grove(&[])
         .assert()
-        .code(1)
-        .stderr(predicates::str::contains("list is not implemented yet"));
+        .success()
+        .stdout(predicates::str::contains("UNBORN"));
 }
 
 #[test]
@@ -88,13 +90,15 @@ fn applies_implicit_actions_after_the_global_policy_override() {
         .code(1)
         .stderr(predicates::str::contains("clone is not implemented yet"));
 
-    std::fs::create_dir(sandbox.root().join(".bare")).unwrap();
-    std::fs::write(sandbox.root().join(".git"), "gitdir: ./.bare\n").unwrap();
+    sandbox
+        .grove(&["init", ".", "--branch", "main"])
+        .assert()
+        .success();
     sandbox
         .grove(&["--ignore-unsupported"])
         .assert()
-        .code(1)
-        .stderr(predicates::str::contains("list is not implemented yet"));
+        .success()
+        .stdout(predicates::str::contains("UNBORN"));
 }
 
 #[test]
