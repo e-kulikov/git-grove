@@ -209,6 +209,30 @@ fn uses_the_default_branch_selected_by_git_when_branch_is_absent() {
     assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "trunk");
 }
 
+#[test]
+fn default_branch_discovery_ignores_the_callers_unrelated_repository() {
+    let sandbox = Sandbox::new();
+    let unrelated = sandbox.root().join("unrelated");
+    std::fs::create_dir(&unrelated).unwrap();
+    sandbox.git(&unrelated, &["init", "--quiet"]);
+    sandbox.git(
+        &unrelated,
+        &["config", "--local", "init.defaultBranch", "local-only"],
+    );
+    let global_config = sandbox.root().join("gitconfig");
+    std::fs::write(&global_config, "[init]\n\tdefaultBranch = global-main\n").unwrap();
+
+    sandbox
+        .grove_in(&unrelated, &["init", "../fresh"])
+        .env("GIT_CONFIG_GLOBAL", global_config)
+        .assert()
+        .success();
+
+    let root = sandbox.root().join("fresh");
+    assert!(root.join("global-main").is_dir());
+    assert!(!root.join("local-only").exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn preserves_non_utf8_branch_bytes() {

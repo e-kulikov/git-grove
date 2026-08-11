@@ -14,6 +14,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
+const REPOSITORY_NEUTRAL_CWD: &str = "/proc";
+
 fn escaped_path(path: &Path) -> String {
     path.as_os_str().as_bytes().escape_bytes().to_string()
 }
@@ -334,7 +336,11 @@ fn preflight_branch(runner: &dyn GitRunner, branch: Option<OsString>) -> Result<
         Some(branch) => BString::from(branch.as_bytes()),
         None => trimmed_line(
             runner
-                .run_ok(Invocation::new().args(["var", "GIT_DEFAULT_BRANCH"]))?
+                .run_ok(
+                    Invocation::new()
+                        .cwd(REPOSITORY_NEUTRAL_CWD)
+                        .args(["var", "GIT_DEFAULT_BRANCH"]),
+                )?
                 .stdout,
             "default branch",
         )?,
@@ -434,7 +440,11 @@ fn run_transaction(
         init_args.push(branch.clone());
     }
     init_args.push(bare.anchored_path.as_os_str().to_os_string());
-    guarded.run_ok(Invocation::new().args(init_args))?;
+    guarded.run_ok(
+        Invocation::new()
+            .cwd(REPOSITORY_NEUTRAL_CWD)
+            .args(init_args),
+    )?;
 
     root.validate()?;
     bare.validate()?;
