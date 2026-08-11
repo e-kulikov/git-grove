@@ -1,5 +1,6 @@
 use crate::error::{GroveError, Result};
 use crate::fsx;
+use bstr::ByteSlice;
 use rustix::fs::{fstat, mkdirat, openat, statat, AtFlags, Mode, OFlags, CWD};
 use std::ffi::OsStr;
 use std::fs::File;
@@ -8,6 +9,10 @@ use std::path::{Component, Path, PathBuf};
 
 pub const POINTER_CONTENTS: &str = "gitdir: ./.bare\n";
 pub const RESERVED: &[&str] = &[".bare", ".git", "AGENTS.md", "CLAUDE.md"];
+
+fn escaped_path(path: &Path) -> String {
+    path.as_os_str().as_bytes().escape_bytes().to_string()
+}
 
 pub fn write_pointer(root: &Path) -> Result<()> {
     fsx::write_atomic(&root.join(".git"), POINTER_CONTENTS.as_bytes())
@@ -72,21 +77,21 @@ impl ValidatedWorktreePath {
                         Err(error) => {
                             return Err(GroveError::failure(format!(
                                 "cannot create a worktree parent under {}: {error}",
-                                self.root_path.display()
+                                escaped_path(&self.root_path)
                             )))
                         }
                     }
                     open_directory_at(&current, component).map_err(|error| {
                         GroveError::usage(format!(
                             "{} has a non-directory or symlinked ancestor: {error}",
-                            self.path().display()
+                            escaped_path(&self.path())
                         ))
                     })?
                 }
                 Err(error) => {
                     return Err(GroveError::usage(format!(
                         "{} has a non-directory or symlinked ancestor: {error}",
-                        self.path().display()
+                        escaped_path(&self.path())
                     )))
                 }
             };
@@ -113,7 +118,7 @@ pub fn validate_worktree_path(root: &Path, requested: &Path) -> Result<Validated
     .map_err(|error| {
         GroveError::usage(format!(
             "cannot open grove root {} without following symlinks: {error}",
-            root.display()
+            escaped_path(root)
         ))
     })?;
     let validated = ValidatedWorktreePath {
@@ -125,24 +130,56 @@ pub fn validate_worktree_path(root: &Path, requested: &Path) -> Result<Validated
     Ok(validated)
 }
 
+/// Validate a worktree path using a caller-held grove root descriptor.
+pub fn validate_worktree_path_at(
+    root_directory: &File,
+    root: &Path,
+    requested: &Path,
+) -> Result<ValidatedWorktreePath> {
+    let relative = contained_relative_path(root, requested)?;
+    let validated = ValidatedWorktreePath {
+        root_directory: root_directory.try_clone().map_err(|error| {
+            GroveError::failure(format!(
+                "cannot duplicate grove directory descriptor: {error}"
+            ))
+        })?,
+        root_path: root.to_path_buf(),
+        relative,
+    };
+    validated.validate_vacant()?;
+    Ok(validated)
+}
+
 fn contained_relative_path(root: &Path, requested: &Path) -> Result<PathBuf> {
     let relative = if requested.is_absolute() {
         requested.strip_prefix(root).map_err(|_| {
-            GroveError::usage(format!("{} is outside the grove", requested.display()))
+            GroveError::usage(format!("{} is outside the grove", escaped_path(requested)))
                 .with_detail("worktrees must live under the grove root")
         })?
     } else {
         requested
     };
 
+    validate_relative_worktree_path(relative)
+}
+
+/// Validate path policy before the grove root exists.
+pub fn validate_relative_worktree_path(requested: &Path) -> Result<PathBuf> {
+    if requested.is_absolute() {
+        return Err(GroveError::usage(format!(
+            "{} must be relative to the grove root",
+            escaped_path(requested)
+        )));
+    }
+
     let mut cleaned = PathBuf::new();
-    for component in relative.components() {
+    for component in requested.components() {
         match component {
             Component::Normal(part) => {
                 if RESERVED.iter().any(|reserved| part == OsStr::new(reserved)) {
                     return Err(GroveError::usage(format!(
                         "{} is reserved by the grove layout",
-                        Path::new(part).display()
+                        escaped_path(Path::new(part))
                     )));
                 }
                 if part.as_bytes().starts_with(b".grove-adopt-") {
@@ -155,7 +192,7 @@ fn contained_relative_path(root: &Path, requested: &Path) -> Result<PathBuf> {
             _ => {
                 return Err(GroveError::usage(format!(
                     "{} must be a plain path inside the grove",
-                    requested.display()
+                    escaped_path(requested)
                 )))
             }
         }
@@ -181,7 +218,7 @@ fn validate_vacant_from(root: &File, absolute: &Path, relative: &Path) -> Result
             return match statat(&current, component, AtFlags::SYMLINK_NOFOLLOW) {
                 Ok(_) => Err(GroveError::needs_decision(format!(
                     "{} already exists",
-                    absolute.display()
+                    escaped_path(absolute)
                 ))
                 .with_detail(
                     "pass an explicit directory argument to place the worktree elsewhere",
@@ -189,7 +226,7 @@ fn validate_vacant_from(root: &File, absolute: &Path, relative: &Path) -> Result
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(GroveError::failure(format!(
                     "cannot inspect {}: {error}",
-                    absolute.display()
+                    escaped_path(absolute)
                 ))),
             };
         }
@@ -200,7 +237,7 @@ fn validate_vacant_from(root: &File, absolute: &Path, relative: &Path) -> Result
             Err(error) => {
                 return Err(GroveError::usage(format!(
                     "{} has a non-directory or symlinked ancestor: {error}",
-                    absolute.display()
+                    escaped_path(absolute)
                 )))
             }
         };
@@ -215,13 +252,13 @@ fn validate_root_identity(root: &File, root_path: &Path) -> Result<()> {
     let named = statat(CWD, root_path, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
         GroveError::usage(format!(
             "grove root {} changed while preparing the worktree: {error}",
-            root_path.display()
+            escaped_path(root_path)
         ))
     })?;
     if held.st_dev != named.st_dev || held.st_ino != named.st_ino {
         return Err(GroveError::usage(format!(
             "grove root {} changed while preparing the worktree",
-            root_path.display()
+            escaped_path(root_path)
         )));
     }
     Ok(())
@@ -360,6 +397,17 @@ mod tests {
     }
 
     #[test]
+    fn occupied_non_utf8_worktree_paths_are_escaped_reversibly() {
+        let dir = root();
+        let relative = PathBuf::from(std::ffi::OsString::from_vec(b"topic-\xff".to_vec()));
+        std::fs::write(dir.path().join(&relative), b"foreign").unwrap();
+
+        let error = validate_worktree_path(dir.path(), &relative).unwrap_err();
+
+        assert!(error.message.contains(r"topic-\xFF"), "{error}");
+    }
+
+    #[test]
     fn rejects_a_symlinked_or_non_directory_ancestor() {
         let dir = root();
         std::fs::create_dir(dir.path().join("real")).unwrap();
@@ -384,6 +432,33 @@ mod tests {
 
         let err = validated.validate_vacant().unwrap_err();
         assert_eq!(err.class, crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn held_root_validation_never_creates_parents_in_a_replacement_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let root_path = parent.path().join("grove");
+        let moved_path = parent.path().join("held-grove");
+        std::fs::create_dir(&root_path).unwrap();
+        let root_directory = openat(
+            CWD,
+            &root_path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .unwrap();
+        let worktree =
+            validate_worktree_path_at(&root_directory, &root_path, Path::new("topic/branch"))
+                .unwrap();
+
+        std::fs::rename(&root_path, &moved_path).unwrap();
+        std::fs::create_dir(&root_path).unwrap();
+
+        let error = worktree.create_parent_directories().unwrap_err();
+        assert_eq!(error.class, crate::error::ExitClass::Usage);
+        assert!(!root_path.join("topic").exists());
+        assert!(!moved_path.join("topic").exists());
     }
 
     #[test]

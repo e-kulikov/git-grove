@@ -39,6 +39,22 @@ fn creates_the_layout_and_the_first_worktree() {
         ],
     );
     assert_eq!(String::from_utf8_lossy(&state.stdout).trim(), "unpublished");
+
+    let metadata = sandbox.git(
+        &root,
+        &[
+            "config",
+            "--file",
+            root.join(".bare/config").to_str().unwrap(),
+            "--get-regexp",
+            "^grove\\.",
+        ],
+    );
+    let metadata = String::from_utf8(metadata.stdout).unwrap();
+    assert!(metadata.contains("grove.version 1\n"));
+    assert!(metadata.contains("grove.defaultbranch main\n"));
+    assert!(metadata.contains("grove.publishstate unpublished\n"));
+    assert!(!metadata.contains("grove.remote"));
 }
 
 #[test]
@@ -51,8 +67,75 @@ fn refuses_a_directory_that_holds_files() {
     sandbox
         .grove(&["init", "occupied"])
         .assert()
-        .code(64)
+        .code(2)
         .stderr(predicates::str::contains("adopt"));
+}
+
+#[test]
+fn missing_parent_components_cannot_bypass_occupied_root_classification() {
+    let sandbox = Sandbox::new();
+    let marker = sandbox.root().join("notes.txt");
+    std::fs::write(&marker, b"foreign").unwrap();
+
+    sandbox
+        .grove(&["init", "missing/..", "--branch", "main"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("adopt"));
+
+    assert_eq!(std::fs::read(marker).unwrap(), b"foreign");
+    assert!(!sandbox.root().join(".bare").exists());
+    assert!(!sandbox.root().join("missing").exists());
+}
+
+#[test]
+fn explicit_reserved_branch_path_is_refused_before_creating_the_root() {
+    let sandbox = Sandbox::new();
+
+    sandbox
+        .grove(&["init", "fresh", "--branch", "AGENTS.md/topic"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("reserved"));
+
+    assert!(!sandbox.root().join("fresh").exists());
+}
+
+#[test]
+fn git_selected_reserved_branch_path_is_refused_before_creating_the_root() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.root().join("gitconfig");
+    std::fs::write(&config, "[init]\n\tdefaultBranch = AGENTS.md/topic\n").unwrap();
+
+    sandbox
+        .grove(&["init", "fresh"])
+        .env("GIT_CONFIG_GLOBAL", config)
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("reserved"));
+
+    assert!(!sandbox.root().join("fresh").exists());
+}
+
+#[test]
+fn refuses_an_existing_bare_directory_or_symlink_as_foreign_state() {
+    for kind in ["directory", "symlink"] {
+        let sandbox = Sandbox::new();
+        let root = sandbox.root().join("fresh");
+        std::fs::create_dir(&root).unwrap();
+        match kind {
+            "directory" => std::fs::create_dir(root.join(".bare")).unwrap(),
+            "symlink" => std::os::unix::fs::symlink("foreign", root.join(".bare")).unwrap(),
+            _ => unreachable!(),
+        }
+
+        sandbox
+            .grove(&["init", "fresh", "--branch", "main"])
+            .assert()
+            .code(2);
+
+        assert!(std::fs::symlink_metadata(root.join(".bare")).is_ok());
+    }
 }
 
 #[test]
@@ -138,7 +221,8 @@ fn preserves_non_utf8_branch_bytes() {
         .grove(&["init", "fresh", "--branch"])
         .arg(&branch)
         .assert()
-        .success();
+        .success()
+        .stdout(predicates::str::contains(r"topic-\xFF"));
 
     let worktree = sandbox.root().join("fresh").join(&branch);
     assert!(worktree.is_dir());
@@ -166,6 +250,157 @@ fn unrelated_non_utf8_environment_does_not_bypass_error_rendering() {
         )
         .assert()
         .success();
+}
+
+#[test]
+fn replacing_the_named_root_cannot_redirect_git_into_foreign_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let root = sandbox.root().join("fresh");
+    let moved = sandbox.root().join("moved-original");
+    let bin = sandbox.root().join("replacing-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\ncase \"$1\" in\n  init) mv \"$GROVE_ROOT\" \"$GROVE_MOVED\"; mkdir \"$GROVE_ROOT\"; printf foreign > \"$GROVE_ROOT/foreign.txt\"; /usr/bin/git \"$@\"; exit $?;;\nesac\nexec /usr/bin/git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+
+    sandbox
+        .grove(&["init", "fresh", "--branch", "main"])
+        .env("PATH", path)
+        .env("GROVE_ROOT", &root)
+        .env("GROVE_MOVED", &moved)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("not a safe cleanup target"));
+
+    assert_eq!(std::fs::read(root.join("foreign.txt")).unwrap(), b"foreign");
+    assert!(!root.join(".bare").exists(), "foreign root was initialized");
+    assert!(moved.join(".bare/HEAD").is_file(), "held root was not used");
+}
+
+#[test]
+fn replacing_the_named_bare_path_cannot_redirect_git_into_foreign_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = Sandbox::new();
+    let root = sandbox.root().join("fresh");
+    let moved_bare = sandbox.root().join("moved-bare");
+    let foreign_bare = sandbox.root().join("foreign-bare");
+    std::fs::create_dir(&foreign_bare).unwrap();
+    std::fs::write(foreign_bare.join("marker"), b"foreign").unwrap();
+    let bin = sandbox.root().join("bare-replacing-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    std::fs::write(
+        &git,
+        "#!/bin/sh\ncase \"$1\" in\n  init) mv \"$GROVE_ROOT/.bare\" \"$GROVE_MOVED_BARE\"; ln -s \"$GROVE_FOREIGN_BARE\" \"$GROVE_ROOT/.bare\"; /usr/bin/git \"$@\"; exit $?;;\nesac\nexec /usr/bin/git \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+
+    sandbox
+        .grove(&["init", "fresh", "--branch", "main"])
+        .env("PATH", path)
+        .env("GROVE_ROOT", &root)
+        .env("GROVE_MOVED_BARE", &moved_bare)
+        .env("GROVE_FOREIGN_BARE", &foreign_bare)
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("not a safe cleanup target"));
+
+    assert_eq!(
+        std::fs::read(foreign_bare.join("marker")).unwrap(),
+        b"foreign"
+    );
+    assert!(
+        !foreign_bare.join("HEAD").exists(),
+        "foreign bare was initialized"
+    );
+    assert!(moved_bare.join("HEAD").is_file(), "held bare was not used");
+    assert_eq!(
+        std::fs::read_link(root.join(".bare")).unwrap(),
+        foreign_bare
+    );
+}
+
+#[test]
+fn concurrent_layout_entries_are_preserved_as_state_conflicts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in [".git", "AGENTS.md", "CLAUDE.md"] {
+        let sandbox = Sandbox::new();
+        let root = sandbox.root().join("fresh");
+        let bin = sandbox.root().join("conflicting-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        let trigger = match entry {
+            ".git" => "init",
+            "AGENTS.md" => "symbolic-ref --short HEAD",
+            "CLAUDE.md" => "grove.publishState",
+            _ => unreachable!(),
+        };
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *'{trigger}'*) /usr/bin/git \"$@\" || exit $?; printf foreign > \"$GROVE_CONFLICT/{entry}\"; exit 0;;\nesac\nexec /usr/bin/git \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").expect("PATH must be set")
+        );
+
+        sandbox
+            .grove(&["init", "fresh", "--branch", "main"])
+            .env("PATH", path)
+            .env("GROVE_CONFLICT", &root)
+            .assert()
+            .code(2);
+
+        assert_eq!(std::fs::read(root.join(entry)).unwrap(), b"foreign");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_recovery_paths_are_escaped_reversibly() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let sandbox = Sandbox::new();
+    let bin = failing_git_shim(&sandbox, None);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
+    let root = OsString::from_vec(b"fresh-\xff".to_vec());
+
+    sandbox
+        .grove(&["init", "--branch", "main"])
+        .arg(&root)
+        .env("PATH", path)
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(r"fresh-\xFF"));
 }
 
 fn failing_git_shim(sandbox: &Sandbox, foreign: Option<&std::path::Path>) -> std::path::PathBuf {

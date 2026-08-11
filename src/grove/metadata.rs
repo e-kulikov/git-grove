@@ -52,6 +52,15 @@ fn config_path(grove: &Grove) -> PathBuf {
 
 fn set(runner: &dyn GitRunner, grove: &Grove, key: &str, value: &[u8]) -> Result<()> {
     let config_path = config_path(grove);
+    set_at(runner, &config_path, key, value)
+}
+
+fn set_at(
+    runner: &dyn GitRunner,
+    config_path: &std::path::Path,
+    key: &str,
+    value: &[u8],
+) -> Result<()> {
     runner.run_ok(Invocation::new().args([
         OsStr::new("config"),
         OsStr::new("--file"),
@@ -102,30 +111,38 @@ fn parse_version(value: &[u8]) -> Result<u32> {
 }
 
 pub fn write(runner: &dyn GitRunner, grove: &Grove, metadata: &Metadata) -> Result<()> {
+    write_to_config(runner, &config_path(grove), metadata)
+}
+
+pub fn write_to_config(
+    runner: &dyn GitRunner,
+    config_path: &std::path::Path,
+    metadata: &Metadata,
+) -> Result<()> {
     ensure_supported(metadata)?;
 
     if let Some(version) = metadata.version {
-        set(
+        set_at(
             runner,
-            grove,
+            config_path,
             "grove.version",
             version.to_string().as_bytes(),
         )?;
     }
     if let Some(default_branch) = &metadata.default_branch {
-        set(
+        set_at(
             runner,
-            grove,
+            config_path,
             "grove.defaultBranch",
             default_branch.as_ref(),
         )?;
     }
     if let Some(remote) = &metadata.remote {
-        set(runner, grove, "grove.remote", remote.as_ref())?;
+        set_at(runner, config_path, "grove.remote", remote.as_ref())?;
     }
-    set(
+    set_at(
         runner,
-        grove,
+        config_path,
         "grove.publishState",
         metadata.publish_state.as_str().as_bytes(),
     )

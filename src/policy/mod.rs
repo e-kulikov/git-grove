@@ -3,12 +3,12 @@ pub mod platform;
 
 use crate::error::{GroveError, Result};
 use crate::git::runner::{GitRunner, Invocation};
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 pub trait Interaction {
     fn stdin_is_terminal(&self) -> bool;
     fn write_stderr(&mut self, text: &str) -> io::Result<()>;
-    fn read_line(&mut self, line: &mut String) -> io::Result<usize>;
+    fn read_line(&mut self, line: &mut Vec<u8>) -> io::Result<usize>;
 }
 
 pub struct SystemInteraction;
@@ -24,8 +24,8 @@ impl Interaction for SystemInteraction {
         stderr.flush()
     }
 
-    fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-        io::stdin().read_line(line)
+    fn read_line(&mut self, line: &mut Vec<u8>) -> io::Result<usize> {
+        io::stdin().lock().read_until(b'\n', line)
     }
 }
 
@@ -68,16 +68,16 @@ pub fn gate(
             interaction
                 .write_stderr("Continue? [y/N] ")
                 .map_err(|error| GroveError::failure(format!("cannot write prompt: {error}")))?;
-            let mut answer = String::new();
+            let mut answer = Vec::new();
             let bytes = interaction
                 .read_line(&mut answer)
                 .map_err(|error| GroveError::failure(format!("cannot read response: {error}")))?;
             if bytes == 0 {
                 return Err(GroveError::usage("cancelled"));
             }
-            let answer = answer.strip_suffix('\n').unwrap_or(&answer);
-            let answer = answer.strip_suffix('\r').unwrap_or(answer);
-            if !matches!(answer, "y" | "yes") {
+            let answer = answer.strip_suffix(b"\n").unwrap_or(&answer);
+            let answer = answer.strip_suffix(b"\r").unwrap_or(answer);
+            if !matches!(answer, b"y" | b"yes") {
                 return Err(GroveError::usage("cancelled"));
             }
         }
@@ -105,7 +105,7 @@ mod tests {
     #[derive(Default)]
     struct TestInteraction {
         terminal: bool,
-        answer: String,
+        answer: Vec<u8>,
         output: String,
     }
 
@@ -119,8 +119,8 @@ mod tests {
             Ok(())
         }
 
-        fn read_line(&mut self, line: &mut String) -> io::Result<usize> {
-            line.push_str(&self.answer);
+        fn read_line(&mut self, line: &mut Vec<u8>) -> io::Result<usize> {
+            line.extend_from_slice(&self.answer);
             Ok(self.answer.len())
         }
     }
@@ -172,11 +172,18 @@ mod tests {
 
     #[test]
     fn terminal_override_requires_exact_lowercase_y_or_yes() {
-        for refused in ["Y\n", "YES\n", " yes \n", "\n", ""] {
+        for refused in [
+            b"Y\n".as_slice(),
+            b"YES\n",
+            b" yes \n",
+            b"\n",
+            b"",
+            b"y\xff\n",
+        ] {
             let runner = RecordingFake::new();
             let mut interaction = TestInteraction {
                 terminal: true,
-                answer: refused.to_string(),
+                answer: refused.to_vec(),
                 output: String::new(),
             };
 
@@ -186,12 +193,12 @@ mod tests {
             assert!(runner.calls().is_empty(), "git was queried after decline");
         }
 
-        for accepted in ["y\n", "yes\r\n"] {
+        for accepted in [b"y\n".as_slice(), b"yes\r\n"] {
             let runner = RecordingFake::new();
             runner.push_response(supported_git());
             let mut interaction = TestInteraction {
                 terminal: true,
-                answer: accepted.to_string(),
+                answer: accepted.to_vec(),
                 output: String::new(),
             };
 

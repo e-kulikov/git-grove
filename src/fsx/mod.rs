@@ -91,6 +91,11 @@ where
                 destination,
                 AtFlags::EMPTY_PATH,
             ) {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    let mut conflict = io(path, "create without replacing an existing path", error);
+                    conflict.class = crate::error::ExitClass::NeedsDecision;
+                    return Err(conflict);
+                }
                 return Err(io(path, "create without replacing an existing path", error));
             }
         }
@@ -102,12 +107,12 @@ where
                 destination,
                 RenameFlags::NOREPLACE,
             ) {
-                return Err(retain_temporary(
-                    io(path, "rename into place without replacement", error),
-                    &temporary,
-                    &directory,
-                    parent,
-                ));
+                let conflict = error.kind() == std::io::ErrorKind::AlreadyExists;
+                let mut error = io(path, "rename into place without replacement", error);
+                if conflict {
+                    error.class = crate::error::ExitClass::NeedsDecision;
+                }
+                return Err(retain_temporary(error, &temporary, &directory, parent));
             }
         }
     }
@@ -306,15 +311,18 @@ fn retain_temporary(
         return original;
     };
     let retained = parent.join(name);
-    match fsync_directory(directory, parent) {
-        Ok(()) => GroveError::failure(format!(
-            "{original}; retained temporary file {}",
-            retained.display()
-        )),
-        Err(sync_error) => GroveError::failure(format!(
+    let class = original.class;
+    let message = match fsync_directory(directory, parent) {
+        Ok(()) => format!("{original}; retained temporary file {}", retained.display()),
+        Err(sync_error) => format!(
             "{original}; retained temporary file {}; additionally {sync_error}",
             retained.display()
-        )),
+        ),
+    };
+    GroveError {
+        class,
+        message,
+        detail: None,
     }
 }
 
@@ -407,6 +415,7 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+        assert_eq!(error.class, crate::error::ExitClass::NeedsDecision);
         assert!(error
             .message
             .contains("rename into place without replacement"));
