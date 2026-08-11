@@ -1,5 +1,6 @@
 mod harness;
 use harness::Sandbox;
+use predicates::prelude::PredicateBooleanExt;
 
 #[test]
 fn reports_its_version() {
@@ -19,6 +20,63 @@ fn reports_usage_errors_with_documented_exit_code_and_prefix() {
         .assert()
         .code(64)
         .stderr(predicates::str::starts_with("git-grove:"));
+}
+
+#[test]
+fn refuses_a_mistyped_subcommand_with_usage_code_and_clone_hint() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["clnoe"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains(
+            "neither a command nor a repository location",
+        ))
+        .stderr(predicates::str::contains("git grove clone <url>"));
+}
+
+#[test]
+fn lists_only_the_supported_lifecycle_aliases_in_help() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["-h"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("plant=clone"))
+        .stdout(predicates::str::contains("seed=init"))
+        .stdout(predicates::str::contains("sprout=add"))
+        .stdout(predicates::str::contains("survey=list"))
+        .stdout(predicates::str::contains("transplant").not())
+        .stdout(predicates::str::contains("tend=").not())
+        .stdout(predicates::str::contains("propagate").not());
+}
+
+#[test]
+fn emits_runtime_zsh_completion() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["completion", "zsh"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("_git-grove"));
+}
+
+#[test]
+fn defaults_to_list_only_when_inside_a_grove() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&[])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("not inside a grove"));
+
+    std::fs::create_dir(sandbox.root().join(".bare")).unwrap();
+    std::fs::write(sandbox.root().join(".git"), "gitdir: ./.bare\n").unwrap();
+    sandbox
+        .grove(&[])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("list is not implemented yet"));
 }
 
 #[test]

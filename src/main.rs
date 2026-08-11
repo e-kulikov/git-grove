@@ -1,3 +1,4 @@
+mod cli;
 pub mod error;
 #[allow(dead_code)]
 mod fsx;
@@ -8,29 +9,26 @@ mod grove;
 #[allow(dead_code)]
 mod policy;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use error::{ExitClass, GroveError, Result};
 use std::process::ExitCode;
 
-#[derive(Parser)]
-#[command(
-    name = "git-grove",
-    version,
-    about = "Manage repositories as a bare clone surrounded by git worktrees"
-)]
-struct Cli {}
-
 fn main() -> ExitCode {
-    let _cli = match Cli::try_parse() {
+    let argv = match cli::normalize(std::env::args_os().collect()) {
+        Ok(argv) => argv,
+        Err(err) => return render(Err(err)),
+    };
+    let cli = match cli::Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
             if !err.use_stderr() {
-                err.exit();
+                let _ = err.print();
+                return ExitCode::from(ExitClass::Ok.code());
             }
             return render(Err(GroveError::usage(err.to_string().trim_end())));
         }
     };
-    render(run())
+    render(run(cli))
 }
 
 fn render(result: Result<()>) -> ExitCode {
@@ -43,6 +41,22 @@ fn render(result: Result<()>) -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    Ok(())
+fn run(cli: cli::Cli) -> Result<()> {
+    policy::platform::check_platform()?;
+    match cli.command {
+        cli::Command::Clone { .. } => Err(GroveError::failure("clone is not implemented yet")),
+        cli::Command::Init { .. } => Err(GroveError::failure("init is not implemented yet")),
+        cli::Command::Add { .. } => Err(GroveError::failure("add is not implemented yet")),
+        cli::Command::List { .. } => Err(GroveError::failure("list is not implemented yet")),
+        cli::Command::Completion { shell } => {
+            let mut command = cli::Cli::command();
+            clap_complete::generate(
+                clap_complete::Shell::from(shell),
+                &mut command,
+                "git-grove",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
+    }
 }
