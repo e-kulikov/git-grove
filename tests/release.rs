@@ -67,6 +67,26 @@ fn release_docs_describe_real_metadata_and_the_narrow_environment_consent() {
 }
 
 #[test]
+fn release_workflow_proves_static_linkage_from_elf_headers() {
+    let workflow = fs::read_to_string(repo_root().join(".github/workflows/release.yml")).unwrap();
+
+    assert!(
+        !workflow.contains("grep -F 'statically linked'"),
+        "file(1) describes static PIE differently across runner versions"
+    );
+    assert_eq!(
+        workflow.matches("grep -Fq 'INTERP'").count(),
+        2,
+        "both the built and packaged binaries must reject an ELF interpreter"
+    );
+    assert_eq!(
+        workflow.matches("grep -Fq 'NEEDED'").count(),
+        2,
+        "both the built and packaged binaries must reject dynamic dependencies"
+    );
+}
+
+#[test]
 fn release_package_is_deterministic_and_has_the_install_contract() {
     let temp = tempfile::tempdir().unwrap();
     let binary = temp.path().join("git-grove");

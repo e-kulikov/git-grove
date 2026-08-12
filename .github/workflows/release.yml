@@ -72,9 +72,13 @@ jobs:
           set -euo pipefail
           cargo "+$BUILD_TOOLCHAIN" build --release --locked --target "$TARGET"
           binary="target/$TARGET/release/git-grove"
-          file "$binary" | grep -F 'statically linked'
+          file "$binary"
           if readelf -l "$binary" | grep -Fq 'INTERP'; then
             echo 'release binary has a dynamic interpreter' >&2
+            exit 1
+          fi
+          if readelf -d "$binary" | grep -Fq 'NEEDED'; then
+            echo 'release binary has a dynamic dependency' >&2
             exit 1
           fi
           "$binary" --version
@@ -111,9 +115,13 @@ jobs:
           tar -xzf "dist/$archive" -C "$temp"
           binary="$temp/$stage/git-grove"
           test -x "$binary"
-          file "$binary" | grep -F 'statically linked'
+          file "$binary"
           if readelf -l "$binary" | grep -Fq 'INTERP'; then
             echo 'packaged binary has a dynamic interpreter' >&2
+            exit 1
+          fi
+          if readelf -d "$binary" | grep -Fq 'NEEDED'; then
+            echo 'packaged binary has a dynamic dependency' >&2
             exit 1
           fi
           "$binary" --version | grep -Fx "git-grove $VERSION"
