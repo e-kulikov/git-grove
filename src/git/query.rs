@@ -193,11 +193,40 @@ pub enum WorktreeLocation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
     pub upstream: Option<BString>,
+    pub upstream_ref: Option<BString>,
+    pub upstream_remote: Option<BString>,
+    pub upstream_oid: Option<BString>,
     pub ahead: Option<u32>,
     pub behind: Option<u32>,
     pub dirty: bool,
+    pub in_progress: bool,
     pub upstream_gone: bool,
     pub graph_unknown: bool,
+}
+
+pub fn operation_in_progress(admin_dir: &Path) -> Result<bool> {
+    const MARKERS: [&str; 8] = [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "index.lock",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ];
+    for marker in MARKERS {
+        match std::fs::symlink_metadata(admin_dir.join(marker)) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(GroveError::failure(format!(
+                    "cannot inspect worktree operation marker {marker}: {error}"
+                )))
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn read_capped_regular(path: &Path, description: &str) -> Result<Option<Vec<u8>>> {
@@ -355,20 +384,33 @@ fn worktree_invocation(record: &WorktreeRecord, admin_dir: &Path) -> Invocation 
     Invocation::new().git_dir(admin_dir).work_tree(&record.path)
 }
 
-fn parse_upstream(raw: &[u8]) -> Result<Option<(BString, BString)>> {
+fn parse_upstream(raw: &[u8]) -> Result<Option<(BString, BString, Option<BString>)>> {
     let raw = raw
         .strip_suffix(b"\n")
         .ok_or_else(|| GroveError::failure("git returned a truncated upstream record"))?;
     let fields = raw.split(|byte| *byte == b'\0').collect::<Vec<_>>();
     match fields.as_slice() {
-        [b"", b"", b""] => Ok(None),
-        [full, short, b""] if !full.is_empty() && !short.is_empty() => {
-            Ok(Some((BString::from(*full), BString::from(*short))))
+        [b"", b"", b"", b""] => Ok(None),
+        [full, short, remote, b""]
+            if !full.is_empty() && !short.is_empty() && !remote.is_empty() =>
+        {
+            let remote = (*remote != b".").then(|| BString::from(*remote));
+            Ok(Some((BString::from(*full), BString::from(*short), remote)))
         }
         _ => Err(GroveError::failure(
             "git returned an invalid upstream record",
         )),
     }
+}
+
+fn parse_oid(raw: &[u8]) -> Result<BString> {
+    let oid = raw
+        .strip_suffix(b"\n")
+        .ok_or_else(|| GroveError::failure("git returned a truncated commit OID"))?;
+    if oid.is_empty() || oid.contains(&b'\n') || oid.contains(&b'\r') {
+        return Err(GroveError::failure("git returned an invalid commit OID"));
+    }
+    Ok(BString::from(oid))
 }
 
 fn parse_counts(raw: &[u8]) -> Result<(u32, u32)> {
@@ -407,6 +449,12 @@ pub(crate) fn status_at(
     admin_dir: &Path,
 ) -> Result<Status> {
     let base = || worktree_invocation(record, admin_dir);
+    if operation_in_progress(admin_dir)? {
+        return Ok(Status {
+            in_progress: true,
+            ..Status::default()
+        });
+    }
     let dirty = runner.run(base().args([
         "--no-optional-locks",
         "status",
@@ -435,17 +483,20 @@ pub(crate) fn status_at(
     branch_ref.push(OsStr::from_bytes(branch.as_ref()));
     let upstream = runner.run(base().args([
         OsStr::new("for-each-ref"),
-        OsStr::new("--format=%(upstream)%00%(upstream:short)%00"),
+        OsStr::new("--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00"),
         OsStr::new("--"),
         branch_ref.as_os_str(),
     ]))?;
     if !upstream.ok() {
         return Err(failure("for-each-ref upstream", &upstream));
     }
-    let Some((full_upstream, short_upstream)) = parse_upstream(&upstream.stdout)? else {
+    let Some((full_upstream, short_upstream, upstream_remote)) = parse_upstream(&upstream.stdout)?
+    else {
         return Ok(status);
     };
     status.upstream = Some(short_upstream);
+    status.upstream_ref = Some(full_upstream.clone());
+    status.upstream_remote = upstream_remote;
 
     let exists = runner.run(base().args([
         OsStr::new("show-ref"),
@@ -461,6 +512,20 @@ pub(crate) fn status_at(
         }
         _ => return Err(failure("show-ref --verify upstream", &exists)),
     }
+
+    let mut upstream_commit = OsString::from(OsStr::from_bytes(full_upstream.as_ref()));
+    upstream_commit.push("^{commit}");
+    let oid = runner.run(base().args([
+        OsStr::new("rev-parse"),
+        OsStr::new("--verify"),
+        OsStr::new("--end-of-options"),
+        upstream_commit.as_os_str(),
+    ]))?;
+    if !oid.ok() {
+        status.graph_unknown = true;
+        return Ok(status);
+    }
+    status.upstream_oid = Some(parse_oid(&oid.stdout)?);
 
     let mut range = OsString::from("HEAD...");
     range.push(OsStr::from_bytes(full_upstream.as_ref()));
@@ -878,16 +943,34 @@ mod tests {
         let (_root, grove, record, admin) = registered_worktree();
         let fake = RecordingFake::new();
         fake.push_response(output(0, b"", b""));
-        fake.push_response(output(0, b"refs/remotes/origin/main\0origin/main\0\n", b""));
+        fake.push_response(output(
+            0,
+            b"refs/remotes/up/stream/topic\0up/stream/topic\0up/stream\0\n",
+            b"",
+        ));
         fake.push_response(output(0, b"", b""));
+        fake.push_response(output(0, b"def\n", b""));
         fake.push_response(output(0, b"2\t3\n", b""));
 
         let status = status(&fake, &grove, &record).unwrap();
 
         assert!(!status.dirty);
+        assert!(!status.in_progress);
         assert_eq!(
             status.upstream.as_ref().map(BString::as_ref),
-            Some(b"origin/main".as_slice())
+            Some(b"up/stream/topic".as_slice())
+        );
+        assert_eq!(
+            status.upstream_ref.as_ref().map(BString::as_ref),
+            Some(b"refs/remotes/up/stream/topic".as_slice())
+        );
+        assert_eq!(
+            status.upstream_remote.as_ref().map(BString::as_ref),
+            Some(b"up/stream".as_slice())
+        );
+        assert_eq!(
+            status.upstream_oid.as_ref().map(BString::as_ref),
+            Some(b"def".as_slice())
         );
         assert_eq!((status.ahead, status.behind), (Some(2), Some(3)));
         for call in fake.calls() {
@@ -914,6 +997,68 @@ mod tests {
                 "--ignore-submodules=none",
             ]
         );
+        assert_eq!(
+            fake.calls()[1].argv_for_test()[2..],
+            [
+                "for-each-ref",
+                "--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00",
+                "--",
+                "refs/heads/main",
+            ]
+        );
+        assert_eq!(
+            fake.calls()[3].argv_for_test()[2..],
+            [
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                "refs/remotes/up/stream/topic^{commit}",
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_every_operation_marker_and_propagates_inspection_errors() {
+        for marker in [
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+            "BISECT_LOG",
+            "index.lock",
+        ] {
+            let admin = tempfile::tempdir().unwrap();
+            std::fs::write(admin.path().join(marker), b"").unwrap();
+            assert!(operation_in_progress(admin.path()).unwrap(), "{marker}");
+        }
+        for marker in ["rebase-merge", "rebase-apply", "sequencer"] {
+            let admin = tempfile::tempdir().unwrap();
+            std::fs::create_dir(admin.path().join(marker)).unwrap();
+            assert!(operation_in_progress(admin.path()).unwrap(), "{marker}");
+        }
+
+        let not_directory = tempfile::NamedTempFile::new().unwrap();
+        let error = operation_in_progress(not_directory.path()).unwrap_err();
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.message.contains("operation marker"));
+    }
+
+    #[test]
+    fn maps_local_upstream_remote_to_none() {
+        let (_root, grove, record, _admin) = registered_worktree();
+        let fake = RecordingFake::new();
+        fake.push_response(output(0, b"", b""));
+        fake.push_response(output(0, b"refs/heads/base\0base\0.\0\n", b""));
+        fake.push_response(output(0, b"", b""));
+        fake.push_response(output(0, b"abc\n", b""));
+        fake.push_response(output(0, b"0\t0\n", b""));
+
+        let status = status(&fake, &grove, &record).unwrap();
+
+        assert_eq!(
+            status.upstream_ref.as_ref().map(BString::as_ref),
+            Some(b"refs/heads/base".as_slice())
+        );
+        assert!(status.upstream_remote.is_none());
     }
 
     #[test]
@@ -921,7 +1066,7 @@ mod tests {
         let (_root, grove, record, _admin) = registered_worktree();
         let no_upstream = RecordingFake::new();
         no_upstream.push_response(output(0, b"", b""));
-        no_upstream.push_response(output(0, b"\0\0\n", b""));
+        no_upstream.push_response(output(0, b"\0\0\0\n", b""));
 
         let local_status = status(&no_upstream, &grove, &record).unwrap();
         assert!(local_status.upstream.is_none());
