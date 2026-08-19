@@ -25,10 +25,7 @@ impl From<&Snapshot> for Row {
             path: snapshot.record.path.clone(),
             status: snapshot.state.as_str(),
             branch: snapshot.record.branch.clone(),
-            upstream: snapshot
-                .tracking
-                .as_ref()
-                .map(|tracking| tracking.upstream_short.clone()),
+            upstream: snapshot.upstream.clone(),
             ahead: snapshot.tracking.as_ref().map(|tracking| tracking.ahead),
             behind: snapshot.tracking.as_ref().map(|tracking| tracking.behind),
             dirty: snapshot.dirty,

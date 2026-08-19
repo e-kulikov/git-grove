@@ -67,6 +67,7 @@ pub struct Snapshot {
     pub admin_dir: Option<PathBuf>,
     pub state: WorktreeState,
     pub dirty: bool,
+    pub upstream: Option<BString>,
     pub tracking: Option<TrackingSnapshot>,
 }
 
@@ -87,6 +88,7 @@ pub fn classify(
             admin_dir: None,
             state,
             dirty: false,
+            upstream: None,
             tracking: None,
         };
     }
@@ -96,6 +98,7 @@ pub fn classify(
         WorktreeLocation::Missing | WorktreeLocation::Invalid => unreachable!(),
     };
     let dirty = status.as_ref().is_some_and(|status| status.dirty);
+    let upstream = status.as_ref().and_then(|status| status.upstream.clone());
     let tracking = status.as_ref().and_then(|status| {
         Some(TrackingSnapshot {
             upstream_short: status.upstream.clone()?,
@@ -144,6 +147,7 @@ pub fn classify(
         admin_dir,
         state,
         dirty,
+        upstream,
         tracking,
     }
 }
@@ -262,16 +266,30 @@ mod tests {
             })
         );
 
-        let incomplete = classify(
+        let upstream_gone = classify(
             record(),
             valid(),
             Some(Status {
                 upstream: Some(BString::from("origin/main")),
-                ahead: Some(0),
-                behind: Some(0),
+                upstream_gone: true,
                 ..Status::default()
             }),
         );
-        assert!(incomplete.tracking.is_none());
+        assert_eq!(upstream_gone.state, WorktreeState::UpstreamGone);
+        assert!(upstream_gone.tracking.is_none());
+        assert_eq!(upstream_gone.upstream, Some(BString::from("origin/main")));
+
+        let unknown = classify(
+            record(),
+            valid(),
+            Some(Status {
+                upstream: Some(BString::from("origin/main")),
+                graph_unknown: true,
+                ..Status::default()
+            }),
+        );
+        assert_eq!(unknown.state, WorktreeState::Unknown);
+        assert!(unknown.tracking.is_none());
+        assert_eq!(unknown.upstream, Some(BString::from("origin/main")));
     }
 }

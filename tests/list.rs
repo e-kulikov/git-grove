@@ -191,7 +191,8 @@ fn classifies_tracking_graph_states_from_pinned_queries() {
         .grove_in(&root, &["list"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("UPSTREAM-GONE"));
+        .stdout(predicates::str::contains("UPSTREAM-GONE"))
+        .stdout(predicates::str::contains("origin/main"));
 }
 
 #[test]

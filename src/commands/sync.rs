@@ -31,6 +31,7 @@ fn missing_snapshot(path: &Path) -> Snapshot {
         admin_dir: None,
         state: WorktreeState::Missing,
         dirty: false,
+        upstream: None,
         tracking: None,
     }
 }
