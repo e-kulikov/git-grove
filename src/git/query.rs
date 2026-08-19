@@ -765,6 +765,41 @@ pub fn remote_candidates(
     Ok(found)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchUpstream {
+    pub full_ref: BString,
+    pub short_ref: BString,
+    pub remote: Option<BString>,
+}
+
+/// The configured upstream of `refs/heads/<branch>`, queried against the
+/// shared bare admin directory; raw branch bytes, never a lossy string.
+pub fn branch_upstream(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    branch: &[u8],
+) -> Result<Option<BranchUpstream>> {
+    let mut branch_ref = OsString::from("refs/heads/");
+    branch_ref.push(OsStr::from_bytes(branch));
+    let output = runner.run(bare(grove).args([
+        OsStr::new("for-each-ref"),
+        OsStr::new("--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00"),
+        OsStr::new("--"),
+        branch_ref.as_os_str(),
+    ]))?;
+    if !output.ok() {
+        return Err(failure("for-each-ref upstream", &output));
+    }
+    let Some((full_ref, short_ref, remote)) = parse_upstream(&output.stdout)? else {
+        return Ok(None);
+    };
+    Ok(Some(BranchUpstream {
+        full_ref,
+        short_ref,
+        remote,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,6 +842,90 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn branch_upstream_queries_the_exact_pinned_ref() {
+        let fake = RecordingFake::new();
+        fake.push_response(output(
+            0,
+            b"refs/remotes/up/stream/topic\0up/stream/topic\0up/stream\0\n",
+            b"",
+        ));
+
+        let upstream = branch_upstream(&fake, &grove(), b"topic").unwrap();
+
+        assert_eq!(
+            upstream,
+            Some(BranchUpstream {
+                full_ref: BString::from("refs/remotes/up/stream/topic"),
+                short_ref: BString::from("up/stream/topic"),
+                remote: Some(BString::from("up/stream")),
+            })
+        );
+        assert_eq!(
+            fake.calls()[0].argv_for_test(),
+            [
+                "--git-dir=/g/.bare",
+                "for-each-ref",
+                "--format=%(upstream)%00%(upstream:short)%00%(upstream:remotename)%00",
+                "--",
+                "refs/heads/topic",
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_upstream_is_none_when_no_upstream_is_configured() {
+        let fake = RecordingFake::new();
+        fake.push_response(output(0, b"\0\0\0\n", b""));
+
+        let upstream = branch_upstream(&fake, &grove(), b"topic").unwrap();
+
+        assert_eq!(upstream, None);
+    }
+
+    #[test]
+    fn branch_upstream_maps_the_local_upstream_remote_to_none() {
+        let fake = RecordingFake::new();
+        fake.push_response(output(0, b"refs/heads/main\0main\0.\0\n", b""));
+
+        let upstream = branch_upstream(&fake, &grove(), b"topic").unwrap();
+
+        assert_eq!(
+            upstream,
+            Some(BranchUpstream {
+                full_ref: BString::from("refs/heads/main"),
+                short_ref: BString::from("main"),
+                remote: None,
+            })
+        );
+    }
+
+    #[test]
+    fn branch_upstream_rejects_malformed_or_multiple_records() {
+        for raw in [
+            b"refs/remotes/origin/topic\0origin/topic\0\n".as_slice(),
+            b"refs/remotes/origin/topic\0origin/topic\0origin\0\nrefs/remotes/origin/topic\0origin/topic\0origin\0\n".as_slice(),
+        ] {
+            let fake = RecordingFake::new();
+            fake.push_response(output(0, raw, b""));
+
+            let error = branch_upstream(&fake, &grove(), b"topic").unwrap_err();
+
+            assert_eq!(error.class, ExitClass::Failure);
+        }
+    }
+
+    #[test]
+    fn branch_upstream_propagates_query_failures() {
+        let fake = RecordingFake::new();
+        fake.push_response(output(7, b"", b"broken query"));
+
+        let error = branch_upstream(&fake, &grove(), b"topic").unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.message.contains("exit status 7"));
     }
 
     #[test]
