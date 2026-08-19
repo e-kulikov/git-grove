@@ -1,8 +1,15 @@
 mod harness;
 
 use harness::Sandbox;
+use predicates::prelude::PredicateBooleanExt;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
+
+fn admin_dir(sandbox: &Sandbox, worktree: &std::path::Path) -> PathBuf {
+    let output = sandbox.git(worktree, &["rev-parse", "--git-dir"]);
+    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim_end())
+}
 
 #[test]
 fn lists_a_fresh_grove_explicitly_and_implicitly_without_the_bare_row() {
@@ -185,6 +192,156 @@ fn classifies_tracking_graph_states_from_pinned_queries() {
         .assert()
         .success()
         .stdout(predicates::str::contains("UPSTREAM-GONE"));
+}
+
+#[test]
+fn an_in_progress_worktree_is_reported_and_stays_exit_zero() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["init", "g", "--branch", "main"])
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+    let worktree = root.join("main");
+    std::fs::write(worktree.join("tracked"), b"one\n").unwrap();
+    sandbox.git(&worktree, &["add", "tracked"]);
+    sandbox.git(&worktree, &["commit", "--quiet", "-m", "one"]);
+    let admin = admin_dir(&sandbox, &worktree);
+    std::fs::write(admin.join("index.lock"), b"").unwrap();
+
+    sandbox
+        .grove_in(&root, &["list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("IN-PROGRESS"));
+}
+
+#[test]
+fn a_locked_and_in_progress_worktree_remains_locked() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["init", "g", "--branch", "main"])
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+    let worktree = root.join("main");
+    std::fs::write(worktree.join("tracked"), b"one\n").unwrap();
+    sandbox.git(&worktree, &["add", "tracked"]);
+    sandbox.git(&worktree, &["commit", "--quiet", "-m", "one"]);
+    sandbox.git(
+        &root,
+        &[
+            "--git-dir",
+            root.join(".bare").to_str().unwrap(),
+            "worktree",
+            "lock",
+            "--reason",
+            "human review",
+            worktree.to_str().unwrap(),
+        ],
+    );
+    let admin = admin_dir(&sandbox, &worktree);
+    std::fs::write(admin.join("index.lock"), b"").unwrap();
+
+    sandbox
+        .grove_in(&root, &["list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("LOCKED"))
+        .stdout(predicates::str::contains("IN-PROGRESS").not());
+}
+
+#[test]
+fn an_in_progress_detached_worktree_stays_in_progress() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["init", "g", "--branch", "main"])
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+    std::fs::write(root.join("main/tracked"), b"one\n").unwrap();
+    sandbox.git(&root.join("main"), &["add", "tracked"]);
+    sandbox.git(&root.join("main"), &["commit", "--quiet", "-m", "one"]);
+    sandbox
+        .grove_in(&root, &["add", "--detach", "HEAD", "review"])
+        .assert()
+        .success();
+    let review = root.join("review");
+    let admin = admin_dir(&sandbox, &review);
+    std::fs::write(admin.join("index.lock"), b"").unwrap();
+
+    sandbox
+        .grove_in(&root, &["list"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("IN-PROGRESS"));
+}
+
+#[test]
+fn list_preserves_git_worktree_record_order_not_path_order() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["init", "g", "--branch", "main"])
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+    std::fs::write(root.join("main/tracked"), b"one\n").unwrap();
+    sandbox.git(&root.join("main"), &["add", "tracked"]);
+    sandbox.git(&root.join("main"), &["commit", "--quiet", "-m", "one"]);
+    sandbox
+        .grove_in(&root, &["add", "aaa-later", "--start", "HEAD"])
+        .assert()
+        .success();
+
+    let raw = sandbox.git(
+        &root,
+        &[
+            "--git-dir",
+            root.join(".bare").to_str().unwrap(),
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+        ],
+    );
+    let raw_stdout = String::from_utf8(raw.stdout).unwrap();
+    let git_order: Vec<&str> = raw_stdout
+        .split('\0')
+        .filter(|entry| entry.starts_with("worktree "))
+        .map(|entry| entry.trim_start_matches("worktree "))
+        .filter(|path| *path != root.join(".bare").to_str().unwrap())
+        .collect();
+    assert_eq!(
+        git_order.len(),
+        2,
+        "expected exactly two non-bare worktrees"
+    );
+
+    // The two worktree names are chosen so raw git order and path-sorted
+    // order coincide by default; assert the two candidate paths so the test
+    // fails loudly (rather than silently passing) if that ever changes.
+    let main_path = root.join("main").to_str().unwrap().to_string();
+    let later_path = root.join("aaa-later").to_str().unwrap().to_string();
+    assert!(git_order.contains(&main_path.as_str()));
+    assert!(git_order.contains(&later_path.as_str()));
+
+    let output = sandbox
+        .grove_in(&root, &["list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut grove_positions: Vec<(usize, &str)> = git_order
+        .iter()
+        .map(|path| (stdout.find(path).unwrap(), *path))
+        .collect();
+    grove_positions.sort_by_key(|(position, _)| *position);
+    let grove_order: Vec<&str> = grove_positions.into_iter().map(|(_, path)| path).collect();
+
+    assert_eq!(
+        grove_order, git_order,
+        "grove list must preserve git's own worktree record order"
+    );
 }
 
 #[test]
