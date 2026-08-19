@@ -197,7 +197,7 @@ impl Sandbox {
 
     /// The admin (git-dir) directory backing the worktree at `path`.
     pub fn worktree_admin(&self, path: &Path) -> PathBuf {
-        let output = self.git(path, &["rev-parse", "--git-dir"]);
+        let output = self.git(path, &["rev-parse", "--absolute-git-dir"]);
         PathBuf::from(String::from_utf8(output.stdout).unwrap().trim_end())
     }
 

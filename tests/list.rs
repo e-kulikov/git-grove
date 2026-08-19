@@ -4,12 +4,6 @@ use harness::Sandbox;
 use predicates::prelude::PredicateBooleanExt;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
-
-fn admin_dir(sandbox: &Sandbox, worktree: &std::path::Path) -> PathBuf {
-    let output = sandbox.git(worktree, &["rev-parse", "--git-dir"]);
-    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim_end())
-}
 
 #[test]
 fn lists_a_fresh_grove_explicitly_and_implicitly_without_the_bare_row() {
@@ -207,7 +201,7 @@ fn an_in_progress_worktree_is_reported_and_stays_exit_zero() {
     std::fs::write(worktree.join("tracked"), b"one\n").unwrap();
     sandbox.git(&worktree, &["add", "tracked"]);
     sandbox.git(&worktree, &["commit", "--quiet", "-m", "one"]);
-    let admin = admin_dir(&sandbox, &worktree);
+    let admin = sandbox.worktree_admin(&worktree);
     std::fs::write(admin.join("index.lock"), b"").unwrap();
 
     sandbox
@@ -241,7 +235,7 @@ fn a_locked_and_in_progress_worktree_remains_locked() {
             worktree.to_str().unwrap(),
         ],
     );
-    let admin = admin_dir(&sandbox, &worktree);
+    let admin = sandbox.worktree_admin(&worktree);
     std::fs::write(admin.join("index.lock"), b"").unwrap();
 
     sandbox
@@ -268,7 +262,7 @@ fn an_in_progress_detached_worktree_stays_in_progress() {
         .assert()
         .success();
     let review = root.join("review");
-    let admin = admin_dir(&sandbox, &review);
+    let admin = sandbox.worktree_admin(&review);
     std::fs::write(admin.join("index.lock"), b"").unwrap();
 
     sandbox
