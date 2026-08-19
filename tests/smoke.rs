@@ -9,7 +9,7 @@ fn reports_its_version() {
         .grove(&["--version"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("git-grove 0.1.0"));
+        .stdout(predicates::str::contains("git-grove 0.2.0"));
 }
 
 #[test]

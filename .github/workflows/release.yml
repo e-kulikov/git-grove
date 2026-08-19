@@ -129,11 +129,44 @@ jobs:
           bash -n "$temp/$stage/completions/git-grove.bash"
           zsh -n "$temp/$stage/completions/_git-grove"
           fish --no-execute "$temp/$stage/completions/git-grove.fish"
-          "$binary" init --branch main "$temp/smoke-grove"
+
+          # Packaged local-remote sync smoke: clone, advance from a peer,
+          # sync, and verify the worktree fast-forwarded. Local temporary
+          # repositories only; no network access.
+          origin="$temp/origin.git"
+          git init --quiet --bare --initial-branch=main "$origin"
+          seed="$temp/seed"
+          git clone --quiet "$origin" "$seed"
+          git -C "$seed" config user.email test@example.invalid
+          git -C "$seed" config user.name Test
+          echo seed >"$seed/README.md"
+          git -C "$seed" add README.md
+          git -C "$seed" commit --quiet -m seed
+          git -C "$seed" push --quiet origin main
+
+          grove="$temp/grove"
+          "$binary" clone "$origin" "$grove"
+
+          peer="$temp/peer"
+          git clone --quiet "$origin" "$peer"
+          git -C "$peer" config user.email test@example.invalid
+          git -C "$peer" config user.name Test
+          echo advance >"$peer/advance.txt"
+          git -C "$peer" add advance.txt
+          git -C "$peer" commit --quiet -m advance
+          git -C "$peer" push --quiet origin main
+
           (
-            cd "$temp/smoke-grove"
-            "$binary" list >/dev/null
+            cd "$grove"
+            "$binary" sync
           )
+          worktree_head=$(git -C "$grove/main" rev-parse HEAD)
+          peer_head=$(git -C "$peer" rev-parse HEAD)
+          if [[ "$worktree_head" != "$peer_head" ]]; then
+            echo 'packaged sync did not fast-forward the worktree to the peer-advanced tip' >&2
+            exit 1
+          fi
+          test -f "$grove/main/advance.txt"
 
       - name: Attest release files
         uses: actions/attest@v4
