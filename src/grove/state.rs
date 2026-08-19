@@ -119,10 +119,7 @@ pub fn classify(
         WorktreeState::Unborn
     } else if record.detached {
         WorktreeState::Detached
-    } else if status.is_none() {
-        WorktreeState::Unknown
-    } else {
-        let status = status.as_ref().expect("status checked above");
+    } else if let Some(status) = status.as_ref() {
         if status.upstream.is_none() {
             WorktreeState::Local
         } else if status.upstream_gone {
@@ -139,6 +136,8 @@ pub fn classify(
                 _ => WorktreeState::Unknown,
             }
         }
+    } else {
+        WorktreeState::Unknown
     };
     Snapshot {
         record,

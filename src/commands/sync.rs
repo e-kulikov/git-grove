@@ -717,4 +717,338 @@ mod tests {
             BString::from(path.as_os_str().as_bytes())
         );
     }
+
+    // --- `run()` orchestration: ordering, residual state, byte safety ---
+
+    struct MultiFixture {
+        _root: tempfile::TempDir,
+        grove: Grove,
+    }
+
+    impl MultiFixture {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let root_path = root.path().canonicalize().unwrap();
+            std::fs::create_dir_all(root_path.join(".bare/worktrees")).unwrap();
+            MultiFixture {
+                _root: root,
+                grove: Grove { root: root_path },
+            }
+        }
+
+        fn add_worktree(&self, name: &std::ffi::OsStr) -> (std::path::PathBuf, std::path::PathBuf) {
+            let admin = self.grove.bare_dir().join("worktrees").join(name);
+            let path = self.grove.root.join(name);
+            std::fs::create_dir_all(&admin).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let mut pointer = b"gitdir: ".to_vec();
+            pointer.extend_from_slice(admin.as_os_str().as_bytes());
+            pointer.push(b'\n');
+            std::fs::write(path.join(".git"), pointer).unwrap();
+            let mut back_pointer = path.join(".git").as_os_str().as_bytes().to_vec();
+            back_pointer.push(b'\n');
+            std::fs::write(admin.join("gitdir"), back_pointer).unwrap();
+            (path, admin)
+        }
+    }
+
+    fn push_worktree_list(
+        fake: &RecordingFake,
+        grove: &Grove,
+        entries: &[(&std::path::Path, &[u8], &[u8])],
+    ) {
+        let mut raw = b"worktree ".to_vec();
+        raw.extend_from_slice(grove.bare_dir().as_os_str().as_bytes());
+        raw.extend_from_slice(b"\0bare\0\0");
+        for (path, branch, head) in entries {
+            raw.extend_from_slice(b"worktree ");
+            raw.extend_from_slice(path.as_os_str().as_bytes());
+            raw.extend_from_slice(b"\0HEAD ");
+            raw.extend_from_slice(head);
+            raw.extend_from_slice(b"\0branch refs/heads/");
+            raw.extend_from_slice(branch);
+            raw.extend_from_slice(b"\0\0");
+        }
+        fake.push_response(output(0, &raw, b""));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_status_ok_behind(
+        fake: &RecordingFake,
+        upstream_full: &str,
+        upstream_short: &str,
+        upstream_remote: &str,
+        oid: &str,
+        ahead: u32,
+        behind: u32,
+    ) {
+        fake.push_response(output(0, b"", b""));
+        fake.push_response(output(
+            0,
+            format!("{upstream_full}\0{upstream_short}\0{upstream_remote}\0\n").as_bytes(),
+            b"",
+        ));
+        fake.push_response(output(0, b"", b""));
+        fake.push_response(output(0, format!("{oid}\n").as_bytes(), b""));
+        fake.push_response(output(0, format!("{ahead}\t{behind}\n").as_bytes(), b""));
+    }
+
+    #[test]
+    fn run_merges_two_behind_candidates_sequentially_in_raw_path_order() {
+        let fixture = MultiFixture::new();
+        let (zzz_path, _zzz_admin) = fixture.add_worktree(std::ffi::OsStr::new("zzz"));
+        let (aaa_path, _aaa_admin) = fixture.add_worktree(std::ffi::OsStr::new("aaa"));
+
+        let fake = RecordingFake::new();
+        // 1. Canonical records, deliberately listed in reverse path order.
+        push_worktree_list(
+            &fake,
+            &fixture.grove,
+            &[(&zzz_path, b"zzz", b"abc"), (&aaa_path, b"aaa", b"abc")],
+        );
+        // 2. FetchPlan queries each unique branch once, in branch-byte order.
+        fake.push_response(output(
+            0,
+            b"refs/remotes/origin/aaa\0origin/aaa\0origin\0\n",
+            b"",
+        ));
+        fake.push_response(output(
+            0,
+            b"refs/remotes/origin/zzz\0origin/zzz\0origin\0\n",
+            b"",
+        ));
+        // 3. One fetch for the single deduplicated remote.
+        fake.push_response(output(0, b"", b""));
+        // 4. Fresh post-fetch snapshots, in the original (unsorted) record order.
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/zzz",
+            "origin/zzz",
+            "origin",
+            "zzz-oid",
+            0,
+            3,
+        );
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/aaa",
+            "origin/aaa",
+            "origin",
+            "aaa-oid",
+            0,
+            3,
+        );
+        // 5/6. update_one("aaa") first (raw-path order): reinspect, merge, reinspect.
+        push_worktree_list(
+            &fake,
+            &fixture.grove,
+            &[(&zzz_path, b"zzz", b"abc"), (&aaa_path, b"aaa", b"abc")],
+        );
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/aaa",
+            "origin/aaa",
+            "origin",
+            "aaa-oid",
+            0,
+            3,
+        );
+        fake.push_response(output(0, b"", b""));
+        push_worktree_list(
+            &fake,
+            &fixture.grove,
+            &[(&zzz_path, b"zzz", b"abc"), (&aaa_path, b"aaa", b"abc")],
+        );
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/aaa",
+            "origin/aaa",
+            "origin",
+            "aaa-oid",
+            0,
+            0,
+        );
+        // update_one("zzz") second: reinspect, merge, reinspect.
+        push_worktree_list(
+            &fake,
+            &fixture.grove,
+            &[(&zzz_path, b"zzz", b"abc"), (&aaa_path, b"aaa", b"abc")],
+        );
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/zzz",
+            "origin/zzz",
+            "origin",
+            "zzz-oid",
+            0,
+            3,
+        );
+        fake.push_response(output(0, b"", b""));
+        push_worktree_list(
+            &fake,
+            &fixture.grove,
+            &[(&zzz_path, b"zzz", b"abc"), (&aaa_path, b"aaa", b"abc")],
+        );
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/zzz",
+            "origin/zzz",
+            "origin",
+            "zzz-oid",
+            0,
+            0,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_eq!(report.class, ExitClass::Ok);
+        assert_eq!(
+            report.rows.iter().map(|row| row.status).collect::<Vec<_>>(),
+            ["UP-TO-DATE", "UP-TO-DATE"]
+        );
+        let merge_indices: Vec<usize> = fake
+            .calls()
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.argv_for_test().contains(&"merge".to_string()))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(merge_indices.len(), 2, "expected exactly two merge calls");
+        let first_merge_path = fake.calls()[merge_indices[0]]
+            .argv_for_test()
+            .iter()
+            .find(|arg| arg.contains("aaa"))
+            .is_some();
+        assert!(
+            first_merge_path,
+            "the first merge call must target the raw-path-first candidate (aaa), got {:?}",
+            fake.calls()[merge_indices[0]].argv_for_test()
+        );
+        assert!(merge_indices[0] < merge_indices[1]);
+    }
+
+    #[test]
+    fn run_reports_a_residual_behind_row_and_exit_two_when_a_candidate_only_partially_changes() {
+        let fixture = MultiFixture::new();
+        let (path, _admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+
+        let fake = RecordingFake::new();
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        fake.push_response(output(
+            0,
+            b"refs/remotes/origin/main\0origin/main\0origin\0\n",
+            b"",
+        ));
+        fake.push_response(output(0, b"", b""));
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+        // update_one's reinspection reports a *different* upstream remote
+        // than planned (a benign identity change mid-run), which is
+        // ineligible for merge; the graph is still clean BEHIND, so the
+        // final row legitimately remains BEHIND and the run still needs a
+        // human decision.
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "up/stream",
+            "def",
+            0,
+            3,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].status, "BEHIND");
+        assert!(fake
+            .calls()
+            .iter()
+            .all(|call| !call.argv_for_test().contains(&"merge".to_string())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_preserves_non_utf8_path_bytes_through_sorting_and_a_blocked_diagnostic() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let fixture = MultiFixture::new();
+        let odd_name = OsString::from_vec(b"odd-\xff".to_vec());
+        let (path, _admin) = fixture.add_worktree(&odd_name);
+
+        let fake = RecordingFake::new();
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        fake.push_response(output(
+            0,
+            b"refs/remotes/origin/main\0origin/main\0origin\0\n",
+            b"",
+        ));
+        fake.push_response(output(0, b"", b""));
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+        fake.push_response(output(1, b"", b"local changes would be overwritten\xff"));
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        assert_eq!(report.rows[0].status, "BLOCKED");
+        assert_eq!(
+            report.rows[0].path.as_os_str().as_bytes(),
+            path.as_os_str().as_bytes()
+        );
+        assert_eq!(
+            report.diagnostics,
+            vec![r"local\x20changes\x20would\x20be\x20overwritten\xFF".to_string()]
+        );
+        // The path's raw bytes must round-trip, byte-for-byte, through
+        // every git argv that carries it — never replaced or corrupted.
+        let carries_path = fake.calls().iter().any(|call| {
+            call.argv_os().iter().any(|arg| {
+                arg.as_bytes()
+                    .windows(odd_name.len())
+                    .any(|window| window == odd_name.as_bytes())
+            })
+        });
+        assert!(
+            carries_path,
+            "expected at least one argv to carry the raw path bytes"
+        );
+    }
 }
