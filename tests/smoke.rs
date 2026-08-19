@@ -46,9 +46,53 @@ fn lists_only_the_supported_lifecycle_aliases_in_help() {
         .stdout(predicates::str::contains("seed=init"))
         .stdout(predicates::str::contains("sprout=add"))
         .stdout(predicates::str::contains("survey=list"))
+        .stdout(predicates::str::contains("tend=sync"))
         .stdout(predicates::str::contains("transplant").not())
-        .stdout(predicates::str::contains("tend=").not())
         .stdout(predicates::str::contains("propagate").not());
+}
+
+#[test]
+fn explicit_sync_outside_a_grove_keeps_the_usage_path() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["sync"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("not inside a grove"));
+    sandbox
+        .grove(&["tend"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::contains("not inside a grove"));
+}
+
+#[test]
+fn tend_dispatches_identically_to_sync() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["init", "g", "--branch", "main"])
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+
+    sandbox
+        .grove_in(&root, &["tend"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("UNBORN"));
+}
+
+#[test]
+fn emits_sync_and_tend_in_runtime_completion() {
+    let sandbox = Sandbox::new();
+    for shell in ["zsh", "bash", "fish"] {
+        sandbox
+            .grove(&["completion", shell])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("sync"))
+            .stdout(predicates::str::contains("tend"));
+    }
 }
 
 #[test]

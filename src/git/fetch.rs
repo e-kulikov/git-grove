@@ -20,6 +20,13 @@ impl FetchPlan {
     ) -> Result<FetchPlan> {
         let mut branches = BTreeSet::<&BString>::new();
         for record in records {
+            let unborn = record
+                .head
+                .as_ref()
+                .is_some_and(|head| head.iter().all(|byte| *byte == b'0'));
+            if unborn {
+                continue;
+            }
             if let Some(branch) = &record.branch {
                 branches.insert(branch);
             }
@@ -89,6 +96,21 @@ mod tests {
         }
     }
 
+    /// An unborn checkout still reports `branch refs/heads/<name>`
+    /// (HEAD is a symbolic ref to a branch that has no commit yet), unlike
+    /// a detached worktree, which has no branch at all.
+    fn unborn_record(branch: &str) -> WorktreeRecord {
+        WorktreeRecord {
+            path: "/g/wt".into(),
+            head: Some(BString::from("0".repeat(40))),
+            branch: Some(BString::from(branch)),
+            bare: false,
+            detached: false,
+            locked: None,
+            prunable: None,
+        }
+    }
+
     fn upstream_response(remote: &str, branch: &str) -> GitOutput {
         output(
             0,
@@ -100,7 +122,11 @@ mod tests {
     #[test]
     fn detached_and_unborn_worktrees_contribute_no_remote() {
         let fake = RecordingFake::new();
-        let records = [record(None, true), record(None, false)];
+        let records = [
+            record(None, true),
+            record(None, false),
+            unborn_record("main"),
+        ];
 
         let plan = FetchPlan::from_records(&fake, &grove(), &records).unwrap();
 

@@ -110,6 +110,36 @@ fn run(cli: cli::Cli) -> Result<()> {
                 }
             }
         }
+        cli::Command::Sync => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let grove = grove::discover::Grove::discover(&cwd)?;
+            let metadata = grove::metadata::read(&runner, &grove)?;
+            grove::metadata::ensure_supported(&metadata)?;
+            let report = commands::sync::run(&runner, &grove)?;
+            output::write_rows(&mut std::io::stdout().lock(), &report.rows, false)?;
+            match report.class {
+                ExitClass::Ok => Ok(()),
+                ExitClass::NeedsDecision => {
+                    let error = GroveError::needs_decision(
+                        "some worktrees remain behind or need attention",
+                    );
+                    if report.diagnostics.is_empty() {
+                        Err(error)
+                    } else {
+                        Err(error.with_detail(report.diagnostics.join("; ")))
+                    }
+                }
+                ExitClass::Failure | ExitClass::Usage => {
+                    unreachable!("sync returns only success or needs-decision classes")
+                }
+            }
+        }
         cli::Command::Completion { shell } => {
             let mut command = cli::Cli::command();
             clap_complete::generate(

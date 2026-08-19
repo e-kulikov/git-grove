@@ -385,6 +385,12 @@ fn worktree_invocation(record: &WorktreeRecord, admin_dir: &Path) -> Invocation 
 }
 
 fn parse_upstream(raw: &[u8]) -> Result<Option<(BString, BString, Option<BString>)>> {
+    if raw.is_empty() {
+        // `for-each-ref -- <ref>` prints nothing at all when <ref> does not
+        // exist yet (an unborn branch), as opposed to one line with empty
+        // fields when the ref exists but has no upstream configured.
+        return Ok(None);
+    }
     let raw = raw
         .strip_suffix(b"\n")
         .ok_or_else(|| GroveError::failure("git returned a truncated upstream record"))?;
@@ -881,6 +887,19 @@ mod tests {
         fake.push_response(output(0, b"\0\0\0\n", b""));
 
         let upstream = branch_upstream(&fake, &grove(), b"topic").unwrap();
+
+        assert_eq!(upstream, None);
+    }
+
+    #[test]
+    fn branch_upstream_is_none_for_a_ref_that_does_not_exist_yet() {
+        // `for-each-ref -- <ref>` prints nothing at all (not one line of
+        // empty fields) when <ref> itself does not exist, e.g. an unborn
+        // branch's `refs/heads/<name>`.
+        let fake = RecordingFake::new();
+        fake.push_response(output(0, b"", b""));
+
+        let upstream = branch_upstream(&fake, &grove(), b"main").unwrap();
 
         assert_eq!(upstream, None);
     }

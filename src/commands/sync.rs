@@ -1,9 +1,11 @@
 use crate::commands::list;
-use crate::error::{GroveError, Result};
+use crate::error::{ExitClass, GroveError, Result};
+use crate::git::fetch::FetchPlan;
 use crate::git::query::{self, WorktreeRecord};
 use crate::git::runner::{GitRunner, Invocation};
 use crate::grove::discover::Grove;
 use crate::grove::state::{Snapshot, WorktreeState};
+use crate::output::Row;
 use bstr::ByteSlice;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -112,6 +114,69 @@ pub fn update_one(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncReport {
+    pub class: ExitClass,
+    pub rows: Vec<Row>,
+    pub diagnostics: Vec<String>,
+}
+
+/// Fetch every required remote, then fast-forward each eligible worktree in
+/// stable raw-path order. Renders no pre-fetch or intermediate rows.
+pub fn run(runner: &dyn GitRunner, grove: &Grove) -> Result<SyncReport> {
+    let records = query::worktrees(runner, grove)?;
+    let plan = FetchPlan::from_records(runner, grove, &records)?;
+    plan.execute(runner, grove)?;
+
+    let mut snapshots: Vec<Snapshot> = records
+        .into_iter()
+        .filter(|record| !record.bare)
+        .map(|record| list::snapshot_record(runner, grove, record))
+        .collect::<Result<_>>()?;
+    snapshots.sort_by(|a, b| {
+        a.record
+            .path
+            .as_os_str()
+            .as_bytes()
+            .cmp(b.record.path.as_os_str().as_bytes())
+    });
+
+    let mut diagnostics = Vec::new();
+    let mut finals = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        if snapshot.state != WorktreeState::Behind {
+            finals.push(snapshot);
+            continue;
+        }
+        match update_one(runner, grove, &snapshot)? {
+            UpdateOutcome::Updated(fresh) => finals.push(fresh),
+            UpdateOutcome::Changed(fresh) => finals.push(fresh),
+            UpdateOutcome::Blocked { snapshot, detail } => {
+                diagnostics.push(detail);
+                finals.push(Snapshot {
+                    state: WorktreeState::Blocked,
+                    ..snapshot
+                });
+            }
+        }
+    }
+
+    let class = if finals
+        .iter()
+        .all(|snapshot| snapshot.state.sync_is_satisfied())
+    {
+        ExitClass::Ok
+    } else {
+        ExitClass::NeedsDecision
+    };
+    let rows = finals.iter().map(Row::from).collect();
+    Ok(SyncReport {
+        class,
+        rows,
+        diagnostics,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +254,7 @@ mod tests {
 
     /// Enqueue the exact git-call sequence `reinspect_path` issues:
     /// worktree list, dirty check, upstream, show-ref, rev-parse, rev-list.
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_reinspection(
         fake: &RecordingFake,
         fixture: &Fixture,
@@ -635,7 +701,6 @@ mod tests {
     fn a_missing_worktree_at_reinspection_is_reported_as_missing() {
         let fixture = fixture();
         let path = fixture.grove.root.join("gone");
-        let planned = missing_snapshot(&path);
 
         let fake = RecordingFake::new();
         fake.push_response(output(
