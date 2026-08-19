@@ -580,9 +580,14 @@ fn sync_reports_blocked_and_exits_two_when_an_ignored_local_file_obstructs_the_m
 
     sandbox
         .grove_in(&root, &["sync"])
+        .env("GIT_TRACE", "1")
         .assert()
         .code(2)
-        .stdout(predicates::str::contains("BLOCKED"));
+        .stdout(predicates::str::contains("BLOCKED"))
+        .stderr(predicates::str::contains("git\\x20merge"))
+        .stderr(predicates::str::contains("--ff-only"))
+        .stderr(predicates::str::contains("--no-autostash"))
+        .stderr(predicates::str::contains("--no-overwrite-ignore"));
 
     assert_eq!(sandbox.oid(&worktree, "HEAD"), before);
     assert_eq!(

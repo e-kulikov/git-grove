@@ -976,6 +976,236 @@ mod tests {
             .all(|call| !call.argv_for_test().contains(&"merge".to_string())));
     }
 
+    /// Enqueue the exact call sequence `run()` issues, for a single-worktree
+    /// grove on branch `main`, up to and including the post-fetch status
+    /// query that classifies the sole candidate as clean BEHIND. Everything
+    /// queued after this lands inside `update_one`'s own revalidation.
+    fn push_initial_behind_plan(fake: &RecordingFake, grove: &Grove, path: &std::path::Path) {
+        push_worktree_list(fake, grove, &[(path, b"main", b"abc")]);
+        fake.push_response(output(
+            0,
+            b"refs/remotes/origin/main\0origin/main\0origin\0\n",
+            b"",
+        ));
+        fake.push_response(output(0, b"", b"")); // fetch
+        push_status_ok_behind(
+            fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+    }
+
+    /// Assert the single-candidate run left it unresolved: no merge was
+    /// attempted, and the run reduces to `NeedsDecision` (exit 2).
+    fn assert_single_candidate_unresolved_without_merge(fake: &RecordingFake, report: &SyncReport) {
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        assert_eq!(report.rows.len(), 1);
+        assert!(fake
+            .calls()
+            .iter()
+            .all(|call| !call.argv_for_test().contains(&"merge".to_string())));
+    }
+
+    #[test]
+    fn a_head_oid_change_mid_run_yields_a_fresh_final_row_with_no_merge_and_exit_two() {
+        let fixture = MultiFixture::new();
+        let (path, _admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+        let fake = RecordingFake::new();
+        push_initial_behind_plan(&fake, &fixture.grove, &path);
+
+        // HEAD moved (e.g. a concurrent local commit) before reinspection.
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"changed")]);
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_single_candidate_unresolved_without_merge(&fake, &report);
+        assert_eq!(report.rows[0].status, "BEHIND");
+    }
+
+    #[test]
+    fn an_upstream_ref_change_mid_run_yields_a_fresh_final_row_with_no_merge_and_exit_two() {
+        let fixture = MultiFixture::new();
+        let (path, _admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+        let fake = RecordingFake::new();
+        push_initial_behind_plan(&fake, &fixture.grove, &path);
+
+        // The branch's configured upstream ref itself changed (e.g. the
+        // branch was reconfigured to track a different remote branch).
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/renamed",
+            "origin/renamed",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_single_candidate_unresolved_without_merge(&fake, &report);
+        assert_eq!(report.rows[0].status, "BEHIND");
+    }
+
+    #[test]
+    fn an_upstream_oid_change_mid_run_yields_a_fresh_final_row_with_no_merge_and_exit_two() {
+        let fixture = MultiFixture::new();
+        let (path, _admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+        let fake = RecordingFake::new();
+        push_initial_behind_plan(&fake, &fixture.grove, &path);
+
+        // The upstream tip moved again between planning and reinspection
+        // (e.g. a second, unrelated fetch raced this one).
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "newer-def",
+            0,
+            3,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_single_candidate_unresolved_without_merge(&fake, &report);
+        assert_eq!(report.rows[0].status, "BEHIND");
+    }
+
+    #[test]
+    fn a_lock_appearing_mid_run_yields_a_locked_final_row_with_no_merge_and_exit_two() {
+        let fixture = MultiFixture::new();
+        let (path, _admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+        let fake = RecordingFake::new();
+        push_initial_behind_plan(&fake, &fixture.grove, &path);
+
+        // `git worktree lock` ran concurrently, after planning but before
+        // update_one's own reinspection.
+        let mut raw = b"worktree ".to_vec();
+        raw.extend_from_slice(fixture.grove.bare_dir().as_os_str().as_bytes());
+        raw.extend_from_slice(b"\0bare\0\0worktree ");
+        raw.extend_from_slice(path.as_os_str().as_bytes());
+        raw.extend_from_slice(b"\0HEAD abc\0branch refs/heads/main\0locked reason\0\0");
+        fake.push_response(output(0, &raw, b""));
+        push_status_ok_behind(
+            &fake,
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_single_candidate_unresolved_without_merge(&fake, &report);
+        assert_eq!(report.rows[0].status, "LOCKED");
+    }
+
+    #[test]
+    fn dirtiness_appearing_mid_run_yields_a_dirty_behind_final_row_with_no_merge_and_exit_two() {
+        let fixture = MultiFixture::new();
+        let (path, _admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+        let fake = RecordingFake::new();
+        push_initial_behind_plan(&fake, &fixture.grove, &path);
+
+        // An untracked file appeared in the worktree concurrently.
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+        fake.push_response(output(0, b"?? dirty\0", b""));
+        fake.push_response(output(
+            0,
+            b"refs/remotes/origin/main\0origin/main\0origin\0\n",
+            b"",
+        ));
+        fake.push_response(output(0, b"", b""));
+        fake.push_response(output(0, b"def\n", b""));
+        fake.push_response(output(0, b"0\t3\n", b""));
+
+        let report = run(&fake, &fixture.grove).unwrap();
+
+        assert_single_candidate_unresolved_without_merge(&fake, &report);
+        assert_eq!(report.rows[0].status, "DIRTY-BEHIND");
+    }
+
+    /// A `GitRunner` that delegates every call to an inner `RecordingFake`
+    /// and, once exactly `after_calls` calls have been observed, runs a
+    /// one-shot side effect on the real filesystem. Used to simulate a
+    /// concurrent `IN-PROGRESS` marker appearing between the calls
+    /// `run()`'s own snapshot pass issues and the calls `update_one`'s
+    /// revalidation issues — a real filesystem race that no queued fake
+    /// response alone can express.
+    struct DelayedEffectRunner<'a> {
+        inner: &'a RecordingFake,
+        after_calls: usize,
+        effect: std::cell::RefCell<Option<Box<dyn FnOnce() + 'a>>>,
+    }
+
+    impl GitRunner for DelayedEffectRunner<'_> {
+        fn run(&self, invocation: Invocation) -> Result<crate::git::runner::GitOutput> {
+            let result = self.inner.run(invocation);
+            if self.inner.calls().len() == self.after_calls {
+                if let Some(effect) = self.effect.borrow_mut().take() {
+                    effect();
+                }
+            }
+            result
+        }
+    }
+
+    #[test]
+    fn an_operation_marker_appearing_mid_run_yields_an_in_progress_final_row_with_no_merge_and_exit_two(
+    ) {
+        let fixture = MultiFixture::new();
+        let (path, admin) = fixture.add_worktree(std::ffi::OsStr::new("main"));
+        let fake = RecordingFake::new();
+        push_initial_behind_plan(&fake, &fixture.grove, &path);
+        // update_one's reinspect_path: the worktree-list call still finds
+        // the same registered worktree; `operation_in_progress` (a real
+        // filesystem check, not a queued response) short-circuits before
+        // any further git call is made, so no status responses follow.
+        push_worktree_list(&fake, &fixture.grove, &[(&path, b"main", b"abc")]);
+
+        let marker = admin.join("index.lock");
+        let runner = DelayedEffectRunner {
+            inner: &fake,
+            // The 8 calls `push_initial_behind_plan` accounts for: worktree
+            // list, one FetchPlan upstream query, one fetch, and the 5
+            // post-fetch status calls (dirty, upstream, show-ref,
+            // rev-parse, rev-list). Write the marker immediately after,
+            // before `update_one`'s own worktree-list call (call 9).
+            after_calls: 8,
+            effect: std::cell::RefCell::new(Some(Box::new(move || {
+                std::fs::write(&marker, b"").unwrap();
+            }))),
+        };
+
+        let report = run(&runner, &fixture.grove).unwrap();
+
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].status, "IN-PROGRESS");
+        assert!(fake
+            .calls()
+            .iter()
+            .all(|call| !call.argv_for_test().contains(&"merge".to_string())));
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_preserves_non_utf8_path_bytes_through_sorting_and_a_blocked_diagnostic() {
