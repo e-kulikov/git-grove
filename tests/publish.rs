@@ -874,6 +874,72 @@ fn publishes_a_default_branch_whose_name_contains_a_slash() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn publishes_a_default_branch_whose_name_is_not_utf8() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let sandbox = Sandbox::new();
+    let branch = OsString::from_vec(b"topic-\xff".to_vec());
+    let origin = sandbox.empty_origin("origin");
+    // `--initial-branch` cannot carry these bytes through `&str`, so point the
+    // unborn HEAD at the branch afterwards, with raw bytes.
+    let mut head_target = OsString::from("refs/heads/");
+    head_target.push(&branch);
+    sandbox.git_os(
+        &origin,
+        &[
+            OsString::from("symbolic-ref"),
+            OsString::from("HEAD"),
+            head_target,
+        ],
+    );
+    sandbox
+        .grove(&["init", "g", "--branch"])
+        .arg(&branch)
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+    let worktree = root.join(&branch);
+    std::fs::write(worktree.join("GROVE.md"), "grove\n").unwrap();
+    sandbox.git(&worktree, &["add", "GROVE.md"]);
+    sandbox.git(&worktree, &["commit", "--quiet", "-m", "grove seed"]);
+    let local = sandbox.oid(&worktree, "HEAD");
+
+    sandbox
+        .grove_in(&root, &["publish", origin.to_str().unwrap()])
+        .assert()
+        .success()
+        // The report escapes the byte reversibly rather than losing it.
+        .stdout(predicates::str::contains(r"topic-\xFF"));
+
+    // `remote_refs` decodes as UTF-8, so compare raw bytes here instead.
+    let refs = sandbox.git(
+        &origin,
+        &["for-each-ref", "--format=%(refname) %(objectname)"],
+    );
+    let mut expected = b"refs/heads/topic-\xff ".to_vec();
+    expected.extend_from_slice(local.as_bytes());
+    expected.push(b'\n');
+    assert_eq!(refs.stdout, expected);
+
+    let head = sandbox.git(&origin, &["symbolic-ref", "HEAD"]);
+    assert_eq!(head.stdout, b"refs/heads/topic-\xff\n");
+
+    let merge = sandbox.git(
+        &bare_of(&root),
+        &["config", "--get-regexp", "^branch\\..*\\.merge$"],
+    );
+    assert_eq!(
+        merge.stdout,
+        b"branch.topic-\xff.merge refs/heads/topic-\xff\n"
+    );
+
+    let fetch = sandbox.git(&bare_of(&root), &["config", "--get", "remote.origin.fetch"]);
+    assert_eq!(fetch.stdout, b"+refs/heads/*:refs/remotes/origin/*\n");
+}
+
 /// Per the specification's `## Testing` note, use a *path* with a space rather
 /// than a branch with a space: `git check-ref-format` rejects the latter.
 #[test]
