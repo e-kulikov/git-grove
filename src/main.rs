@@ -1,18 +1,6 @@
-mod cli;
-mod commands;
-pub mod error;
-#[allow(dead_code)]
-mod fsx;
-#[allow(dead_code)]
-mod git;
-#[allow(dead_code)]
-mod grove;
-mod output;
-#[allow(dead_code)]
-mod policy;
-
 use clap::{CommandFactory, Parser};
-use error::{ExitClass, GroveError, Result};
+use git_grove::error::{ExitClass, GroveError, Result};
+use git_grove::{cli, commands, fsx, git, grove, output, policy};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {

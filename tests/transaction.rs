@@ -1,10 +1,20 @@
 mod harness;
 
+use git_grove::transaction::journal::{RawBytes, ValidatedBytePath};
 use harness::Sandbox;
 use predicates::str::contains;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+#[test]
+fn journal_raw_bytes_and_paths_reject_noncanonical_encodings() {
+    let raw = RawBytes::from_bytes(b"name-\xff");
+    assert_eq!(raw.decode(), b"name-\xff");
+    assert!(serde_json::from_str::<RawBytes>(r#"{"encoding":"Hex","value":"FF"}"#).is_err());
+    assert!(ValidatedBytePath::new(Path::new("../escape")).is_err());
+    assert!(ValidatedBytePath::component(b"a/b").is_err());
+}
 
 struct LockHolder {
     child: Child,
