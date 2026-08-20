@@ -23,9 +23,10 @@
 
 use crate::error::{ExitClass, GroveError, Result};
 use crate::git::config::{
-    config_key, config_values, escaped, required, set_config, trim_one_line,
-    validate_refspec_destinations,
+    config_key, config_values, configure_upstreams, escaped, list_local_heads, remote_head_branch,
+    required, set_config, trim_one_line, validate_refspec_destinations,
 };
+use crate::git::fetch::FetchPlan;
 use crate::git::query;
 use crate::git::remote::{self, Ancestry};
 use crate::git::runner::{GitRunner, Invocation};
@@ -511,6 +512,376 @@ fn live_remote_url(
     }
 }
 
+/// `refs/remotes/<remote>/<branch>`.
+fn tracking_ref(remote: &OsStr, branch: &[u8]) -> Vec<u8> {
+    let mut reference = b"refs/remotes/".to_vec();
+    reference.extend_from_slice(remote.as_bytes());
+    reference.push(b'/');
+    reference.extend_from_slice(branch);
+    reference
+}
+
+/// The refspecs specification step 5 pushes: the default branch alone, or —
+/// under `--all-branches` — every local head, in git's `for-each-ref` order,
+/// still as **one** atomic push.
+fn push_refspecs(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    request: &Request,
+    flight: &Preflight,
+) -> Result<Vec<Vec<u8>>> {
+    let sources = if request.all_branches {
+        list_local_heads(runner, &grove.bare_dir())?
+    } else {
+        vec![flight.default_ref()]
+    };
+    Ok(sources
+        .into_iter()
+        .map(|source| {
+            let mut refspec = source.clone();
+            refspec.push(b':');
+            refspec.extend_from_slice(&source);
+            refspec
+        })
+        .collect())
+}
+
+/// Specification step 5: one explicit, non-forced, atomic push.
+///
+/// There is no `--force`, no `--force-with-lease`, no `--set-upstream`, no
+/// `--all`, no `--mirror` and no `--tags`. `--all-branches` widens the refspec
+/// list, never the number of pushes: a partial publication is exactly the
+/// hazard `--atomic` exists to prevent.
+///
+/// This is the one child whose stderr the tool branches on, so it goes through
+/// `run_classified`. Accepted cost: its *own* unrelated failures render in
+/// English too (`error: failed to push some refs`, `! [remote rejected]`).
+/// Server-side rejection-hook text is hook output rather than gettext, so hook
+/// messages reach the user unchanged either way.
+fn push(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    request: &Request,
+    refspecs: &[Vec<u8>],
+) -> Result<()> {
+    let mut args = vec![
+        OsString::from("push"),
+        OsString::from("--atomic"),
+        OsString::from("--"),
+        request.remote.to_os_string(),
+    ];
+    args.extend(
+        refspecs
+            .iter()
+            .map(|refspec| OsString::from_vec(refspec.clone())),
+    );
+
+    let output = runner.run_classified(Invocation::new().git_dir(grove.bare_dir()).args(args))?;
+    if output.ok() {
+        return Ok(());
+    }
+
+    // Measured: git refuses a non-advertising receiving end pre-flight, with
+    // exit 128 and zero refs updated on the remote — so "refused before any ref
+    // is updated" is satisfied by git itself, and no separate `--dry-run`
+    // capability probe is issued. `atomic` is a receive-pack capability, so
+    // `ls-remote` could not probe it even in principle.
+    if output
+        .stderr
+        .windows(ATOMIC_UNSUPPORTED.len())
+        .any(|window| window == ATOMIC_UNSUPPORTED)
+    {
+        return Err(conflict(
+            "the publication target does not support atomic push",
+            "nothing was published; git refused before sending any ref update",
+        ));
+    }
+
+    Err(GroveError::failure("cannot push to the publication target")
+        .with_detail(escaped(&output.stderr)))
+}
+
+const ATOMIC_UNSUPPORTED: &[u8] = b"the receiving end does not support --atomic push";
+
+/// Whether `reference` exists in the bare repository.
+fn ref_exists(runner: &dyn GitRunner, grove: &Grove, reference: &[u8]) -> Result<bool> {
+    let output = runner.run(Invocation::new().git_dir(grove.bare_dir()).args([
+        OsStr::new("show-ref"),
+        OsStr::new("--verify"),
+        OsStr::new("--quiet"),
+        OsStr::new("--"),
+        OsStr::from_bytes(reference),
+    ]))?;
+    match output.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        status => Err(GroveError::failure(format!(
+            "git show-ref failed with exit status {status} while verifying {}",
+            escaped(reference)
+        ))
+        .with_detail(escaped(&output.stderr))),
+    }
+}
+
+/// The object `reference` resolves to.
+fn resolve(runner: &dyn GitRunner, grove: &Grove, reference: &[u8]) -> Result<BString> {
+    let mut revision = OsString::from_vec(reference.to_vec());
+    revision.push("^{commit}");
+    let output = required(
+        runner,
+        Invocation::new().git_dir(grove.bare_dir()).args([
+            OsStr::new("rev-parse"),
+            OsStr::new("--verify"),
+            OsStr::new("--end-of-options"),
+            revision.as_os_str(),
+        ]),
+        "rev-parse",
+    )?;
+    Ok(BString::from(trim_one_line(output.stdout, "object ID")?))
+}
+
+/// Specification step 6, second half: point the local `refs/remotes/<r>/HEAD`
+/// at the remote's default branch and verify what git wrote.
+///
+/// Measured: the step-5 push creates `refs/remotes/<remote>/<branch>` itself,
+/// because step 4 wrote `remote.<name>.fetch` before it — so this verifies the
+/// tracking ref rather than assuming it, and fetches only as an explicit
+/// fallback if it is somehow absent.
+fn point_remote_head(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    request: &Request,
+    flight: &Preflight,
+) -> Result<()> {
+    let tracking = tracking_ref(&request.remote, &flight.default_branch);
+    if !ref_exists(runner, grove, &tracking)? {
+        FetchPlan {
+            remotes: vec![BString::from(request.remote.as_bytes().to_vec())],
+        }
+        .execute(runner, grove)?;
+        if !ref_exists(runner, grove, &tracking)? {
+            return Err(GroveError::failure(format!(
+                "the push did not create {}",
+                escaped(&tracking)
+            )));
+        }
+    }
+
+    // `--auto` is the mode argument and must precede `--`: with `--` first, git
+    // reads `--auto` as the positional <branch> and fails with
+    // `error: Not a valid ref: refs/remotes/<remote>/--auto`. The `--` still
+    // guards a remote name beginning with a dash.
+    required(
+        runner,
+        Invocation::new().git_dir(grove.bare_dir()).args([
+            OsStr::new("remote"),
+            OsStr::new("set-head"),
+            OsStr::new("--auto"),
+            OsStr::new("--"),
+            request.remote.as_os_str(),
+        ]),
+        "remote set-head --auto",
+    )?;
+
+    // Verify what git wrote locally. `remote set-head` never changes the server.
+    let written = remote_head_branch(runner, &grove.bare_dir(), &request.remote)?;
+    if written.as_bytes() != flight.default_branch.as_slice() {
+        return Err(GroveError::failure(format!(
+            "the remote HEAD was set to {} rather than {}",
+            escaped(written.as_bytes()),
+            escaped(&flight.default_branch)
+        )));
+    }
+    Ok(())
+}
+
+/// Specification step 7: ask the hosting side, over the wire, whether `HEAD`
+/// now resolves to this grove's default branch.
+fn server_head_matches(
+    runner: &dyn GitRunner,
+    request: &Request,
+    flight: &Preflight,
+) -> Result<bool> {
+    let advert = remote::advertise(runner, &request.url)?;
+    Ok(advert
+        .head_symref
+        .is_some_and(|symref| symref.as_slice() == flight.default_ref().as_slice()))
+}
+
+fn published_receipt(request: &Request) -> Receipt {
+    Receipt {
+        remote: BString::from(request.remote.as_bytes().to_vec()),
+        url: BString::from(request.url.as_bytes().to_vec()),
+    }
+}
+
+/// The report for a run that pushed but could not confirm the hosting side's
+/// default branch. The state stays `publishing`, so a rerun reconciles.
+fn unconfirmed_head_report(
+    request: &Request,
+    flight: &Preflight,
+    lines: Vec<String>,
+    mut diagnostics: Vec<String>,
+) -> PublishReport {
+    diagnostics.push(format!(
+        "the hosting side's default branch is not {}; set it by hand, then run `git grove publish {}` again",
+        escaped(&flight.default_branch),
+        escaped(request.url.as_bytes())
+    ));
+    PublishReport {
+        class: ExitClass::NeedsDecision,
+        lines,
+        diagnostics,
+    }
+}
+
+/// Steps 5 to 7, shared by a fresh publication and by resuming an interrupted
+/// one. The receipt is already `publishing` and the remote already configured.
+fn publish_and_verify(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    request: &Request,
+    flight: &Preflight,
+    diagnostics: Vec<String>,
+) -> Result<PublishReport> {
+    let refspecs = push_refspecs(runner, grove, request, flight)?;
+    push(runner, grove, request, &refspecs)?;
+
+    // Upstreams are written explicitly through `config --file` and verified,
+    // never through `push --set-upstream`.
+    let bare = grove.bare_dir();
+    configure_upstreams(
+        runner,
+        &bare,
+        &request.remote,
+        &[wildcard_refspec(&request.remote)],
+    )?;
+    point_remote_head(runner, grove, request, flight)?;
+
+    let mut lines = vec![format!(
+        "published {} to {} at {}",
+        escaped(&flight.default_branch),
+        escaped(request.remote.as_bytes()),
+        escaped(request.url.as_bytes())
+    )];
+    if request.all_branches {
+        lines.push(format!(
+            "pushed {} branches in one atomic push",
+            refspecs.len()
+        ));
+    }
+
+    if !server_head_matches(runner, request, flight)? {
+        return Ok(unconfirmed_head_report(request, flight, lines, diagnostics));
+    }
+
+    metadata::write_receipt(
+        runner,
+        grove,
+        PublishState::Published,
+        &published_receipt(request),
+    )?;
+    Ok(PublishReport {
+        class: ExitClass::Ok,
+        lines,
+        diagnostics,
+    })
+}
+
+/// A rerun on a grove this tool already published: repair the local
+/// configuration, push only if the remote is strictly behind, and re-verify the
+/// hosting side's `HEAD`.
+///
+/// No probe ref is used here. A configured remote makes
+/// `refs/remotes/<remote>/<default>` the authoritative comparison point that a
+/// probe ref exists only to synthesise when there is no remote yet.
+fn repair_published(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    request: &Request,
+    flight: &Preflight,
+) -> Result<PublishReport> {
+    FetchPlan {
+        remotes: vec![BString::from(request.remote.as_bytes().to_vec())],
+    }
+    .execute(runner, grove)?;
+
+    configure_local_remote(runner, grove, request, true)?;
+    let bare = grove.bare_dir();
+    configure_upstreams(
+        runner,
+        &bare,
+        &request.remote,
+        &[wildcard_refspec(&request.remote)],
+    )?;
+
+    let local_ref = flight.default_ref();
+    let tracking = tracking_ref(&request.remote, &flight.default_branch);
+    let mut lines = Vec::new();
+
+    match remote::is_ancestor(runner, grove, &tracking, &local_ref)? {
+        Ancestry::Ancestor => {
+            let remote_oid = resolve(runner, grove, &tracking)?;
+            let local_oid = resolve(runner, grove, &local_ref)?;
+            if remote_oid == local_oid {
+                lines.push(format!(
+                    "{} is already at {}",
+                    escaped(request.remote.as_bytes()),
+                    escaped(&local_oid)
+                ));
+            } else {
+                let refspecs = push_refspecs(runner, grove, request, flight)?;
+                push(runner, grove, request, &refspecs)?;
+                lines.push(format!(
+                    "advanced {} on {} to {}",
+                    escaped(&flight.default_branch),
+                    escaped(request.remote.as_bytes()),
+                    escaped(&local_oid)
+                ));
+            }
+        }
+        Ancestry::NotAncestor => {
+            return Err(conflict(
+                "the publication target is ahead of this grove or has diverged",
+                format!(
+                    "{} is not behind this grove's {}; nothing was pushed",
+                    escaped(&tracking),
+                    escaped(&local_ref)
+                ),
+            ))
+        }
+        // A configured remote's tracking ref vanishing mid-run is not a
+        // decision a user can make.
+        Ancestry::MissingObject => {
+            return Err(GroveError::failure(format!(
+                "{} vanished while this grove was being repaired",
+                escaped(&tracking)
+            )))
+        }
+    }
+
+    point_remote_head(runner, grove, request, flight)?;
+
+    if !server_head_matches(runner, request, flight)? {
+        // The same condition specification step 7 prescribes `publishing` and
+        // exit 2 for on a first publish, so a rerun applies the same rule. The
+        // receipt is untouched, so the acceptance matrix still resumes cleanly.
+        metadata::write_receipt(
+            runner,
+            grove,
+            PublishState::Publishing,
+            &published_receipt(request),
+        )?;
+        return Ok(unconfirmed_head_report(request, flight, lines, Vec::new()));
+    }
+
+    Ok(PublishReport {
+        class: ExitClass::Ok,
+        lines,
+        diagnostics: Vec::new(),
+    })
+}
+
 /// Run the publication transaction.
 pub fn run(
     runner: &dyn GitRunner,
@@ -520,16 +891,14 @@ pub fn run(
 ) -> Result<PublishReport> {
     let live = live_remote_url(runner, grove, &request.remote)?;
     let resume = accept_rerun(metadata, live.as_ref(), request)?;
-    let preflight = preflight(runner, grove, metadata, request)?;
+    let flight = preflight(runner, grove, metadata, request)?;
 
     if resume == Resume::RepairPublished {
-        return Err(GroveError::failure(
-            "repairing an already published grove is not implemented yet",
-        ));
+        return repair_published(runner, grove, request, &flight);
     }
 
     let mut diagnostics = Vec::new();
-    inspect_target(runner, grove, request, &preflight, &mut diagnostics)?;
+    inspect_target(runner, grove, request, &flight, &mut diagnostics)?;
 
     // The first durable write. Everything above is read-only against the remote
     // and self-healing locally.
@@ -537,19 +906,11 @@ pub fn run(
         runner,
         grove,
         PublishState::Publishing,
-        &Receipt {
-            remote: BString::from(request.remote.as_bytes().to_vec()),
-            url: BString::from(request.url.as_bytes().to_vec()),
-        },
+        &published_receipt(request),
     )?;
 
     configure_local_remote(runner, grove, request, live.is_some())?;
-
-    Ok(PublishReport {
-        class: ExitClass::Ok,
-        lines: Vec::new(),
-        diagnostics,
-    })
+    publish_and_verify(runner, grove, request, &flight, diagnostics)
 }
 
 #[cfg(test)]
@@ -1026,6 +1387,8 @@ mod tests {
         fake.push_response(values(&[b"true"]));
         fake.push_response(values(&[b"origin"]));
 
+        script_tail(&fake);
+
         run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
         let calls = calls_of(&fake);
@@ -1125,6 +1488,8 @@ mod tests {
         fake.push_response(values(&[b"true"]));
         fake.push_response(values(&[b"origin"]));
 
+        script_tail(&fake);
+
         run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
         assert!(probe_ref_deleted(&fake));
@@ -1202,6 +1567,8 @@ mod tests {
         fake.push_response(values(&[b"true"]));
         fake.push_response(values(&[b"origin"]));
 
+        script_tail(&fake);
+
         let report = run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
         assert_eq!(
@@ -1223,6 +1590,29 @@ mod tests {
         assert!(purge < advertise);
     }
 
+    /// The responses steps 5 to 7 consume on the happy path: the atomic push,
+    /// the explicit upstream writes and their verification, the tracking-ref
+    /// check and `set-head --auto` with its verification, the server-side
+    /// `HEAD` re-advertisement, and the three `published` receipt writes.
+    fn script_tail(fake: &RecordingFake) {
+        fake.push_response(out(0, b"")); // push --atomic
+        fake.push_response(out(0, b"refs/heads/main\n")); // list_local_heads
+        fake.push_response(out(0, b"")); // show-ref refs/remotes/origin/main
+        fake.push_response(out(0, b"")); // branch.main.remote write
+        fake.push_response(out(0, b"")); // branch.main.merge write
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(values(&[b"refs/heads/main"]));
+        fake.push_response(out(0, b"")); // ref_exists refs/remotes/origin/main
+        fake.push_response(out(0, b"")); // remote set-head --auto
+        fake.push_response(out(0, b"refs/remotes/origin/main\n")); // symbolic-ref
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // show-ref --hash
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // rev-parse
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
+        for _ in 0..3 {
+            fake.push_response(out(0, b"")); // the published receipt
+        }
+    }
+
     // ---- specification step 4: the local remote configuration ----------
 
     #[test]
@@ -1239,6 +1629,8 @@ mod tests {
         fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
         fake.push_response(values(&[b"true"]));
         fake.push_response(values(&[b"origin"]));
+
+        script_tail(&fake);
 
         run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
@@ -1285,6 +1677,8 @@ mod tests {
         fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
         fake.push_response(values(&[b"true"]));
         fake.push_response(values(&[b"origin"]));
+
+        script_tail(&fake);
 
         run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
@@ -1350,6 +1744,8 @@ mod tests {
         fake.push_response(values(&[b"origin"]));
         let metadata = metadata_of(PublishState::Publishing, Some("origin"), Some(URL));
 
+        script_tail(&fake);
+
         run(&fake, &grove(), &metadata, &request()).unwrap();
 
         assert!(!calls_of(&fake)
@@ -1374,6 +1770,8 @@ mod tests {
         fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
         fake.push_response(values(&[b"true"]));
         fake.push_response(values(&[b"origin"]));
+
+        script_tail(&fake);
 
         run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
@@ -1432,6 +1830,8 @@ mod tests {
         fake.push_response(out(0, b""));
         fake.push_response(values(&[b"origin"]));
 
+        script_tail(&fake);
+
         run(&fake, &grove(), &unpublished(), &request()).unwrap();
 
         let calls = calls_of(&fake);
@@ -1471,5 +1871,511 @@ mod tests {
 
         assert_eq!(error.class, ExitClass::Failure);
         assert!(error.message.contains("worktree.guessRemote"));
+    }
+
+    // ---- specification step 5: the push --------------------------------
+
+    /// Everything a fresh publication consumes up to and including the local
+    /// configuration, for a grove with a commit on `main` and an empty target.
+    fn script_through_configuration(fake: &RecordingFake) {
+        script_preflight(fake);
+        fake.push_response(out(0, b"")); // purge
+        fake.push_response(out(0, b"")); // ls-remote: empty target
+        for _ in 0..3 {
+            fake.push_response(out(0, b"")); // publishing receipt
+        }
+        fake.push_response(out(0, b"")); // remote add
+        fake.push_response(values(&[URL.as_bytes()]));
+        fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
+        fake.push_response(values(&[b"true"]));
+        fake.push_response(values(&[b"origin"]));
+    }
+
+    fn push_call(fake: &RecordingFake) -> Vec<String> {
+        calls_of(fake)
+            .into_iter()
+            .find(|call| call.contains(&"push".to_string()))
+            .expect("a push must have been issued")
+    }
+
+    #[test]
+    fn the_default_push_is_one_explicit_non_forced_atomic_refspec() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        script_tail(&fake);
+
+        run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        assert_eq!(
+            push_call(&fake),
+            [
+                BARE,
+                "push",
+                "--atomic",
+                "--",
+                "origin",
+                "refs/heads/main:refs/heads/main",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_publication_invocation_ever_forces_or_sets_upstream() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        script_tail(&fake);
+
+        run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        for call in calls_of(&fake) {
+            for forbidden in [
+                "--force",
+                "--force-with-lease",
+                "--set-upstream",
+                "-u",
+                "--all",
+                "--mirror",
+                "--tags",
+            ] {
+                assert!(
+                    !call.iter().any(|arg| arg == forbidden),
+                    "{forbidden} appeared in {call:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_push_child_is_locale_pinned_so_its_stderr_can_be_classified() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        script_tail(&fake);
+
+        run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        let pinned: Vec<bool> = fake
+            .calls()
+            .iter()
+            .filter(|call| call.argv_for_test().contains(&"push".to_string()))
+            .map(|call| call.is_c_locale())
+            .collect();
+        assert_eq!(pinned, vec![true]);
+    }
+
+    #[test]
+    fn all_branches_pushes_every_local_head_in_one_atomic_push() {
+        let fake = RecordingFake::new();
+        script_preflight(&fake);
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        for _ in 0..3 {
+            fake.push_response(out(0, b""));
+        }
+        fake.push_response(out(0, b""));
+        fake.push_response(values(&[URL.as_bytes()]));
+        fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
+        fake.push_response(values(&[b"true"]));
+        fake.push_response(values(&[b"origin"]));
+        // push_refspecs asks for every local head first.
+        fake.push_response(out(
+            0,
+            b"refs/heads/main\nrefs/heads/topic/x\nrefs/heads/z\n",
+        ));
+        fake.push_response(out(0, b"")); // the single push
+        fake.push_response(out(0, b"refs/heads/main\n")); // configure_upstreams
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(values(&[b"refs/heads/main"]));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
+        for _ in 0..3 {
+            fake.push_response(out(0, b""));
+        }
+        let request = Request {
+            url: OsString::from(URL),
+            remote: OsString::from("origin"),
+            all_branches: true,
+        };
+
+        run(&fake, &grove(), &unpublished(), &request).unwrap();
+
+        let pushes: Vec<Vec<String>> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"push".to_string()))
+            .collect();
+        assert_eq!(pushes.len(), 1, "one atomic push, never one per branch");
+        assert_eq!(
+            pushes[0],
+            [
+                BARE,
+                "push",
+                "--atomic",
+                "--",
+                "origin",
+                "refs/heads/main:refs/heads/main",
+                "refs/heads/topic/x:refs/heads/topic/x",
+                "refs/heads/z:refs/heads/z",
+            ]
+        );
+    }
+
+    /// Measured M8: git refuses pre-flight with exit 128 and updates no ref, so
+    /// "nothing was published" is guaranteed by git itself and no separate
+    /// `--dry-run` capability probe is needed. Measured M15: this match is only
+    /// sound because the child is locale-pinned.
+    #[test]
+    fn a_target_that_does_not_advertise_atomic_push_is_a_named_decision() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        fake.push_response(GitOutput {
+            status: 128,
+            stdout: Vec::new(),
+            stderr: b"fatal: the receiving end does not support --atomic push\nfatal: the remote end hung up unexpectedly\n".to_vec(),
+        });
+
+        let error = run(&fake, &grove(), &unpublished(), &request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.message.contains("atomic push"));
+        assert!(error.detail.unwrap().contains("nothing was published"));
+    }
+
+    #[test]
+    fn any_other_push_failure_is_a_failure_that_leaves_the_state_publishing() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        fake.push_response(GitOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"remote: rejected by policy\nerror: failed to push some refs\n".to_vec(),
+        });
+
+        let error = run(&fake, &grove(), &unpublished(), &request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.detail.unwrap().contains("rejected"));
+        let states: Vec<String> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"grove.publishState".to_string()))
+            .map(|call| call.last().unwrap().clone())
+            .collect();
+        assert_eq!(states, vec!["publishing"], "the state is never advanced");
+    }
+
+    // ---- steps 6 and 7 -------------------------------------------------
+
+    #[test]
+    fn upstreams_are_written_explicitly_and_the_happy_path_never_fetches() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        script_tail(&fake);
+
+        run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        let calls = calls_of(&fake);
+        assert!(calls.contains(&vec![
+            "config".to_string(),
+            "--file".into(),
+            CONFIG.into(),
+            "branch.main.remote".into(),
+            "origin".into(),
+        ]));
+        assert!(calls.contains(&vec![
+            "config".to_string(),
+            "--file".into(),
+            CONFIG.into(),
+            "branch.main.merge".into(),
+            "refs/heads/main".into(),
+        ]));
+        assert!(
+            !calls.iter().any(|call| call.contains(&"fetch".to_string())),
+            "the push creates the tracking ref itself; no fetch is needed"
+        );
+    }
+
+    #[test]
+    fn set_head_passes_auto_before_the_dashes_that_guard_the_remote_name() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        script_tail(&fake);
+
+        run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        assert!(calls_of(&fake).contains(&vec![
+            BARE.to_string(),
+            "remote".into(),
+            "set-head".into(),
+            "--auto".into(),
+            "--".into(),
+            "origin".into(),
+        ]));
+    }
+
+    #[test]
+    fn an_absent_tracking_ref_is_fetched_as_an_explicit_fallback() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        fake.push_response(out(0, b"")); // push
+        fake.push_response(out(0, b"refs/heads/main\n"));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(values(&[b"refs/heads/main"]));
+        fake.push_response(out(1, b"")); // tracking ref absent
+        fake.push_response(out(0, b"")); // fallback fetch
+        fake.push_response(out(0, b"")); // present now
+        fake.push_response(out(0, b"")); // set-head
+        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
+        for _ in 0..3 {
+            fake.push_response(out(0, b""));
+        }
+
+        run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        let fetches: Vec<Vec<String>> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"fetch".to_string()))
+            .collect();
+        assert_eq!(fetches.len(), 1);
+        assert_eq!(fetches[0], sync_fetch_argv());
+    }
+
+    /// The repair and fallback fetches must stay byte-identical to `sync`'s.
+    fn sync_fetch_argv() -> Vec<String> {
+        let fake = RecordingFake::new();
+        FetchPlan {
+            remotes: vec![BString::from("origin")],
+        }
+        .execute(&fake, &grove())
+        .unwrap();
+        fake.calls()[0].argv_for_test()
+    }
+
+    /// Measured M12: pushing into a target whose unborn `HEAD` names another
+    /// branch leaves `HEAD` dangling and silent.
+    #[test]
+    fn an_unconfirmed_server_head_keeps_publishing_and_asks_for_a_decision() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        fake.push_response(out(0, b"")); // push
+        fake.push_response(out(0, b"refs/heads/main\n"));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(values(&[b"refs/heads/main"]));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        // The target advertises the branch but no HEAD symref.
+        fake.push_response(out(0, format!("{OID}\trefs/heads/main\n").as_bytes()));
+
+        let report = run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        assert!(report.lines[0].contains("published main"));
+        assert!(report
+            .diagnostics
+            .last()
+            .unwrap()
+            .contains("set it by hand"));
+        let states: Vec<String> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"grove.publishState".to_string()))
+            .map(|call| call.last().unwrap().clone())
+            .collect();
+        assert_eq!(
+            states,
+            vec!["publishing"],
+            "the state is kept at publishing, not advanced and not rolled back"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_server_head_advances_the_receipt_to_published() {
+        let fake = RecordingFake::new();
+        script_through_configuration(&fake);
+        script_tail(&fake);
+
+        let report = run(&fake, &grove(), &unpublished(), &request()).unwrap();
+
+        assert_eq!(report.class, ExitClass::Ok);
+        let states: Vec<String> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"grove.publishState".to_string()))
+            .map(|call| call.last().unwrap().clone())
+            .collect();
+        assert_eq!(states, vec!["publishing", "published"]);
+    }
+
+    // ---- the published rerun -------------------------------------------
+
+    fn published_metadata() -> Metadata {
+        metadata_of(PublishState::Published, Some("origin"), Some(URL))
+    }
+
+    /// Everything the repair path consumes up to its ancestry classification.
+    fn script_repair_preamble(fake: &RecordingFake) {
+        fake.push_response(values(&[URL.as_bytes()])); // live remote url
+        fake.push_response(out(0, b"")); // check-ref-format
+        fake.push_response(out(0, b"refs/heads/main\n")); // has_any_commit
+        fake.push_response(out(0, b"")); // show-ref refs/heads/main
+        fake.push_response(out(0, b"")); // the sync-shaped fetch
+        fake.push_response(values(&[URL.as_bytes()])); // remote.origin.url
+        fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
+        fake.push_response(values(&[b"true"])); // worktree.guessRemote
+        fake.push_response(values(&[b"origin"])); // grove.remote
+        fake.push_response(out(0, b"refs/heads/main\n")); // configure_upstreams
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(values(&[b"refs/heads/main"]));
+    }
+
+    fn script_repair_tail(fake: &RecordingFake) {
+        fake.push_response(out(0, b"")); // tracking ref exists
+        fake.push_response(out(0, b"")); // set-head
+        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
+    }
+
+    #[test]
+    fn a_repair_run_fetches_exactly_as_sync_does_and_uses_no_probe_ref() {
+        let fake = RecordingFake::new();
+        script_repair_preamble(&fake);
+        fake.push_response(out(0, b"")); // is_ancestor: tracking is an ancestor
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // remote oid
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // local oid
+        script_repair_tail(&fake);
+
+        let report = run(&fake, &grove(), &published_metadata(), &request()).unwrap();
+
+        assert_eq!(report.class, ExitClass::Ok);
+        assert!(report.lines[0].contains("already at"));
+        let calls = calls_of(&fake);
+        let fetches: Vec<&Vec<String>> = calls
+            .iter()
+            .filter(|call| call.contains(&"fetch".to_string()))
+            .collect();
+        assert_eq!(fetches.len(), 1);
+        assert_eq!(*fetches[0], sync_fetch_argv());
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.iter().any(|arg| arg.contains("publish-probe"))),
+            "the repair path compares against the tracking ref, never a probe ref"
+        );
+        assert!(!calls.iter().any(|call| call.contains(&"push".to_string())));
+    }
+
+    #[test]
+    fn a_repair_run_pushes_when_the_target_is_strictly_behind() {
+        let fake = RecordingFake::new();
+        script_repair_preamble(&fake);
+        fake.push_response(out(0, b"")); // is_ancestor: Ancestor
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // remote oid
+        fake.push_response(out(0, b"aaaaaaa\n")); // local oid differs
+        fake.push_response(out(0, b"")); // push
+        script_repair_tail(&fake);
+
+        let report = run(&fake, &grove(), &published_metadata(), &request()).unwrap();
+
+        assert_eq!(report.class, ExitClass::Ok);
+        assert!(report.lines[0].contains("advanced main"));
+        assert_eq!(
+            push_call(&fake),
+            [
+                BARE,
+                "push",
+                "--atomic",
+                "--",
+                "origin",
+                "refs/heads/main:refs/heads/main",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repair_run_refuses_when_the_target_is_ahead_or_diverged() {
+        let fake = RecordingFake::new();
+        script_repair_preamble(&fake);
+        fake.push_response(out(1, b"")); // is_ancestor: NotAncestor
+
+        let error = run(&fake, &grove(), &published_metadata(), &request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.detail.unwrap().contains("nothing was pushed"));
+        assert!(!calls_of(&fake)
+            .iter()
+            .any(|call| call.contains(&"push".to_string())));
+    }
+
+    /// A configured remote's tracking ref vanishing mid-run is not a decision a
+    /// user can make, so it is exit 1 and not exit 2.
+    #[test]
+    fn a_repair_run_whose_tracking_ref_vanished_is_a_failure() {
+        let fake = RecordingFake::new();
+        script_repair_preamble(&fake);
+        fake.push_response(out(128, b"")); // is_ancestor: MissingObject
+
+        let error = run(&fake, &grove(), &published_metadata(), &request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.message.contains("vanished"));
+    }
+
+    #[test]
+    fn a_repair_run_demotes_to_publishing_when_the_server_head_no_longer_matches() {
+        let fake = RecordingFake::new();
+        script_repair_preamble(&fake);
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, b"")); // tracking ref exists
+        fake.push_response(out(0, b"")); // set-head
+        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
+        fake.push_response(advert_of("refs/heads/master", &[("refs/heads/main", OID)]));
+        for _ in 0..3 {
+            fake.push_response(out(0, b""));
+        }
+
+        let report = run(&fake, &grove(), &published_metadata(), &request()).unwrap();
+
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        let states: Vec<String> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"grove.publishState".to_string()))
+            .map(|call| call.last().unwrap().clone())
+            .collect();
+        assert_eq!(states, vec!["publishing"]);
+        let receipts: Vec<Vec<String>> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| {
+                call.iter()
+                    .any(|arg| arg == "grove.publishUrl" || arg == "grove.publishRemote")
+            })
+            .collect();
+        assert_eq!(
+            receipts.last().unwrap().last().unwrap(),
+            URL,
+            "the receipt itself is untouched, so the matrix still resumes"
+        );
     }
 }
