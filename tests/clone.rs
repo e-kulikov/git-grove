@@ -3,6 +3,7 @@ mod harness;
 use harness::Sandbox;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 #[test]
@@ -108,6 +109,64 @@ fn honours_a_renamed_remote() {
     assert!(std::fs::read_to_string(root.join("AGENTS.md"))
         .unwrap()
         .contains("upstream/"));
+}
+
+#[test]
+fn remote_set_head_uses_option_terminator() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.bare_origin("o");
+    let wrapper_dir = sandbox.root().join("git-wrapper");
+    std::fs::create_dir(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    let argv_log = sandbox.root().join("remote-set-head.argv");
+    std::fs::write(
+        &wrapper,
+        b"#!/bin/sh\nrecord=0\nprevious=\nfor arg do\n  if [ \"$record\" -eq 1 ]; then\n    printf '%s\\0' \"$arg\" >>\"$GIT_GROVE_ARGV_LOG\"\n  elif [ \"$previous\" = remote ] && [ \"$arg\" = set-head ]; then\n    record=1\n    printf 'remote\\0set-head\\0' >>\"$GIT_GROVE_ARGV_LOG\"\n  fi\n  previous=$arg\ndone\nexec \"$GIT_GROVE_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let path = format!(
+        "{}:{}",
+        wrapper_dir.display(),
+        std::env::var("PATH").unwrap()
+    );
+    sandbox
+        .grove(&[
+            "clone",
+            origin.to_str().unwrap(),
+            "g",
+            "--",
+            "--origin",
+            "upstream",
+        ])
+        .env("PATH", path)
+        .env("GIT_GROVE_ARGV_LOG", &argv_log)
+        .env("GIT_GROVE_REAL_GIT", real_git.trim_end())
+        .assert()
+        .success();
+
+    let argv = std::fs::read(argv_log).unwrap();
+    let argv = argv
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        argv,
+        [
+            b"remote".as_slice(),
+            b"set-head".as_slice(),
+            b"--auto".as_slice(),
+            b"--".as_slice(),
+            b"upstream".as_slice(),
+        ]
+    );
 }
 
 #[test]

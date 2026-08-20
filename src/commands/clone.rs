@@ -404,8 +404,9 @@ fn run_transaction(
         Invocation::new().git_dir(&bare.anchored_path).args([
             OsStr::new("remote"),
             OsStr::new("set-head"),
-            verdict.remote_name.as_os_str(),
             OsStr::new("--auto"),
+            OsStr::new("--"),
+            verdict.remote_name.as_os_str(),
         ]),
         "remote set-head --auto",
     )?;
