@@ -752,6 +752,14 @@ fn run_transaction(
             "the foreign entry was preserved",
         ));
     }
+    // A clone has a remote, so its state is `published` — per the
+    // specification's `## adopt` step 8, `unpublished` is for a grove with no
+    // remote. It deliberately records **no** publication receipt, and not only
+    // because it predates the keys: a receipt would match `publish`'s
+    // `RepairPublished` rerun path, which rewrites `remote.<name>.fetch` to the
+    // wildcard refspec and would therefore silently un-narrow a narrowed clone,
+    // whose per-branch refspecs `repair_refspecs` writes on purpose. Staying
+    // receipt-less is what keeps a cloned grove out of that path.
     metadata::write_to_config(
         &guarded,
         &config,
@@ -760,6 +768,8 @@ fn run_transaction(
             default_branch: Some(selected.as_bytes().to_vec().into()),
             remote: Some(verdict.remote_name.as_bytes().to_vec().into()),
             publish_state: PublishState::Published,
+            publish_remote: None,
+            publish_url: None,
         },
     )?;
     let facts = Facts {

@@ -499,6 +499,8 @@ fn run_transaction(
             default_branch: Some(actual_branch.clone()),
             remote: None,
             publish_state: PublishState::Unpublished,
+            publish_remote: None,
+            publish_url: None,
         },
     )?;
 
