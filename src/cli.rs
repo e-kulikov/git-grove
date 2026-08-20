@@ -14,6 +14,8 @@ pub const KNOWN: &[&str] = &[
     "sprout",
     "list",
     "survey",
+    "sync",
+    "tend",
     "completion",
     "help",
 ];
@@ -23,7 +25,7 @@ pub const KNOWN: &[&str] = &[
     name = "git-grove",
     version,
     about = "Manage repositories as a bare clone surrounded by git worktrees",
-    after_help = "Aliases: plant=clone  seed=init  sprout=add  survey=list"
+    after_help = "Aliases: plant=clone  seed=init  sprout=add  survey=list  tend=sync"
 )]
 pub struct Cli {
     /// Consent to sanitizing unsafe Git environment variables
@@ -85,6 +87,9 @@ pub enum Command {
         #[arg(long)]
         porcelain: bool,
     },
+    /// Fetch and fast-forward every eligible worktree
+    #[command(visible_alias = "tend")]
+    Sync,
     /// Generate shell completion code
     Completion { shell: CompletionShell },
 }
@@ -372,6 +377,8 @@ mod tests {
             "sprout",
             "list",
             "survey",
+            "sync",
+            "tend",
             "completion",
             "help",
         ] {

@@ -1,6 +1,9 @@
 pub mod porcelain;
 
+use crate::error::GroveError;
+use crate::grove::state::Snapshot;
 use bstr::{BString, ByteSlice};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -14,6 +17,37 @@ pub struct Row {
     pub behind: Option<u32>,
     pub dirty: bool,
     pub locked: Option<BString>,
+}
+
+impl From<&Snapshot> for Row {
+    fn from(snapshot: &Snapshot) -> Self {
+        Row {
+            path: snapshot.record.path.clone(),
+            status: snapshot.state.as_str(),
+            branch: snapshot.record.branch.clone(),
+            upstream: snapshot.upstream.clone(),
+            ahead: snapshot.tracking.as_ref().map(|tracking| tracking.ahead),
+            behind: snapshot.tracking.as_ref().map(|tracking| tracking.behind),
+            dirty: snapshot.dirty,
+            locked: snapshot.record.locked.clone(),
+        }
+    }
+}
+
+pub fn write_rows(
+    writer: &mut dyn Write,
+    rows: &[Row],
+    porcelain: bool,
+) -> crate::error::Result<()> {
+    let bytes = if porcelain {
+        self::porcelain::render(rows)
+    } else {
+        render_human(rows).into_bytes()
+    };
+    writer
+        .write_all(&bytes)
+        .and_then(|_| writer.flush())
+        .map_err(|error| GroveError::failure(format!("cannot write stdout: {error}")))
 }
 
 fn escaped(bytes: &[u8]) -> String {
@@ -64,9 +98,30 @@ pub fn render_human(rows: &[Row]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ExitClass;
     use bstr::BString;
     use std::ffi::OsString;
+    use std::io;
     use std::os::unix::ffi::OsStringExt;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+    }
+
+    #[test]
+    fn propagates_stdout_write_failures_as_failure() {
+        let error = write_rows(&mut FailingWriter, &[], true).unwrap_err();
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.message.contains("stdout"));
+    }
 
     #[test]
     fn human_output_reversibly_escapes_raw_path_and_ref_bytes() {

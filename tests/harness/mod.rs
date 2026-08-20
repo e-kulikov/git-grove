@@ -160,4 +160,53 @@ impl Sandbox {
         self.git(&seed, &["push", "--quiet", "origin", "main"]);
         origin
     }
+
+    /// Clone `origin` into a fresh peer directory under the sandbox root.
+    pub fn peer_clone(&self, origin: &Path, name: &str) -> PathBuf {
+        let peer = self.root().join(name);
+        self.git(
+            self.root(),
+            &[
+                "clone",
+                "--quiet",
+                origin.to_str().unwrap(),
+                peer.to_str().unwrap(),
+            ],
+        );
+        peer
+    }
+
+    /// Write `contents` to `relative` inside `repo`, then add, commit, and
+    /// push the change to `remote`/`branch`.
+    pub fn commit_and_push(
+        &self,
+        repo: &Path,
+        relative: &str,
+        contents: &[u8],
+        remote: &str,
+        branch: &str,
+    ) {
+        std::fs::write(repo.join(relative), contents).unwrap();
+        self.git(repo, &["add", relative]);
+        self.git(
+            repo,
+            &["commit", "--quiet", "-m", &format!("advance {relative}")],
+        );
+        self.git(repo, &["push", "--quiet", remote, branch]);
+    }
+
+    /// The admin (git-dir) directory backing the worktree at `path`.
+    pub fn worktree_admin(&self, path: &Path) -> PathBuf {
+        let output = self.git(path, &["rev-parse", "--absolute-git-dir"]);
+        PathBuf::from(String::from_utf8(output.stdout).unwrap().trim_end())
+    }
+
+    /// The resolved commit OID of `revision` inside `repo`.
+    pub fn oid(&self, repo: &Path, revision: &str) -> String {
+        let output = self.git(repo, &["rev-parse", revision]);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim_end()
+            .to_string()
+    }
 }

@@ -13,7 +13,7 @@ fn release_version_requires_a_strict_matching_tag() {
     let manifest = repo_root().join("Cargo.toml");
 
     let valid = Command::new(&script)
-        .args(["v0.1.0", manifest.to_str().unwrap()])
+        .args(["v0.2.0", manifest.to_str().unwrap()])
         .output()
         .expect("run version validator");
     assert!(
@@ -21,9 +21,9 @@ fn release_version_requires_a_strict_matching_tag() {
         "{}",
         String::from_utf8_lossy(&valid.stderr)
     );
-    assert_eq!(valid.stdout, b"0.1.0\n");
+    assert_eq!(valid.stdout, b"0.2.0\n");
 
-    for tag in ["0.1.0", "v01.1.0", "v0.1", "v0.1.0-rc.1", "v0.2.0"] {
+    for tag in ["0.2.0", "v01.2.0", "v0.2", "v0.2.0-rc.1", "v0.1.0"] {
         let invalid = Command::new(&script)
             .args([tag, manifest.to_str().unwrap()])
             .output()
@@ -67,6 +67,68 @@ fn release_docs_describe_real_metadata_and_the_narrow_environment_consent() {
 }
 
 #[test]
+fn release_docs_describe_sync_and_its_safety_contract() {
+    for relative in ["README.md", "man/git-grove.1"] {
+        let document = fs::read_to_string(repo_root().join(relative)).unwrap();
+        for required in [
+            "sync",
+            "tend",
+            "--ff-only",
+            "--no-autostash",
+            "--no-overwrite-ignore",
+            "git-town",
+        ] {
+            assert!(
+                document.contains(required),
+                "{relative} omits sync contract term {required}"
+            );
+        }
+        let rendered_words = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            rendered_words.contains("fetch --all"),
+            "{relative} must explicitly rule out fetch --all"
+        );
+        assert!(
+            rendered_words.contains("worktree that is clean and behind"),
+            "{relative} must describe that only a clean, behind worktree is updated"
+        );
+        assert!(
+            document.contains("path")
+                && (document.contains("order") || document.contains("sequential")),
+            "{relative} must describe stable sequential path ordering"
+        );
+        assert!(
+            document.contains("status `1`") || document.contains(".B 1"),
+            "{relative} must describe exit 1 for a fetch failure"
+        );
+        assert!(
+            document.contains("status `2`") || document.contains(".B 2"),
+            "{relative} must describe exit 2 for an unresolved or blocked state"
+        );
+        for unimplemented in ["publish", "adopt"] {
+            assert!(
+                !document.contains(&format!("git grove {unimplemented}"))
+                    && !document.contains(&format!("git-grove {unimplemented}")),
+                "{relative} must not advertise unimplemented command {unimplemented}"
+            );
+        }
+        assert!(
+            !rendered_words.contains("--no-overwrite-ignore @{upstream}"),
+            "{relative} must not claim the merge targets the symbolic @{{upstream}} revision"
+        );
+    }
+}
+
+#[test]
+fn grove_format_version_is_unchanged_by_the_0_2_0_package_version() {
+    let source = fs::read_to_string(repo_root().join("src/grove/metadata.rs")).unwrap();
+    assert!(
+        source.contains("pub const FORMAT_VERSION: u32 = 1;"),
+        "grove layout format must remain version 1 across the 0.2.0 package bump"
+    );
+}
+
+#[test]
 fn release_workflow_proves_static_linkage_from_elf_headers() {
     let workflow = fs::read_to_string(repo_root().join(".github/workflows/release.yml")).unwrap();
 
@@ -102,7 +164,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
     run_packager(&binary, &first);
     run_packager(&binary, &second);
 
-    let archive_name = "git-grove_0.1.0_linux_x86_64.tar.gz";
+    let archive_name = "git-grove_0.2.0_linux_x86_64.tar.gz";
     assert_eq!(
         fs::read(first.join(archive_name)).unwrap(),
         fs::read(second.join(archive_name)).unwrap(),
@@ -126,7 +188,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
         .output()
         .unwrap();
     assert!(listing.status.success());
-    let prefix = "git-grove_0.1.0_linux_x86_64";
+    let prefix = "git-grove_0.2.0_linux_x86_64";
     let expected = [
         format!("{prefix}/"),
         format!("{prefix}/LICENSE"),
@@ -178,7 +240,7 @@ fn run_packager(binary: &Path, destination: &Path) {
     let output = Command::new(repo_root().join("scripts/package-release.sh"))
         .env("SOURCE_DATE_EPOCH", "946684800")
         .args([
-            "0.1.0",
+            "0.2.0",
             binary.to_str().unwrap(),
             destination.to_str().unwrap(),
         ])

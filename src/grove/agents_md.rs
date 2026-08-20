@@ -80,6 +80,7 @@ pub fn render(facts: &Facts) -> String {
          ```bash\n\
          git grove list                 # inspect worktrees and their branches\n\
          git grove add <branch>         # create a worktree for a branch\n\
+         git grove sync                 # fetch and fast-forward eligible worktrees\n\
          ```\n\n",
     );
 
@@ -161,14 +162,20 @@ mod tests {
             .find("git grove list")
             .expect("list must be documented");
         let add = text.find("git grove add").expect("add must be documented");
+        let sync = text
+            .find("git grove sync")
+            .expect("sync must be documented");
         let raw = text
             .find("git worktree add")
             .expect("escape-hatch command must be documented");
 
-        assert!(list < raw);
-        assert!(add < raw);
+        assert!(list < add);
+        assert!(add < sync);
+        assert!(sync < raw);
+        assert!(text.contains(
+            "git grove sync                 # fetch and fast-forward eligible worktrees"
+        ));
         for unavailable in [
-            "git grove sync",
             "git grove publish",
             "git grove adopt",
             "git grove ls",

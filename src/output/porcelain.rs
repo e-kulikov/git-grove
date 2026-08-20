@@ -76,4 +76,26 @@ mod tests {
               locked\x00review-\xfc\x00\x00"
         );
     }
+
+    #[test]
+    fn emits_the_in_progress_status_value() {
+        let rows = [Row {
+            path: OsString::from_vec(b"/g/main".to_vec()).into(),
+            status: "IN-PROGRESS",
+            branch: Some(BString::from("main")),
+            upstream: None,
+            ahead: None,
+            behind: None,
+            dirty: false,
+            locked: None,
+        }];
+
+        let bytes = render(&rows);
+
+        assert!(bytes.starts_with(b"git-grove-list-v1\0"));
+        assert!(bytes
+            .windows(b"status\0IN-PROGRESS\0".len())
+            .any(|part| part == b"status\0IN-PROGRESS\0"));
+        assert!(bytes.ends_with(b"\0\0"));
+    }
 }

@@ -1,8 +1,9 @@
 # git-grove
 
 `git-grove` manages a repository as a bare clone surrounded by Git worktrees.
-Version 0.1 deliberately has a small lifecycle: create or clone a grove, add
-worktrees, and inspect their state.
+Version 0.2 has a small, explicit lifecycle: create or clone a grove, add
+worktrees, inspect their state, and fetch and fast-forward eligible
+worktrees.
 
 ## Requirements
 
@@ -18,28 +19,28 @@ With [mise](https://mise.jdx.dev/dev-tools/backends/github.html) and GitHub as
 the backend:
 
 ```sh
-mise use -g 'github:e-kulikov/git-grove@0.1.0'
+mise use -g 'github:e-kulikov/git-grove@0.2.0'
 ```
 
 For declarative mise configuration:
 
 ```toml
 [tools]
-"github:e-kulikov/git-grove" = { version = "0.1.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
+"github:e-kulikov/git-grove" = { version = "0.2.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
 ```
 
-The GitHub backend can install this only after the `v0.1.0` release and its
+The GitHub backend can install this only after the `v0.2.0` release and its
 assets have been published. The release workflow produces an attestation and
 `SHA256SUMS`; mise can lock the published checksum with `mise lock`.
 
 For a direct installation, download
-`git-grove_0.1.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
+`git-grove_0.2.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
 verify the archive, then install its binary:
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf git-grove_0.1.0_linux_x86_64.tar.gz
-install -m 0755 git-grove_0.1.0_linux_x86_64/git-grove ~/.local/bin/git-grove
+tar -xzf git-grove_0.2.0_linux_x86_64.tar.gz
+install -m 0755 git-grove_0.2.0_linux_x86_64/git-grove ~/.local/bin/git-grove
 ```
 
 The archive also contains the man page and generated Bash, Zsh, and Fish
@@ -63,11 +64,15 @@ git grove add experiment --start main
 
 # Inspect every worktree.
 git grove list
+
+# Fetch every required remote and fast-forward eligible worktrees.
+git grove sync
 ```
 
 The aliases are `plant` for `clone`, `seed` for `init`, `sprout` for `add`,
-and `survey` for `list`. Inside a grove, invoking `git grove` without a command
-runs `list`. A repository locator as the first argument selects `clone`.
+`survey` for `list`, and `tend` for `sync`. Inside a grove, invoking
+`git grove` without a command runs `list`. A repository locator as the first
+argument selects `clone`.
 
 `add` always names its branch explicitly:
 
@@ -86,19 +91,51 @@ named `detached-<short-oid>`.
 project/
 ├── .bare/       bare Git repository and shared administration
 ├── .git         pointer containing: gitdir: ./.bare
-├── AGENTS.md    generated repository facts and 0.1 command guide
+├── AGENTS.md    generated repository facts and 0.2 command guide
 ├── CLAUDE.md    relative link to AGENTS.md
 ├── main/        worktree
 └── feature/     another worktree
 ```
 
 Grove metadata is stored in the real Git configuration at `.bare/config`, not
-in a separate metadata file. Version 0.1 uses `grove.version`,
+in a separate metadata file. Version 0.2 uses `grove.version`,
 `grove.defaultBranch`, `grove.remote`, and `grove.publishState`.
 
 All managed worktree paths must remain strictly below the grove root. Existing
 files, symlinks, nonempty destinations, ambiguous remote branches, and
 unrecognized repository state are preserved for a human decision.
+
+## Sync
+
+`git grove sync` (alias `tend`) fetches every remote a registered worktree's
+branch is configured to track, then fast-forwards each eligible worktree:
+
+```sh
+git grove sync
+```
+
+Sync is explicit and narrow, by design:
+
+- It fetches only the remotes configured as the upstream of a registered
+  branch worktree, one atomic fetch per remote — never `git fetch --all`.
+  If any required fetch fails, sync exits with status `1` and updates no
+  worktree.
+- It updates only a worktree that is clean and behind: no local commits
+  ahead of its upstream, no uncommitted changes, and no lock or in-progress
+  operation. Every other worktree, and every candidate whose safety-relevant
+  identity changed since it was last inspected, is reported and left alone.
+- Updates run one worktree at a time, in a stable order sorted by worktree
+  path, so behavior does not depend on process scheduling.
+- The only update it ever runs is
+  `git merge --ff-only --no-edit --no-autostash --no-overwrite-ignore
+  <upstream-oid>`, targeting the exact upstream commit re-inspected
+  immediately beforehand, not the symbolic `@{upstream}` revision (which
+  Git would resolve from live branch configuration at merge time, not from
+  the commit sync already validated). Sync never rebases, pushes, invokes
+  git-town, or resolves a conflict; a refused or blocked merge is reported
+  and left for a human decision, and later worktrees are still processed.
+- Any worktree that remains behind, blocked, or otherwise unresolved after
+  a sync run causes exit status `2`.
 
 ## Safety and exit status
 
@@ -111,9 +148,11 @@ Git child process. It does not bypass the platform check, minimum Git version,
 or refused clone options.
 
 Exit status `0` means success, `1` means an unexpected Git/filesystem/I/O
-failure, `2` means repository state needs a human decision, and `64` means a
-usage error or refused unsupported context. `list --porcelain` emits the
-versioned, NUL-delimited `git-grove-list-v1` protocol for automation.
+failure (including a failed `sync` fetch), `2` means repository state needs a
+human decision (including a worktree `sync` left behind or blocked), and `64`
+means a usage error or refused unsupported context. `list --porcelain` emits
+the versioned, NUL-delimited `git-grove-list-v1` protocol for automation;
+`sync` has no porcelain output in 0.2.
 
 ## Completions and manual
 
@@ -139,10 +178,10 @@ mise exec -- cargo fmt --all -- --check
 mise exec -- cargo test --all-targets --locked
 mise exec -- cargo clippy --all-targets --locked -- -D warnings
 mise exec -- cargo build --release --locked --target x86_64-unknown-linux-musl
-scripts/package-release.sh 0.1.0 \
+scripts/package-release.sh 0.2.0 \
   target/x86_64-unknown-linux-musl/release/git-grove dist
 ```
 
 Release tags must be strict `vX.Y.Z` and match the package version exactly.
-For 0.1.0 the uploaded files are
-`git-grove_0.1.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
+For 0.2.0 the uploaded files are
+`git-grove_0.2.0_linux_x86_64.tar.gz` and `SHA256SUMS`.

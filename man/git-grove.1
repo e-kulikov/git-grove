@@ -1,4 +1,4 @@
-.TH GIT-GROVE 1 "2026-08-11" "git-grove 0.1.0" "Git Extensions"
+.TH GIT-GROVE 1 "2026-08-19" "git-grove 0.2.0" "Git Extensions"
 .SH NAME
 git-grove \- manage repositories as a bare clone surrounded by Git worktrees
 .SH SYNOPSIS
@@ -34,8 +34,9 @@ The command aliases are
 .BR plant = clone ,
 .BR seed = init ,
 .BR sprout = add ,
+.BR survey = list ,
 and
-.BR survey = list .
+.BR tend = sync .
 .SH COMMANDS
 .TP
 .B clone \fR[\fB-b\fR|\fB--branch \fIbranch\fR] \fIurl\fR [\fIdir\fR] [\fB--\fR \fIgit-options\fR...]
@@ -81,6 +82,34 @@ and lock or recovery state.  Human output escapes non-printing bytes
 reversibly.  Missing, invalid, or prunable worktrees are reported and cause
 exit status 2.
 .TP
+.B sync
+Fetch every remote a registered branch worktree's upstream requires, one
+atomic fetch per remote, never
+.BR "fetch --all" .
+If any required fetch fails, no worktree is updated and the command exits
+with status
+.BR 1 .
+After all required fetches succeed, fast-forward only a worktree that is
+clean and behind: no local commits ahead of its upstream, no uncommitted
+changes, and no lock or in-progress operation.  Worktrees are updated one at
+a time, in a stable order sorted by worktree path.  The only update command
+run is
+.BR "git merge --ff-only --no-edit --no-autostash --no-overwrite-ignore <upstream-oid>" ,
+targeting the exact upstream commit re-inspected immediately beforehand, not
+the symbolic
+.B @{upstream}
+revision, which Git would instead resolve from live branch configuration at
+merge time.
+.B sync
+never rebases, pushes, invokes
+.BR git-town ,
+or resolves a conflict; a refused or blocked merge is reported and later
+worktrees are still processed.  Any worktree left behind, blocked, or
+otherwise unresolved causes exit status
+.BR 2 .
+The alias is
+.BR tend .
+.TP
 .B completion \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR}
 Write completion source for the selected shell to standard output.
 .SH OPTIONS
@@ -116,7 +145,7 @@ The real Git configuration also stores metadata under
 .BR grove.remote ,
 and
 .BR grove.publishState .
-Version 0.1 refuses a newer
+Version 0.2 refuses a newer
 .B grove.version
 before writing.
 .TP
@@ -183,7 +212,7 @@ Usage error, refused option or environment, unsupported context without an
 override, or no grove where one is required.
 .SH FILES
 .TP
-.I git-grove_0.1.0_linux_x86_64.tar.gz
+.I git-grove_0.2.0_linux_x86_64.tar.gz
 Static Linux x86_64 release archive containing the executable, license,
 README, this manual, and generated Bash, Zsh, and Fish completions.
 .TP
