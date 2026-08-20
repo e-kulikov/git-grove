@@ -1,5 +1,6 @@
 use crate::error::{GroveError, Result};
 use crate::fsx;
+use crate::fsx::held::open_directory_at;
 use bstr::ByteSlice;
 use rustix::fs::{fstat, mkdirat, openat, statat, AtFlags, Mode, OFlags, CWD};
 use std::ffi::OsStr;
@@ -262,17 +263,6 @@ fn validate_root_identity(root: &File, root_path: &Path) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
-    openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(Into::into)
 }
 
 #[cfg(test)]

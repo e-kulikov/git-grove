@@ -85,6 +85,11 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove add",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             commands::add::run(&runner, &grove, mode).map(|_| ())
@@ -98,6 +103,11 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Shared,
+                "git grove list",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             match commands::list::run(&runner, &grove, porcelain)? {
@@ -119,6 +129,11 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove sync",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             let report = commands::sync::run(&runner, &grove)?;
@@ -153,6 +168,11 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove publish",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             let request = commands::publish::Request {

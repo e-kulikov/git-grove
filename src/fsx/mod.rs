@@ -8,6 +8,10 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+pub mod held;
+pub mod lock;
+pub mod mountinfo;
+
 const TEMP_NAME_ATTEMPTS: usize = 16;
 
 #[allow(dead_code)]
