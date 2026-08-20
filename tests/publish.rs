@@ -1015,6 +1015,59 @@ fn publishes_under_a_two_level_remote_name() {
     );
 }
 
+/// The guard every `--` in this command exists for, exercised end to end.
+///
+/// Measured M14: `git remote add -x <url>` is exit 129 while
+/// `git remote add -- -x <url>` succeeds, and `a/b` is a valid remote name — so
+/// a dash-leading name is legal and must be passed after `--`. The same applies
+/// to `remote set-head --auto -- <remote>`, where the mode must come *before*
+/// the separator: with `--` first git reads `--auto` as the positional
+/// `<branch>` and fails with `Not a valid ref: refs/remotes/<remote>/--auto`.
+///
+/// Every other test here uses `origin`, for which the separators are inert.
+/// This one fails if any of them is dropped or misplaced.
+#[test]
+fn publishes_under_a_remote_name_beginning_with_a_dash() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.empty_origin("origin");
+    let root = grove_with_a_commit(&sandbox, "g", "main");
+    let local = sandbox.oid(&root.join("main"), "HEAD");
+
+    sandbox
+        .grove_in(&root, &["publish", "--remote=-x", origin.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("published main to -x"));
+
+    assert_eq!(
+        sandbox.remote_refs(&origin),
+        vec![("refs/heads/main".to_string(), local)]
+    );
+    assert_eq!(
+        sandbox.remote_head_symref(&origin).as_deref(),
+        Some("refs/heads/main")
+    );
+    assert_eq!(
+        config_of(&sandbox, &root, "grove.publishRemote").as_deref(),
+        Some("-x")
+    );
+    assert_eq!(
+        config_of(&sandbox, &root, "remote.-x.fetch").as_deref(),
+        Some("+refs/heads/*:refs/remotes/-x/*")
+    );
+    assert_eq!(
+        config_of(&sandbox, &root, "branch.main.remote").as_deref(),
+        Some("-x")
+    );
+    // `remote set-head --auto -- -x` wrote this; the plan's literal argv would
+    // instead have tried to point HEAD at a branch called `--auto`.
+    let head = sandbox.git(&bare_of(&root), &["symbolic-ref", "refs/remotes/-x/HEAD"]);
+    assert_eq!(
+        String::from_utf8(head.stdout).unwrap().trim_end(),
+        "refs/remotes/-x/main"
+    );
+}
+
 #[test]
 fn all_branches_publishes_every_local_branch_to_an_empty_remote() {
     let sandbox = Sandbox::new();
