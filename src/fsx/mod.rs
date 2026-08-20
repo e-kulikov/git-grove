@@ -287,17 +287,25 @@ fn link_temporary_file(file: &File, directory: &File, parent: &Path) -> Result<O
     )))
 }
 
-fn temporary_name() -> Result<OsString> {
+/// Sixteen random bytes, lowercase hex. The unique half of every name this
+/// tool has to invent: temporary files here, publication probe refs in
+/// `git::remote`.
+pub(crate) fn hex_nonce() -> Result<String> {
     let mut random = [0_u8; 16];
-    getrandom::getrandom(&mut random).map_err(|error| {
-        GroveError::failure(format!("cannot generate temporary filename: {error}"))
-    })?;
+    getrandom::getrandom(&mut random)
+        .map_err(|error| GroveError::failure(format!("cannot generate a random name: {error}")))?;
 
-    let mut name = String::from(".git-grove-tmp-");
+    let mut nonce = String::with_capacity(random.len() * 2);
     for byte in random {
         use std::fmt::Write as _;
-        write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+        write!(&mut nonce, "{byte:02x}").expect("writing to a String cannot fail");
     }
+    Ok(nonce)
+}
+
+fn temporary_name() -> Result<OsString> {
+    let mut name = String::from(".git-grove-tmp-");
+    name.push_str(&hex_nonce()?);
     Ok(name.into())
 }
 

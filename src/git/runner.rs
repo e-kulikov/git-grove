@@ -11,6 +11,7 @@ pub struct Invocation {
     work_tree: Option<PathBuf>,
     cwd: Option<PathBuf>,
     args: Vec<OsString>,
+    c_locale: bool,
 }
 
 impl Invocation {
@@ -41,6 +42,23 @@ impl Invocation {
         self.args
             .extend(args.into_iter().map(|arg| arg.as_ref().to_os_string()));
         self
+    }
+
+    /// Pin this child's locale so its diagnostics are the untranslated C-locale
+    /// text. This is a parsing contract for one invocation, not a change to the
+    /// environment policy: every other git child keeps the user's locale, so
+    /// git's own diagnostics still reach the user in their language.
+    ///
+    /// Measured on git 2.47.3: `LC_ALL=C` wins over `LANGUAGE`, because gettext
+    /// ignores `LANGUAGE` under the C locale. `LANGUAGE=` is belt and braces.
+    pub fn c_locale(mut self) -> Self {
+        self.c_locale = true;
+        self
+    }
+
+    /// Whether this invocation carries the locale pin.
+    pub fn is_c_locale(&self) -> bool {
+        self.c_locale
     }
 
     fn argv(&self) -> Vec<OsString> {
@@ -77,6 +95,11 @@ impl Invocation {
 pub struct GitOutput {
     pub status: i32,
     pub stdout: Vec<u8>,
+    /// Git's diagnostics, raw. Forwarding these to the user, escaped, is always
+    /// safe. **Branching** on their content is only sound when the output came
+    /// from [`GitRunner::run_classified`], which pins the child's locale: git
+    /// translates its diagnostics, so an unpinned match is a match on whatever
+    /// language the user happens to run in.
     pub stderr: Vec<u8>,
 }
 
@@ -103,6 +126,17 @@ pub trait GitRunner {
         }
         Ok(out)
     }
+
+    /// Run with the child's locale pinned to `C`, so its stderr is the
+    /// untranslated text. This is the only documented way to obtain stderr the
+    /// tool may branch on; see [`GitOutput::stderr`].
+    ///
+    /// Accepted cost: the pinned child's *own* unrelated diagnostics render in
+    /// English too. Server-side rejection-hook text is hook output rather than
+    /// gettext, so hook messages are unaffected either way.
+    fn run_classified(&self, invocation: Invocation) -> Result<GitOutput> {
+        self.run(invocation.c_locale())
+    }
 }
 
 pub struct RealGit;
@@ -121,6 +155,9 @@ impl GitRunner for RealGit {
             cmd.current_dir(cwd);
         }
         env::sanitize(&mut cmd);
+        if invocation.c_locale {
+            cmd.env("LC_ALL", "C").env("LANGUAGE", "");
+        }
         let out = cmd
             .output()
             .map_err(|error| GroveError::failure(format!("cannot run git: {error}")))?;
@@ -231,6 +268,100 @@ mod tests {
         assert_eq!(error.class, ExitClass::Failure);
         assert_eq!(error.message, "git status failed");
         assert_eq!(error.detail.as_deref(), Some("unknown option"));
+    }
+
+    #[test]
+    fn the_locale_pin_is_environment_not_argv() {
+        let inv = Invocation::new().c_locale().args(["push"]);
+
+        assert_eq!(inv.argv_for_test(), vec!["push"]);
+        assert!(inv.is_c_locale());
+    }
+
+    #[test]
+    fn a_plain_invocation_is_not_locale_pinned() {
+        assert!(!Invocation::new().args(["push"]).is_c_locale());
+    }
+
+    #[test]
+    fn run_classified_marks_the_invocation_and_otherwise_delegates_to_run() {
+        let fake = RecordingFake::new();
+        fake.push_response(GitOutput {
+            status: 128,
+            stdout: Vec::new(),
+            stderr: b"fatal: the receiving end does not support --atomic push\n".to_vec(),
+        });
+
+        let out = fake
+            .run_classified(Invocation::new().git_dir("/g/.bare").args(["push"]))
+            .unwrap();
+
+        assert_eq!(out.status, 128);
+        assert_eq!(
+            out.stderr,
+            b"fatal: the receiving end does not support --atomic push\n"
+        );
+        let call = &fake.calls()[0];
+        assert!(call.is_c_locale());
+        assert_eq!(call.argv_for_test(), vec!["--git-dir=/g/.bare", "push"]);
+    }
+
+    /// Ask git itself to report the child environment it was handed, so the pin
+    /// is proved where it is applied rather than inferred from a translation.
+    ///
+    /// The plan asks for a child spawned under `LANGUAGE=de`. `RealGit` has no
+    /// per-child environment API, so the only way to arrange that here would be
+    /// mutating this process's environment, which the plan's Global Constraints
+    /// forbid. Asserting the pinned values directly is stronger and needs no
+    /// German catalog to be installed; the end-to-end `LANGUAGE=de` case lives
+    /// in `tests/publish.rs`, where the harness can set the child environment.
+    #[test]
+    fn real_git_pins_lc_all_and_clears_language_only_when_classified() {
+        const ALIAS: &str = r#"alias.groveenv=!printf '%s|%s\n' "$LC_ALL" "$LANGUAGE""#;
+        let git = RealGit::new();
+
+        let pinned = git
+            .run_classified(Invocation::new().args(["-c", ALIAS, "groveenv"]))
+            .unwrap();
+
+        assert!(pinned.ok(), "stderr: {}", pinned.stdout_trimmed());
+        assert_eq!(pinned.stdout, b"C|\n");
+
+        let inherited = git
+            .run(Invocation::new().args(["-c", ALIAS, "groveenv"]))
+            .unwrap();
+
+        assert!(inherited.ok());
+        assert_eq!(
+            inherited.stdout,
+            format!(
+                "{}|{}\n",
+                std::env::var("LC_ALL").unwrap_or_default(),
+                std::env::var("LANGUAGE").unwrap_or_default()
+            )
+            .into_bytes(),
+            "run must not pin the locale"
+        );
+    }
+
+    #[test]
+    fn run_classified_yields_the_c_locale_diagnostic_text() {
+        let git = RealGit::new();
+
+        let out = git
+            .run_classified(Invocation::new().args([
+                "ls-remote",
+                "--",
+                "/nonexistent/git-grove-probe.git",
+            ]))
+            .unwrap();
+
+        assert!(!out.ok());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("does not appear to be a git repository"),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[cfg(unix)]
