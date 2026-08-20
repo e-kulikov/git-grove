@@ -7,6 +7,7 @@ use crate::grove::discover::Grove;
 use crate::grove::state::{Snapshot, WorktreeState};
 use crate::output::Row;
 use bstr::ByteSlice;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -91,17 +92,27 @@ pub fn update_one(
         .admin_dir
         .as_ref()
         .expect("a clean BEHIND snapshot always has a validated admin directory");
+    // Target the merge at the exact OID just re-inspected, never the
+    // symbolic `@{upstream}` revision: Git resolves that symbol at merge
+    // time from the branch's live upstream configuration, not from the
+    // OID `eligible` already validated, which reopens the very
+    // target-indirection TOCTOU this revalidation exists to close.
+    let fresh_tracking = fresh
+        .tracking
+        .as_ref()
+        .expect("an eligible clean BEHIND snapshot always has tracking data");
+    let upstream_oid = OsStr::from_bytes(fresh_tracking.upstream_oid.as_ref());
     let output = runner.run(
         Invocation::new()
             .git_dir(admin_dir)
             .work_tree(&fresh.record.path)
             .args([
-                "merge",
-                "--ff-only",
-                "--no-edit",
-                "--no-autostash",
-                "--no-overwrite-ignore",
-                "@{upstream}",
+                OsStr::new("merge"),
+                OsStr::new("--ff-only"),
+                OsStr::new("--no-edit"),
+                OsStr::new("--no-autostash"),
+                OsStr::new("--no-overwrite-ignore"),
+                upstream_oid,
             ]),
     )?;
     let reinspected = reinspect_path(runner, grove, &planned.record.path)?;
@@ -598,6 +609,59 @@ mod tests {
     }
 
     #[test]
+    fn merge_targets_the_freshly_inspected_upstream_oid_not_the_symbolic_revision() {
+        // Regression for the reviewed TOCTOU: `@{upstream}` is resolved by
+        // Git at merge time from live branch configuration, not from the
+        // OID `eligible` just validated. A distinctive OID value here (not
+        // shared with any other fixture default) makes it unambiguous that
+        // the merge argv carries the re-inspected value through, not a
+        // hardcoded literal.
+        let fixture = fixture();
+        let planned = planned_snapshot(&fixture);
+
+        let fake = RecordingFake::new();
+        enqueue_reinspection(
+            &fake,
+            &fixture,
+            "main",
+            "abc",
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            3,
+        );
+        fake.push_response(output(0, b"", b""));
+        enqueue_reinspection(
+            &fake,
+            &fixture,
+            "main",
+            "def",
+            "refs/remotes/origin/main",
+            "origin/main",
+            "origin",
+            "def",
+            0,
+            0,
+        );
+
+        update_one(&fake, &fixture.grove, &planned).unwrap();
+
+        let calls = fake.calls();
+        let merge_call = calls
+            .iter()
+            .find(|call| call.argv_for_test().contains(&"merge".to_string()))
+            .unwrap();
+        let argv = merge_call.argv_for_test();
+        assert_eq!(argv.last().unwrap(), "def");
+        assert!(
+            !argv.iter().any(|arg| arg == "@{upstream}"),
+            "merge must never target the symbolic @{{upstream}} revision: {argv:?}"
+        );
+    }
+
+    #[test]
     fn unchanged_candidate_merges_with_the_exact_pinned_arguments() {
         let fixture = fixture();
         let planned = planned_snapshot(&fixture);
@@ -647,7 +711,10 @@ mod tests {
                 "--no-edit",
                 "--no-autostash",
                 "--no-overwrite-ignore",
-                "@{upstream}",
+                // The planned/fresh upstream OID from this fixture's
+                // `enqueue_reinspection` calls, not the symbolic
+                // `@{upstream}` revision.
+                "def",
             ]
         );
     }

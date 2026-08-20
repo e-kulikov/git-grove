@@ -112,6 +112,10 @@ fn release_docs_describe_sync_and_its_safety_contract() {
                 "{relative} must not advertise unimplemented command {unimplemented}"
             );
         }
+        assert!(
+            !rendered_words.contains("--no-overwrite-ignore @{upstream}"),
+            "{relative} must not claim the merge targets the symbolic @{{upstream}} revision"
+        );
     }
 }
 

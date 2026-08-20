@@ -128,9 +128,12 @@ Sync is explicit and narrow, by design:
   path, so behavior does not depend on process scheduling.
 - The only update it ever runs is
   `git merge --ff-only --no-edit --no-autostash --no-overwrite-ignore
-  @{upstream}`. Sync never rebases, pushes, invokes git-town, or resolves a
-  conflict; a refused or blocked merge is reported and left for a human
-  decision, and later worktrees are still processed.
+  <upstream-oid>`, targeting the exact upstream commit re-inspected
+  immediately beforehand, not the symbolic `@{upstream}` revision (which
+  Git would resolve from live branch configuration at merge time, not from
+  the commit sync already validated). Sync never rebases, pushes, invokes
+  git-town, or resolves a conflict; a refused or blocked merge is reported
+  and left for a human decision, and later worktrees are still processed.
 - Any worktree that remains behind, blocked, or otherwise unresolved after
   a sync run causes exit status `2`.
 
