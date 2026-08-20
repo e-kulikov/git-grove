@@ -238,6 +238,44 @@ pub struct NamedBlobProof {
     pub blob: BlobProof,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectType {
+    RegularFile,
+    Directory,
+    Symlink,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "proof", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IdentityProof {
+    Known {
+        identity: FileIdentity,
+    },
+    Created {
+        object_type: ObjectType,
+        mode: u32,
+        mount_id: u64,
+        sha256: Option<[u8; 32]>,
+        symlink_target: Option<RawBytes>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PathProof {
+    pub at: Location,
+    pub identity: IdentityProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentProof {
+    pub bytes: RawBytes,
+    pub sha256: [u8; 32],
+    pub mode: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManifestContent {
@@ -309,25 +347,32 @@ pub struct OriginalEvidence {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FinalEvidence {
-    pub worktree_list_porcelain_z: ByteSnapshot,
+    pub worktrees: Vec<WorktreeProof>,
     pub payload_status_porcelain_v2_z: ByteSnapshot,
     pub payload_ls_files_stage_z: ByteSnapshot,
     pub payload_ls_files_verbose_z: ByteSnapshot,
     pub config_values: Vec<ConfigValueProof>,
-    pub refs: Vec<NamedBlobProof>,
-    pub pointer_files: Vec<NamedBlobProof>,
+    pub refs: Vec<PathProof>,
+    pub pointer_files: Vec<PathProof>,
     pub metadata: Vec<ConfigValueProof>,
-    pub guide: BlobProof,
+    pub guide: ContentProof,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeneratedEvidence {
-    pub transformed_config: BlobProof,
-    pub transformed_config_worktree: Option<BlobProof>,
-    pub payload_pointer: BlobProof,
-    pub default_pointer: Option<BlobProof>,
-    pub guide: BlobProof,
+    pub payload_pointer: PathProof,
+    pub default_pointer: Option<PathProof>,
+    pub guide: ContentProof,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorktreeProof {
+    pub path: RawBytes,
+    pub head: HeadProof,
+    pub locked_reason: Option<RawBytes>,
+    pub bare: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -355,12 +400,12 @@ pub enum Presence {
 pub enum GitPostcondition {
     Path {
         at: Location,
-        identity: FileIdentity,
+        identity: IdentityProof,
     },
     Config {
         proof: ConfigValueProof,
     },
-    Bytes {
+    AuthoredBytes {
         at: Location,
         bytes: RawBytes,
         sha256: [u8; 32],
@@ -379,8 +424,8 @@ pub enum Primitive {
     Rename {
         from: Location,
         to: Location,
-        before: FileIdentity,
-        after: FileIdentity,
+        before: IdentityProof,
+        after: IdentityProof,
     },
     Write {
         at: Location,
@@ -391,7 +436,18 @@ pub enum Primitive {
     },
     Remove {
         at: Location,
-        expected: FileIdentity,
+        expected: IdentityProof,
+    },
+    CreateDirectory {
+        at: Location,
+        mode: u32,
+        mount_id: u64,
+    },
+    Symlink {
+        at: Location,
+        target: RawBytes,
+        sha256: [u8; 32],
+        mount_id: u64,
     },
     Git {
         invocation: JournalInvocation,
@@ -588,7 +644,21 @@ fn validate_primitive(primitive: &Primitive) -> Result<()> {
             }
             validate_postcondition(postcondition)?;
         }
-        Primitive::Rename { .. } | Primitive::Remove { .. } => {}
+        Primitive::Rename { before, after, .. } => {
+            validate_identity_proof(before)?;
+            validate_identity_proof(after)?;
+        }
+        Primitive::Remove { expected, .. } => validate_identity_proof(expected)?,
+        Primitive::CreateDirectory { mode, .. } => validate_mode(*mode)?,
+        Primitive::Symlink {
+            target,
+            sha256: expected,
+            ..
+        } => {
+            if sha256(&target.decode()) != *expected {
+                return Err(invalid("journal symlink target hash does not match"));
+            }
+        }
     }
     Ok(())
 }
@@ -599,7 +669,6 @@ fn validate_plan(plan: &ImmutablePlan) -> Result<()> {
         &plan.original.status_porcelain_v2_z,
         &plan.original.ls_files_stage_z,
         &plan.original.ls_files_verbose_z,
-        &plan.expected_final.worktree_list_porcelain_z,
         &plan.expected_final.payload_status_porcelain_v2_z,
         &plan.expected_final.payload_ls_files_stage_z,
         &plan.expected_final.payload_ls_files_verbose_z,
@@ -610,12 +679,6 @@ fn validate_plan(plan: &ImmutablePlan) -> Result<()> {
         Some(&plan.original.config),
         plan.original.config_worktree.as_ref(),
         Some(&plan.original.head),
-        Some(&plan.generated.transformed_config),
-        plan.generated.transformed_config_worktree.as_ref(),
-        Some(&plan.generated.payload_pointer),
-        plan.generated.default_pointer.as_ref(),
-        Some(&plan.generated.guide),
-        Some(&plan.expected_final.guide),
         plan.original.index.as_ref(),
     ]
     .into_iter()
@@ -629,11 +692,23 @@ fn validate_plan(plan: &ImmutablePlan) -> Result<()> {
         .iter()
         .chain(&plan.original.refs)
         .chain(&plan.original.private_state)
-        .chain(&plan.expected_final.refs)
-        .chain(&plan.expected_final.pointer_files)
     {
         validate_blob(&named.blob)?;
     }
+    validate_path_proof(&plan.generated.payload_pointer)?;
+    if let Some(pointer) = &plan.generated.default_pointer {
+        validate_path_proof(pointer)?;
+    }
+    for path in plan
+        .expected_final
+        .refs
+        .iter()
+        .chain(&plan.expected_final.pointer_files)
+    {
+        validate_path_proof(path)?;
+    }
+    validate_content(&plan.generated.guide)?;
+    validate_content(&plan.expected_final.guide)?;
     for entry in &plan.original.payload_manifest {
         match &entry.content {
             ManifestContent::None => {}
@@ -677,6 +752,51 @@ fn validate_blob(blob: &BlobProof) -> Result<()> {
     Ok(())
 }
 
+fn validate_content(content: &ContentProof) -> Result<()> {
+    if sha256(&content.bytes.decode()) != content.sha256 {
+        return Err(invalid("content proof hash does not match"));
+    }
+    validate_mode(content.mode)
+}
+
+fn validate_path_proof(path: &PathProof) -> Result<()> {
+    validate_identity_proof(&path.identity)
+}
+
+fn validate_identity_proof(proof: &IdentityProof) -> Result<()> {
+    let IdentityProof::Created {
+        object_type,
+        mode,
+        sha256: expected,
+        symlink_target,
+        ..
+    } = proof
+    else {
+        return Ok(());
+    };
+    validate_mode(*mode)?;
+    match (object_type, expected, symlink_target) {
+        (ObjectType::Directory, None, None) => Ok(()),
+        (ObjectType::RegularFile, _, None) => Ok(()),
+        (ObjectType::Symlink, Some(expected), Some(target))
+            if sha256(&target.decode()) == *expected =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid(
+            "created identity proof has inconsistent content evidence",
+        )),
+    }
+}
+
+fn validate_mode(mode: u32) -> Result<()> {
+    if mode & !0o7777 != 0 {
+        Err(invalid("journal mode contains non-permission bits"))
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_identity_bytes(identity: FileIdentity, bytes: &RawBytes) -> Result<()> {
     if let Some(expected) = identity.sha256 {
         if sha256(&bytes.decode()) != expected {
@@ -688,8 +808,9 @@ fn validate_identity_bytes(identity: FileIdentity, bytes: &RawBytes) -> Result<(
 
 fn validate_postcondition(postcondition: &GitPostcondition) -> Result<()> {
     match postcondition {
-        GitPostcondition::Path { .. } | GitPostcondition::Config { .. } => Ok(()),
-        GitPostcondition::Bytes {
+        GitPostcondition::Path { identity, .. } => validate_identity_proof(identity),
+        GitPostcondition::Config { .. } => Ok(()),
+        GitPostcondition::AuthoredBytes {
             bytes,
             sha256: hash,
             ..
@@ -804,6 +925,30 @@ mod tests {
         ByteSnapshot::new(invocation(), b"")
     }
 
+    fn known(seed: u64) -> IdentityProof {
+        IdentityProof::Known {
+            identity: identity(seed),
+        }
+    }
+
+    fn created_file() -> IdentityProof {
+        IdentityProof::Created {
+            object_type: ObjectType::RegularFile,
+            mode: 0o644,
+            mount_id: 7,
+            sha256: Some(sha256(b"")),
+            symlink_target: None,
+        }
+    }
+
+    fn content() -> ContentProof {
+        ContentProof {
+            bytes: RawBytes::from_bytes(b""),
+            sha256: sha256(b""),
+            mode: 0o644,
+        }
+    }
+
     fn journal() -> Journal {
         let path = || ValidatedBytePath::component(b"file").unwrap();
         let original = OriginalEvidence {
@@ -821,7 +966,7 @@ mod tests {
             private_state: Vec::new(),
         };
         let final_evidence = FinalEvidence {
-            worktree_list_porcelain_z: snapshot(),
+            worktrees: Vec::new(),
             payload_status_porcelain_v2_z: snapshot(),
             payload_ls_files_stage_z: snapshot(),
             payload_ls_files_verbose_z: snapshot(),
@@ -829,7 +974,7 @@ mod tests {
             refs: Vec::new(),
             pointer_files: Vec::new(),
             metadata: Vec::new(),
-            guide: blob(12),
+            guide: content(),
         };
         Journal {
             schema: JOURNAL_SCHEMA,
@@ -856,11 +1001,12 @@ mod tests {
                 },
                 original,
                 generated: GeneratedEvidence {
-                    transformed_config: blob(13),
-                    transformed_config_worktree: None,
-                    payload_pointer: blob(14),
+                    payload_pointer: PathProof {
+                        at: Location::Root { path: path() },
+                        identity: created_file(),
+                    },
                     default_pointer: None,
-                    guide: blob(15),
+                    guide: content(),
                 },
                 expected_final: final_evidence,
             },
@@ -870,8 +1016,8 @@ mod tests {
                 primitive: Primitive::Rename {
                     from: Location::Root { path: path() },
                     to: Location::Transaction { path: path() },
-                    before: identity(2),
-                    after: identity(2),
+                    before: known(2),
+                    after: known(2),
                 },
             }],
             progress: Progress::Forward,

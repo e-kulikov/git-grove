@@ -214,6 +214,35 @@ mod tests {
         ByteSnapshot::new(invocation(), b"")
     }
 
+    fn known() -> IdentityProof {
+        IdentityProof::Known {
+            identity: identity(),
+        }
+    }
+
+    fn generated_file() -> PathProof {
+        PathProof {
+            at: Location::Root {
+                path: ValidatedBytePath::component(b"generated").unwrap(),
+            },
+            identity: IdentityProof::Created {
+                object_type: ObjectType::RegularFile,
+                mode: 0o644,
+                mount_id: 1,
+                sha256: Some(sha256(b"")),
+                symlink_target: None,
+            },
+        }
+    }
+
+    fn content() -> ContentProof {
+        ContentProof {
+            bytes: RawBytes::from_bytes(b""),
+            sha256: sha256(b""),
+            mode: 0o644,
+        }
+    }
+
     fn journal() -> Journal {
         let blob = placeholder_blob();
         Journal {
@@ -254,14 +283,12 @@ mod tests {
                     private_state: vec![],
                 },
                 generated: GeneratedEvidence {
-                    transformed_config: blob.clone(),
-                    transformed_config_worktree: None,
-                    payload_pointer: blob.clone(),
+                    payload_pointer: generated_file(),
                     default_pointer: None,
-                    guide: blob.clone(),
+                    guide: content(),
                 },
                 expected_final: FinalEvidence {
-                    worktree_list_porcelain_z: snapshot(),
+                    worktrees: vec![],
                     payload_status_porcelain_v2_z: snapshot(),
                     payload_ls_files_stage_z: snapshot(),
                     payload_ls_files_verbose_z: snapshot(),
@@ -269,7 +296,7 @@ mod tests {
                     refs: vec![],
                     pointer_files: vec![],
                     metadata: vec![],
-                    guide: blob,
+                    guide: content(),
                 },
             },
             operations: vec![OperationRecord {
@@ -279,7 +306,7 @@ mod tests {
                     at: Location::Root {
                         path: ValidatedBytePath::component(b"generated").unwrap(),
                     },
-                    expected: identity(),
+                    expected: known(),
                 },
             }],
             progress: Progress::Forward,

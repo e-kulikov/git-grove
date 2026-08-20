@@ -10,6 +10,8 @@ pub const KNOWN: &[&str] = &[
     "plant",
     "init",
     "seed",
+    "adopt",
+    "transplant",
     "add",
     "sprout",
     "list",
@@ -75,6 +77,24 @@ pub enum Command {
         dir: Option<PathBuf>,
         #[arg(short = 'b', long = "branch")]
         branch: Option<OsString>,
+    },
+    /// Convert an ordinary repository into a grove
+    #[command(alias = "transplant")]
+    Adopt {
+        /// Repository path (defaults to the current repository)
+        path: Option<PathBuf>,
+        /// Remote recorded as the grove's default remote
+        #[arg(long)]
+        remote: Option<OsString>,
+        /// Branch used as the grove's default worktree
+        #[arg(long = "default-branch")]
+        default_branch: Option<OsString>,
+        /// Resume an interrupted adoption
+        #[arg(long = "continue", conflicts_with_all = ["abort", "remote", "default_branch"])]
+        continue_adoption: bool,
+        /// Reverse an interrupted adoption
+        #[arg(long, conflicts_with_all = ["continue_adoption", "remote", "default_branch"])]
+        abort: bool,
     },
     /// Add a worktree for a branch
     #[command(

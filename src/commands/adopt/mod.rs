@@ -1,3 +1,4 @@
+mod forward;
 pub mod inventory;
 pub mod preflight;
 
@@ -5,6 +6,23 @@ use crate::error::{GroveError, Result};
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
+
+pub fn run(
+    runner: &dyn crate::git::runner::GitRunner,
+    args: &AdoptArgs,
+    cwd: &std::path::Path,
+) -> Result<()> {
+    args.validate()?;
+    match args.action {
+        AdoptAction::Fresh => forward::run(runner, args, cwd),
+        AdoptAction::Continue => Err(GroveError::needs_decision(
+            "adoption recovery is not implemented yet; preserve the transaction and retry with this release's recovery command",
+        )),
+        AdoptAction::Abort => Err(GroveError::needs_decision(
+            "adoption rollback is not implemented yet; preserve the transaction for recovery",
+        )),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdoptAction {

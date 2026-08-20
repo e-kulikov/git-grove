@@ -81,8 +81,8 @@ pub fn plan(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<Adop
         &["worktree", "list", "--porcelain", "-z"],
     )?;
     validate_single_worktree(&worktrees.bytes.decode(), &root_path)?;
-    let inventory = inventory::collect(&root, git)?;
-    refuse_active_state(&inventory)?;
+    let initial_inventory = inventory::collect(&root, git)?;
+    refuse_active_state(&initial_inventory)?;
     refuse_sparse_submodule_and_conflicts(runner, &root_path, git)?;
 
     let status = snapshot(
@@ -150,16 +150,48 @@ pub fn plan(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<Adop
         _ => Some(RawBytes::from_bytes(default_branch.as_bytes())),
     };
 
-    let private = private_state(runner, &root_path, git, &inventory)?;
-    let refs = shared_ref_files(git, &inventory)?;
-    let shared_indexes = shared_indexes(runner, &root_path, git)?;
-    let (private_state, retained_shared_fallthrough) = private;
+    let (classified_private, retained_shared_fallthrough) =
+        private_state(runner, &root_path, git, &initial_inventory)?;
+    let classified_refs = shared_ref_files(git, &initial_inventory)?;
+    let classified_shared_indexes = shared_indexes(runner, &root_path, git)?;
+    let inventory = inventory::collect(&root, git)?;
+    validate_query_side_effects(&initial_inventory, &inventory)?;
+    let private_state = classified_private
+        .iter()
+        .map(|named| inventory::named_blob(git, &named.path.to_path_buf()))
+        .collect::<Result<Vec<_>>>()?;
+    let refs = classified_refs
+        .iter()
+        .map(|named| inventory::named_blob(git, &named.path.to_path_buf()))
+        .collect::<Result<Vec<_>>>()?;
+    let shared_indexes = classified_shared_indexes
+        .iter()
+        .map(|named| inventory::named_blob(git, &named.path.to_path_buf()))
+        .collect::<Result<Vec<_>>>()?;
     let revalidated = inventory::collect(&root, git)?;
     if revalidated.payload != inventory.payload || revalidated.git_entries != inventory.git_entries
     {
+        let detail = inventory
+            .git_entries
+            .iter()
+            .zip(&revalidated.git_entries)
+            .find(|(before, after)| before != after)
+            .map(|(before, after)| format!("Git entry changed: {before:?} -> {after:?}"))
+            .or_else(|| {
+                inventory
+                    .payload
+                    .iter()
+                    .zip(&revalidated.payload)
+                    .find(|(before, after)| before != after)
+                    .map(|(before, after)| {
+                        format!("payload entry changed: {before:?} -> {after:?}")
+                    })
+            })
+            .unwrap_or_else(|| "an entry was added or removed".to_string());
         return Err(GroveError::needs_decision(
             "repository contents changed during adopt preflight",
-        ));
+        )
+        .with_detail(detail));
     }
     let original = OriginalEvidence {
         worktree_list_porcelain_z: worktrees,
@@ -214,6 +246,40 @@ pub fn plan(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<Adop
         original,
         retained_shared_fallthrough,
     })
+}
+
+fn validate_query_side_effects(before: &Inventory, after: &Inventory) -> Result<()> {
+    if before.payload != after.payload
+        || before.git_entries.len() != after.git_entries.len()
+        || before.git_entries.iter().zip(&after.git_entries).any(
+            |((before_path, before), (after_path, after))| {
+                before_path != after_path
+                    || (before != after
+                        && !(before_path
+                            .file_name()
+                            .is_some_and(|name| name.as_bytes().starts_with(b"sharedindex."))
+                            && same_stable_file(before, after)))
+            },
+        )
+    {
+        return Err(GroveError::needs_decision(
+            "repository contents changed during adopt preflight",
+        ));
+    }
+    Ok(())
+}
+
+fn same_stable_file(
+    left: &crate::fsx::held::FileIdentity,
+    right: &crate::fsx::held::FileIdentity,
+) -> bool {
+    left.dev == right.dev
+        && left.ino == right.ino
+        && left.mode == right.mode
+        && left.nlink == right.nlink
+        && left.size == right.size
+        && left.mount_id == right.mount_id
+        && left.sha256 == right.sha256
 }
 
 fn resolve_root(runner: &dyn GitRunner, requested: Option<&Path>, cwd: &Path) -> Result<PathBuf> {

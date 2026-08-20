@@ -167,3 +167,279 @@ fn preflight_selects_the_only_remote_and_refuses_ambiguous_metadata() {
     assert_eq!(error.class, ExitClass::NeedsDecision);
     assert!(error.to_string().contains("multiple remotes"));
 }
+
+#[test]
+fn fresh_adopt_preserves_the_payload_and_builds_a_grove() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "fresh");
+    std::fs::write(root.join("delete-me"), b"delete\n").unwrap();
+    std::fs::write(root.join("rename-me"), b"rename\n").unwrap();
+    std::fs::write(root.join("executable"), b"#!/bin/sh\n").unwrap();
+    std::fs::write(root.join(".gitignore"), b"ignored\n").unwrap();
+    std::os::unix::fs::symlink("tracked", root.join("tracked-link")).unwrap();
+    sandbox.git(
+        &root,
+        &[
+            "add",
+            "delete-me",
+            "rename-me",
+            "executable",
+            ".gitignore",
+            "tracked-link",
+        ],
+    );
+    sandbox.git(&root, &["commit", "--quiet", "-m", "fixture"]);
+    std::fs::write(root.join("tracked"), b"modified\n").unwrap();
+    std::fs::write(root.join("untracked"), b"untracked\n").unwrap();
+    std::fs::write(root.join("ignored"), b"ignored\n").unwrap();
+    std::fs::write(root.join("staged"), b"staged\n").unwrap();
+    sandbox.git(&root, &["add", "staged"]);
+    sandbox.git(&root, &["rm", "--quiet", "delete-me"]);
+    sandbox.git(&root, &["mv", "rename-me", "renamed"]);
+    let mut permissions = std::fs::metadata(root.join("executable"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(root.join("executable"), permissions).unwrap();
+    sandbox.git(&root, &["update-index", "--split-index"]);
+    let head = sandbox.git(&root, &["rev-parse", "HEAD"]).stdout;
+    for name in ["ORIG_HEAD", "AUTO_MERGE"] {
+        std::fs::write(root.join(".git").join(name), &head).unwrap();
+    }
+    std::fs::write(root.join(".git/COMMIT_EDITMSG"), b"message\n").unwrap();
+    std::fs::write(root.join(".git/FETCH_HEAD"), b"").unwrap();
+    let before_status = sandbox
+        .git(
+            &root,
+            &[
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--branch",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+        )
+        .stdout;
+    let before_stage = sandbox.git(&root, &["ls-files", "--stage", "-z"]).stdout;
+    let before_verbose = sandbox.git(&root, &["ls-files", "-v", "-z"]).stdout;
+
+    sandbox.grove_in(&root, &["adopt"]).assert().success();
+
+    assert_eq!(
+        std::fs::read(root.join(".git")).unwrap(),
+        b"gitdir: ./.bare\n"
+    );
+    assert!(root.join(".bare").is_dir());
+    assert_eq!(
+        std::fs::read(root.join("main/tracked")).unwrap(),
+        b"modified\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join("main/untracked")).unwrap(),
+        b"untracked\n"
+    );
+    assert_eq!(
+        sandbox
+            .git(
+                &root.join("main"),
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--branch",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ]
+            )
+            .stdout,
+        before_status
+    );
+    assert_eq!(
+        sandbox
+            .git(&root.join("main"), &["ls-files", "--stage", "-z"])
+            .stdout,
+        before_stage
+    );
+    assert_eq!(
+        sandbox
+            .git(&root.join("main"), &["ls-files", "-v", "-z"])
+            .stdout,
+        before_verbose
+    );
+    for name in ["ORIG_HEAD", "AUTO_MERGE", "COMMIT_EDITMSG", "FETCH_HEAD"] {
+        let path = String::from_utf8(
+            sandbox
+                .git(
+                    &root.join("main"),
+                    &["rev-parse", "--path-format=absolute", "--git-path", name],
+                )
+                .stdout,
+        )
+        .unwrap();
+        assert!(Path::new(path.trim()).starts_with(root.join(".bare/worktrees")));
+        assert!(!root.join(".bare").join(name).exists());
+    }
+    assert_eq!(
+        sandbox.repo_config(&root, "grove.defaultBranch").as_deref(),
+        Some("main")
+    );
+    assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".grove-adopt-")));
+}
+
+#[test]
+fn branch_matrix_keeps_a_non_default_payload_and_creates_the_default_checkout() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "matrix");
+    sandbox.git(&root, &["branch", "topic"]);
+    sandbox.git(&root, &["switch", "--quiet", "topic"]);
+
+    sandbox
+        .grove_in(
+            sandbox.root(),
+            &["adopt", "--default-branch", "main", root.to_str().unwrap()],
+        )
+        .assert()
+        .success();
+
+    assert_eq!(
+        String::from_utf8(
+            sandbox
+                .git(&root.join("topic"), &["branch", "--show-current"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        "topic"
+    );
+    assert_eq!(
+        String::from_utf8(
+            sandbox
+                .git(&root.join("main"), &["branch", "--show-current"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        "main"
+    );
+}
+
+#[test]
+fn branch_matrix_preserves_a_detached_payload_and_materializes_the_default() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "detached");
+    let oid = String::from_utf8(sandbox.git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    sandbox.git(&root, &["switch", "--quiet", "--detach"]);
+
+    sandbox
+        .grove_in(
+            sandbox.root(),
+            &["adopt", "--default-branch", "main", root.to_str().unwrap()],
+        )
+        .assert()
+        .success();
+
+    let payload = root.join(format!("detached-{}", &oid[..12]));
+    assert_eq!(
+        String::from_utf8(sandbox.git(&payload, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim(),
+        oid
+    );
+    assert_eq!(
+        String::from_utf8(
+            sandbox
+                .git(&payload, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        "HEAD"
+    );
+    assert_eq!(
+        String::from_utf8(
+            sandbox
+                .git(&root.join("main"), &["branch", "--show-current"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        "main"
+    );
+}
+
+#[test]
+fn branch_matrix_tracks_a_remote_only_default_without_fetching() {
+    let sandbox = Sandbox::new();
+    let origin = sandbox.bare_origin("adopt-origin");
+    let root = sandbox.root().join("remote-only");
+    sandbox.git(
+        sandbox.root(),
+        &[
+            "clone",
+            "--quiet",
+            origin.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ],
+    );
+    sandbox.git(&root, &["switch", "--quiet", "-c", "topic"]);
+    sandbox.git(&root, &["branch", "-D", "main"]);
+
+    sandbox
+        .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert_eq!(
+        String::from_utf8(
+            sandbox
+                .git(&root.join("main"), &["branch", "--show-current"])
+                .stdout
+        )
+        .unwrap()
+        .trim(),
+        "main"
+    );
+    assert_eq!(
+        sandbox
+            .repo_config(&root.join("main"), "branch.main.remote")
+            .as_deref(),
+        Some("origin")
+    );
+    assert_eq!(
+        sandbox.repo_config(&root, "grove.remote").as_deref(),
+        Some("origin")
+    );
+}
+
+#[test]
+fn branch_matrix_keeps_worktree_config_private_and_bare_layout_separate() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "worktree-config");
+    sandbox.git(&root, &["config", "extensions.worktreeConfig", "true"]);
+    sandbox.git(&root, &["config", "--worktree", "custom.payload", "kept"]);
+
+    sandbox
+        .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+        .assert()
+        .success();
+
+    assert_eq!(
+        sandbox
+            .repo_config(&root.join("main"), "custom.payload")
+            .as_deref(),
+        Some("kept")
+    );
+    assert_eq!(
+        sandbox.repo_config(&root, "core.bare").as_deref(),
+        Some("true")
+    );
+    assert!(!root.join("main/.git").is_dir());
+}

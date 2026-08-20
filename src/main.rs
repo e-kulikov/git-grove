@@ -63,6 +63,38 @@ fn run(cli: cli::Cli) -> Result<()> {
             })?;
             commands::init::run(&runner, dir, branch, &cwd).map(|_| ())
         }
+        cli::Command::Adopt {
+            path,
+            remote,
+            default_branch,
+            continue_adoption,
+            abort,
+        } => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let action = if continue_adoption {
+                commands::adopt::AdoptAction::Continue
+            } else if abort {
+                commands::adopt::AdoptAction::Abort
+            } else {
+                commands::adopt::AdoptAction::Fresh
+            };
+            commands::adopt::run(
+                &runner,
+                &commands::adopt::AdoptArgs {
+                    path,
+                    remote,
+                    default_branch,
+                    action,
+                },
+                &cwd,
+            )
+        }
         cli::Command::Add(args) => {
             let mode = args.resolve()?;
             let runner = git::runner::RealGit::new();

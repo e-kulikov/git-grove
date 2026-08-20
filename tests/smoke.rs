@@ -49,7 +49,7 @@ fn lists_only_the_supported_lifecycle_aliases_in_help() {
         .stdout(predicates::str::contains("tend=sync"))
         .stdout(predicates::str::contains("propagate=publish"))
         .stdout(predicates::str::contains("transplant").not())
-        .stdout(predicates::str::contains("adopt").not());
+        .stdout(predicates::str::contains("adopt"));
 }
 
 #[test]
