@@ -1,7 +1,7 @@
 use super::preflight::{self, AdoptPlan};
 use super::AdoptArgs;
 use crate::error::{GroveError, Result};
-use crate::fsx::held::HeldDirectory;
+use crate::fsx::held::{FileSystem, HeldDirectory, RealFileSystem, ValidatedRelativePath};
 use crate::git::runner::{GitOutput, GitRunner, Invocation};
 use crate::grove::agents_md::{self, Facts};
 use crate::grove::discover::Grove;
@@ -272,8 +272,70 @@ fn normalize_pending_phase(
     };
     if phase_is_after(&journal.plan, index, root.path(), transaction.path())? {
         finish_phase(journal, index, transaction, checkpoints)?;
+    } else if !phase_is_before(&journal.plan, index, root.path(), transaction.path())? {
+        return Err(GroveError::needs_decision(format!(
+            "adoption phase {} is at neither its exact before nor after state",
+            index + 1
+        )));
     }
     Ok(())
+}
+
+fn phase_is_before(
+    plan: &ImmutablePlan,
+    index: usize,
+    root: &Path,
+    transaction: &Path,
+) -> Result<bool> {
+    let payload_relative = raw_path(&plan.decisions.payload_path)?;
+    let payload = root.join(&payload_relative);
+    let staging = transaction.join("payload");
+    let pointer = payload_pointer(root, &payload_relative)?;
+    let admin = pointer_admin(&pointer)?;
+    match index {
+        0 => Ok(!path_exists(&staging)?),
+        1 => Ok(real_directory(&root.join(".git"))? && !path_exists(&root.join(".bare"))?),
+        2 => Ok(payload_top_level(plan)?
+            .iter()
+            .all(|name| root.join(name).exists())),
+        3 => Ok(!path_exists(&payload)? && !path_exists(&admin)?),
+        4 => Ok(path_exists(&staging)?
+            && std::fs::read(payload.join(".git")).ok().as_deref() == Some(pointer.as_slice())),
+        5 => {
+            for named in &plan.original.private_state {
+                if !blob_matches(
+                    &root.join(".bare").join(named.path.to_path_buf()),
+                    &named.blob,
+                )? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        6 => match &plan.decisions.default_path {
+            Some(path) => Ok(!path_exists(&root.join(raw_path(path)?))?),
+            None => Ok(true),
+        },
+        7 => Ok(!path_exists(&root.join("AGENTS.md"))? && !path_exists(&root.join("CLAUDE.md"))?),
+        8 => {
+            if !path_exists(&admin.join("locked"))? {
+                return Ok(false);
+            }
+            if let Some(default) = &plan.decisions.default_path {
+                let default_pointer = std::fs::read(root.join(raw_path(default)?).join(".git"))
+                    .map_err(|error| {
+                        GroveError::needs_decision(format!(
+                            "cannot inspect default worktree lock: {error}"
+                        ))
+                    })?;
+                if !path_exists(&pointer_admin(&default_pointer)?.join("locked"))? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Err(GroveError::failure("unknown adoption phase")),
+    }
 }
 
 fn phase_is_after(
@@ -512,6 +574,13 @@ fn stage_installed_payload(
     staging: &Path,
 ) -> Result<()> {
     verify_manifest_roots(plan, payload)?;
+    let payload_relative = raw_path(&plan.decisions.payload_path)?;
+    let expected_pointer = payload_pointer(root, &payload_relative)?;
+    if std::fs::read(payload.join(".git")).ok().as_deref() != Some(expected_pointer.as_slice()) {
+        return Err(GroveError::needs_decision(
+            "generated payload pointer was modified; refusing rollback",
+        ));
+    }
     let aside = transaction.join("payload.git");
     std::fs::rename(payload.join(".git"), &aside)
         .map_err(|error| GroveError::failure(format!("cannot stage payload pointer: {error}")))?;
@@ -575,11 +644,87 @@ fn restore_git_directory(plan: &ImmutablePlan, root: &Path, bare: &Path) -> Resu
 }
 
 fn verify_manifest_roots(plan: &ImmutablePlan, payload: &Path) -> Result<()> {
-    for name in payload_top_level(plan)? {
-        if !path_exists(&payload.join(name))? {
-            return Err(GroveError::needs_decision(
-                "payload contents changed; refusing rollback",
-            ));
+    verify_manifest(plan, payload, false)
+}
+
+fn verify_manifest(plan: &ImmutablePlan, base: &Path, exact_times: bool) -> Result<()> {
+    let held = HeldDirectory::open(base)?;
+    let actual_count = held
+        .inventory()?
+        .into_iter()
+        .filter(|entry| entry.path.as_path() != Path::new(".git"))
+        .count();
+    if actual_count != plan.original.payload_manifest.len() {
+        return Err(GroveError::needs_decision(
+            "payload entry set changed during adoption",
+        ));
+    }
+    for entry in &plan.original.payload_manifest {
+        verify_manifest_entry(&held, entry, exact_times)?;
+    }
+    Ok(())
+}
+
+fn verify_manifest_component(
+    plan: &ImmutablePlan,
+    base: &Path,
+    component: &OsStr,
+    exact_times: bool,
+) -> Result<()> {
+    let held = HeldDirectory::open(base)?;
+    for entry in &plan.original.payload_manifest {
+        if entry
+            .path
+            .to_path_buf()
+            .components()
+            .next()
+            .is_some_and(|first| first.as_os_str() == component)
+        {
+            verify_manifest_entry(&held, entry, exact_times)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_manifest_entry(
+    base: &HeldDirectory,
+    entry: &ManifestEntry,
+    exact_times: bool,
+) -> Result<()> {
+    let path = entry.path.to_path_buf();
+    let relative = ValidatedRelativePath::new(&path)?;
+    let actual = RealFileSystem.identity_at(base, &relative)?;
+    let expected = entry.identity;
+    let stable = actual.dev == expected.dev
+        && actual.ino == expected.ino
+        && actual.mode == expected.mode
+        && actual.nlink == expected.nlink
+        && actual.size == expected.size
+        && actual.mtime == expected.mtime
+        && actual.mount_id == expected.mount_id
+        && actual.sha256 == expected.sha256
+        && (!exact_times || actual.ctime == expected.ctime);
+    if !stable {
+        return Err(GroveError::needs_decision(format!(
+            "payload entry {} changed during adoption",
+            path.as_os_str().as_bytes().escape_bytes()
+        )));
+    }
+    if let ManifestContent::Symlink {
+        target,
+        sha256: expected_hash,
+    } = &entry.content
+    {
+        let actual_target =
+            std::fs::read_link(base.anchored_path.join(&path)).map_err(|error| {
+                GroveError::needs_decision(format!("cannot verify payload symlink: {error}"))
+            })?;
+        let bytes = actual_target.as_os_str().as_bytes();
+        if sha256(bytes) != *expected_hash || bytes != target.decode() {
+            return Err(GroveError::needs_decision(format!(
+                "payload symlink {} changed during adoption",
+                path.as_os_str().as_bytes().escape_bytes()
+            )));
         }
     }
     Ok(())
@@ -929,6 +1074,7 @@ fn stage_payload(plan: &ImmutablePlan, root: &Path, staging: &Path) -> Result<()
         let destination = staging.join(&name);
         match (path_exists(&source)?, path_exists(&destination)?) {
             (true, false) => {
+                verify_manifest_component(plan, root, &name, true)?;
                 std::fs::rename(&source, &destination).map_err(|error| {
                     GroveError::failure(format!(
                         "cannot stage payload entry {}: {error}",
@@ -938,7 +1084,7 @@ fn stage_payload(plan: &ImmutablePlan, root: &Path, staging: &Path) -> Result<()
                 sync_dir(root)?;
                 sync_dir(staging)?;
             }
-            (false, true) => {}
+            (false, true) => verify_manifest_component(plan, staging, &name, false)?,
             _ => {
                 return Err(GroveError::needs_decision(format!(
                     "payload entry {} is at neither its exact before nor after location",
@@ -1068,6 +1214,7 @@ fn install_private_state(
         )?;
     }
     write_bare_head(bare, &plan.decisions.default_branch)?;
+    verify_manifest(plan, payload, false)?;
     verify_payload_snapshots(runner, plan, payload)
 }
 

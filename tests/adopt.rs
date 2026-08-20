@@ -4,8 +4,15 @@ use git_grove::commands::adopt::preflight;
 use git_grove::commands::adopt::AdoptArgs;
 use git_grove::error::ExitClass;
 use git_grove::git::runner::RealGit;
+#[cfg(unix)]
+use harness::tree_snapshot;
 use harness::Sandbox;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::{
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt, OsStringExt},
+};
 
 fn flat_repository(sandbox: &Sandbox, name: &str) -> PathBuf {
     let root = sandbox.root().join(name);
@@ -15,6 +22,41 @@ fn flat_repository(sandbox: &Sandbox, name: &str) -> PathBuf {
     sandbox.git(&root, &["add", "tracked"]);
     sandbox.git(&root, &["commit", "--quiet", "-m", "initial"]);
     root
+}
+
+#[cfg(unix)]
+fn assert_refuses_without_mutation(sandbox: &Sandbox, root: &Path, options: &[&str], code: i32) {
+    let before_status = sandbox
+        .git(root, &["status", "--porcelain=v2", "-z", "--branch"])
+        .stdout;
+    let before_refs = sandbox
+        .git(root, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        .stdout;
+    let before_tree = tree_snapshot(root);
+    let mut args = vec!["adopt"];
+    args.extend_from_slice(options);
+    args.push(root.to_str().unwrap());
+    sandbox.grove_in(sandbox.root(), &args).assert().code(code);
+    assert_eq!(tree_snapshot(root), before_tree, "repository tree changed");
+    assert_eq!(
+        sandbox
+            .git(root, &["status", "--porcelain=v2", "-z", "--branch"])
+            .stdout,
+        before_status,
+        "status changed"
+    );
+    assert_eq!(
+        sandbox
+            .git(root, &["for-each-ref", "--format=%(refname) %(objectname)"])
+            .stdout,
+        before_refs,
+        "refs changed"
+    );
+    assert!(!std::fs::read_dir(root).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .as_bytes()
+        .starts_with(b".grove-adopt-")));
 }
 
 #[test]
@@ -79,6 +121,92 @@ fn preflight_refuses_git_locks_and_hardlinks_without_mutation() {
                 .starts_with(".grove-adopt-")
         }));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn preflight_refusal_table_is_byte_for_byte_non_mutating() {
+    let sandbox = Sandbox::new();
+
+    for kind in ["file", "symlink"] {
+        let root = flat_repository(&sandbox, &format!("dot-git-{kind}"));
+        std::fs::rename(root.join(".git"), root.join("actual-git")).unwrap();
+        if kind == "file" {
+            std::fs::write(root.join(".git"), b"gitdir: ./actual-git\n").unwrap();
+        } else {
+            std::os::unix::fs::symlink("actual-git", root.join(".git")).unwrap();
+        }
+        assert_refuses_without_mutation(&sandbox, &root, &[], 2);
+    }
+
+    let bare = flat_repository(&sandbox, "reserved-bare");
+    std::fs::create_dir(bare.join(".bare")).unwrap();
+    assert_refuses_without_mutation(&sandbox, &bare, &[], 2);
+
+    let extra = flat_repository(&sandbox, "extra-worktree");
+    let linked = sandbox.root().join("extra-linked");
+    sandbox.git(
+        &extra,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert_refuses_without_mutation(&sandbox, &extra, &[], 2);
+
+    for marker in [
+        "MERGE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "sequencer",
+        "BISECT_LOG",
+        "BISECT_START",
+        "MERGE_AUTOSTASH",
+    ] {
+        let root = flat_repository(&sandbox, &format!("marker-{}", marker.to_lowercase()));
+        let path = root.join(".git").join(marker);
+        if matches!(marker, "rebase-merge" | "rebase-apply" | "sequencer") {
+            std::fs::create_dir(&path).unwrap();
+        } else {
+            std::fs::write(&path, b"active\n").unwrap();
+        }
+        assert_refuses_without_mutation(&sandbox, &root, &[], 2);
+    }
+
+    for lock in ["index.lock", "config.lock", "refs/heads/main.lock"] {
+        let root = flat_repository(&sandbox, &format!("lock-{}", lock.replace('/', "-")));
+        let path = root.join(".git").join(lock);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+        assert_refuses_without_mutation(&sandbox, &root, &[], 2);
+    }
+
+    let sparse = flat_repository(&sandbox, "sparse");
+    sandbox.git(&sparse, &["config", "core.sparseCheckout", "true"]);
+    assert_refuses_without_mutation(&sandbox, &sparse, &[], 2);
+
+    let modules = flat_repository(&sandbox, "modules");
+    std::fs::create_dir(modules.join(".git/modules")).unwrap();
+    assert_refuses_without_mutation(&sandbox, &modules, &[], 2);
+
+    let conflict = flat_repository(&sandbox, "conflict");
+    sandbox.git(&conflict, &["switch", "--quiet", "-c", "side"]);
+    std::fs::write(conflict.join("tracked"), b"side\n").unwrap();
+    sandbox.git(&conflict, &["commit", "--quiet", "-am", "side"]);
+    sandbox.git(&conflict, &["switch", "--quiet", "main"]);
+    std::fs::write(conflict.join("tracked"), b"main\n").unwrap();
+    sandbox.git(&conflict, &["commit", "--quiet", "-am", "main"]);
+    let merge = sandbox.git_output(&conflict, &["merge", "--no-edit", "side"]);
+    assert_eq!(merge.status.code(), Some(1));
+    assert_refuses_without_mutation(&sandbox, &conflict, &[], 2);
+
+    let invalid_remote = flat_repository(&sandbox, "invalid-remote");
+    assert_refuses_without_mutation(&sandbox, &invalid_remote, &["--remote", "missing"], 2);
 }
 
 #[test]
@@ -473,6 +601,127 @@ fn branch_matrix_keeps_worktree_config_private_and_bare_layout_separate() {
         Some("true")
     );
     assert!(!root.join("main/.git").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_adopt_preserves_raw_names_modes_links_and_shared_fallthrough() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "raw-fidelity");
+    let names = [
+        b"raw-\xff".to_vec(),
+        b"line\nbreak".to_vec(),
+        b"tab\tname".to_vec(),
+        b"back\\slash".to_vec(),
+    ];
+    for (index, name) in names.iter().enumerate() {
+        std::fs::write(root.join(OsString::from_vec(name.clone())), [index as u8]).unwrap();
+    }
+    std::fs::write(root.join("empty"), b"").unwrap();
+    std::fs::write(root.join("large"), vec![b'l'; 1024 * 1024]).unwrap();
+    std::fs::create_dir(root.join("private-dir")).unwrap();
+    let mut mode = std::fs::metadata(root.join("private-dir"))
+        .unwrap()
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut mode, 0o711);
+    std::fs::set_permissions(root.join("private-dir"), mode).unwrap();
+    std::os::unix::fs::symlink(OsString::from_vec(names[0].clone()), root.join("raw-link"))
+        .unwrap();
+    let fallthrough = OsString::from_vec(b"custom-\xff".to_vec());
+    std::fs::write(root.join(".git").join(&fallthrough), b"shared\n").unwrap();
+    let raw_ref = OsString::from_vec(b"refs/custom/raw-\xff".to_vec());
+    sandbox.git_os(
+        &root,
+        &[
+            OsString::from("update-ref"),
+            raw_ref.clone(),
+            OsString::from("HEAD"),
+        ],
+    );
+    sandbox.git(
+        &root,
+        &["update-ref", "--create-reflog", "refs/stash", "HEAD"],
+    );
+    sandbox.git_os(
+        &root,
+        &[
+            OsString::from("config"),
+            OsString::from("custom.raw"),
+            OsString::from_vec(b"value-\xff".to_vec()),
+        ],
+    );
+
+    let output = sandbox
+        .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    for (index, name) in names.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(root.join("main").join(OsString::from_vec(name.clone()))).unwrap(),
+            [index as u8]
+        );
+    }
+    assert_eq!(
+        std::fs::read_link(root.join("main/raw-link"))
+            .unwrap()
+            .as_os_str()
+            .as_bytes(),
+        names[0]
+    );
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(root.join("main/private-dir"))
+                .unwrap()
+                .permissions()
+        ) & 0o777,
+        0o711
+    );
+    assert_eq!(std::fs::metadata(root.join("main/empty")).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::metadata(root.join("main/large")).unwrap().len(),
+        1024 * 1024
+    );
+    assert_eq!(
+        sandbox
+            .git_os(
+                &root,
+                &[
+                    OsString::from("show-ref"),
+                    OsString::from("--verify"),
+                    raw_ref,
+                ],
+            )
+            .status
+            .code(),
+        Some(0)
+    );
+    assert!(root.join(".bare/refs/stash").exists());
+    assert!(root.join(".bare/logs/refs/stash").exists());
+    assert_eq!(
+        sandbox
+            .git_os(
+                &root,
+                &[
+                    OsString::from("config"),
+                    OsString::from("--get"),
+                    OsString::from("custom.raw"),
+                ],
+            )
+            .stdout,
+        b"value-\xff\n"
+    );
+    assert_eq!(
+        std::fs::read(root.join(".bare").join(&fallthrough)).unwrap(),
+        b"shared\n"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(r"custom-\xFF"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(feature = "failpoints")]

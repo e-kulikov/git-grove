@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -11,6 +13,77 @@ pub struct Sandbox {
     home: TempDir,
     work: TempDir,
     path: OsString,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct TreeEntry {
+    path: Vec<u8>,
+    kind: u8,
+    mode: u32,
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    content: Vec<u8>,
+}
+
+/// A byte-preserving recursive snapshot used to prove preflight refusals do
+/// not mutate the repository. Access times are intentionally excluded.
+#[cfg(unix)]
+pub fn tree_snapshot(root: &Path) -> Vec<TreeEntry> {
+    fn visit(root: &Path, relative: &Path, entries: &mut Vec<TreeEntry>) {
+        let absolute = root.join(relative);
+        let metadata = std::fs::symlink_metadata(&absolute).unwrap();
+        let file_type = metadata.file_type();
+        let content = if file_type.is_file() {
+            std::fs::read(&absolute).unwrap()
+        } else if file_type.is_symlink() {
+            std::fs::read_link(&absolute)
+                .unwrap()
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        entries.push(TreeEntry {
+            path: relative.as_os_str().as_bytes().to_vec(),
+            kind: if file_type.is_dir() {
+                1
+            } else if file_type.is_file() {
+                2
+            } else if file_type.is_symlink() {
+                3
+            } else {
+                4
+            },
+            mode: metadata.mode(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            nlink: metadata.nlink(),
+            size: metadata.size(),
+            mtime: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            content,
+        });
+        if file_type.is_dir() {
+            let mut children = std::fs::read_dir(&absolute)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            children.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+            for child in children {
+                visit(root, &relative.join(child), entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, Path::new(""), &mut entries);
+    entries
 }
 
 impl Sandbox {
@@ -43,6 +116,17 @@ impl Sandbox {
     }
 
     pub fn git(&self, cwd: &Path, args: &[&str]) -> Output {
+        let out = self.git_output(cwd, args);
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    pub fn git_output(&self, cwd: &Path, args: &[&str]) -> Output {
         let mut cmd = Command::new("git");
         cmd.current_dir(cwd)
             .args([
@@ -55,14 +139,7 @@ impl Sandbox {
             ])
             .args(args);
         self.apply_env(&mut cmd);
-        let out = cmd.output().expect("git must be installed");
-        assert!(
-            out.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-        out
+        cmd.output().expect("git must be installed")
     }
 
     #[cfg(unix)]
