@@ -195,7 +195,16 @@ impl Sandbox {
             .collect()
     }
 
-    /// What `HEAD` resolves to in `repo`, or `None` when it does not resolve.
+    /// The ref `HEAD` *points at* in `repo`, or `None` when `HEAD` is not a
+    /// symbolic ref at all.
+    ///
+    /// This reads the symref target, not a resolved commit: an empty bare
+    /// repository whose unborn `HEAD` names a branch that does not exist yet —
+    /// and a repository whose `HEAD` was left dangling by a push into another
+    /// branch — both still report that target here and exit `0`. Tests that
+    /// need to know whether the hosting side actually *resolves* `HEAD` must
+    /// ask over the wire with `ls-remote --symref`, which is what `publish`
+    /// itself does.
     pub fn remote_head_symref(&self, repo: &Path) -> Option<String> {
         let mut cmd = Command::new("git");
         cmd.current_dir(repo)
