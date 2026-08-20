@@ -2247,6 +2247,70 @@ mod tests {
         );
     }
 
+    /// The shape that makes running step 7 before the local `set-head`
+    /// necessary rather than merely tidy. `--all-branches` into an empty target
+    /// whose unborn `HEAD` names a branch this grove also has makes the server
+    /// `HEAD` resolvable, so `set-head --auto` *succeeds* and points the local
+    /// `refs/remotes/<r>/HEAD` at the wrong branch. In the plan's literal order
+    /// the local verification would then fail as exit 1, for a condition the
+    /// specification names as a decision at exit 2 — and there would be no
+    /// stderr to classify, because git exited 0.
+    #[test]
+    fn a_server_head_naming_another_branch_is_a_decision_even_when_set_head_would_succeed() {
+        let fake = RecordingFake::new();
+        script_preflight(&fake);
+        fake.push_response(out(0, b"")); // purge
+        fake.push_response(out(0, b"")); // ls-remote: the target is empty
+        for _ in 0..3 {
+            fake.push_response(out(0, b""));
+        }
+        fake.push_response(out(0, b"")); // remote add
+        fake.push_response(values(&[URL.as_bytes()]));
+        fake.push_response(values(&[b"+refs/heads/*:refs/remotes/origin/*"]));
+        fake.push_response(values(&[b"true"]));
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(out(0, b"refs/heads/main\nrefs/heads/master\n")); // push_refspecs
+        fake.push_response(out(0, b"")); // the single push
+        fake.push_response(out(0, b"refs/heads/main\n")); // configure_upstreams
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(out(0, b""));
+        fake.push_response(values(&[b"origin"]));
+        fake.push_response(values(&[b"refs/heads/main"]));
+        fake.push_response(out(0, b"")); // tracking ref exists
+                                         // The push made the target's HEAD resolvable — to `master`, not `main`.
+        fake.push_response(advert_of(
+            "refs/heads/master",
+            &[("refs/heads/main", OID), ("refs/heads/master", OID)],
+        ));
+        let request = Request {
+            url: OsString::from(URL),
+            remote: OsString::from("origin"),
+            all_branches: true,
+        };
+
+        let report = run(&fake, &grove(), &unpublished(), &request).unwrap();
+
+        assert_eq!(report.class, ExitClass::NeedsDecision);
+        assert!(report
+            .diagnostics
+            .last()
+            .unwrap()
+            .contains("set it by hand"));
+        assert!(
+            !calls_of(&fake)
+                .iter()
+                .any(|call| call.contains(&"set-head".to_string())),
+            "there is nothing sane to point the local remote HEAD at"
+        );
+        let states: Vec<String> = calls_of(&fake)
+            .into_iter()
+            .filter(|call| call.contains(&"grove.publishState".to_string()))
+            .map(|call| call.last().unwrap().clone())
+            .collect();
+        assert_eq!(states, vec!["publishing"]);
+    }
+
     #[test]
     fn a_confirmed_server_head_advances_the_receipt_to_published() {
         let fake = RecordingFake::new();

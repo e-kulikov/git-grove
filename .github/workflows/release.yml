@@ -168,6 +168,37 @@ jobs:
           fi
           test -f "$grove/main/advance.txt"
 
+          # Packaged local-remote publish smoke: init a second grove, commit in
+          # its worktree, publish it to a fresh empty origin, and verify the
+          # origin's default branch and HEAD. Local temporary repositories
+          # only; no network access.
+          empty_origin="$temp/empty-origin.git"
+          git init --quiet --bare --initial-branch=main "$empty_origin"
+
+          published="$temp/published"
+          "$binary" init "$published" --branch main
+          git -C "$published/main" config user.email test@example.invalid
+          git -C "$published/main" config user.name Test
+          echo published >"$published/main/PUBLISHED.md"
+          git -C "$published/main" add PUBLISHED.md
+          git -C "$published/main" commit --quiet -m publish
+
+          (
+            cd "$published"
+            "$binary" publish "$empty_origin"
+          )
+          published_head=$(git -C "$published/main" rev-parse HEAD)
+          origin_head=$(git --git-dir="$empty_origin" rev-parse refs/heads/main)
+          if [[ "$published_head" != "$origin_head" ]]; then
+            echo 'packaged publish did not push the default branch to the origin' >&2
+            exit 1
+          fi
+          origin_symref=$(git --git-dir="$empty_origin" symbolic-ref HEAD)
+          if [[ "$origin_symref" != 'refs/heads/main' ]]; then
+            echo "packaged publish left the origin HEAD at $origin_symref" >&2
+            exit 1
+          fi
+
       - name: Attest release files
         uses: actions/attest@v4
         with:

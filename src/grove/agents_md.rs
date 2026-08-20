@@ -81,6 +81,7 @@ pub fn render(facts: &Facts) -> String {
          git grove list                 # inspect worktrees and their branches\n\
          git grove add <branch>         # create a worktree for a branch\n\
          git grove sync                 # fetch and fast-forward eligible worktrees\n\
+         git grove publish <url>        # give an unpublished grove a remote and push it\n\
          ```\n\n",
     );
 
@@ -169,18 +170,21 @@ mod tests {
             .find("git worktree add")
             .expect("escape-hatch command must be documented");
 
+        let publish = text
+            .find("git grove publish")
+            .expect("publish must be documented");
+
         assert!(list < add);
         assert!(add < sync);
-        assert!(sync < raw);
+        assert!(sync < publish);
+        assert!(publish < raw);
         assert!(text.contains(
             "git grove sync                 # fetch and fast-forward eligible worktrees"
         ));
-        for unavailable in [
-            "git grove publish",
-            "git grove adopt",
-            "git grove ls",
-            "git grove new",
-        ] {
+        assert!(text.contains(
+            "git grove publish <url>        # give an unpublished grove a remote and push it"
+        ));
+        for unavailable in ["git grove adopt", "git grove ls", "git grove new"] {
             assert!(
                 !text.contains(unavailable),
                 "must not recommend {unavailable}"
