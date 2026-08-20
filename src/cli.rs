@@ -16,6 +16,8 @@ pub const KNOWN: &[&str] = &[
     "survey",
     "sync",
     "tend",
+    "publish",
+    "propagate",
     "completion",
     "help",
 ];
@@ -25,7 +27,7 @@ pub const KNOWN: &[&str] = &[
     name = "git-grove",
     version,
     about = "Manage repositories as a bare clone surrounded by git worktrees",
-    after_help = "Aliases: plant=clone  seed=init  sprout=add  survey=list  tend=sync"
+    after_help = "Aliases: plant=clone  seed=init  sprout=add  survey=list  tend=sync  propagate=publish"
 )]
 pub struct Cli {
     /// Consent to sanitizing unsafe Git environment variables
@@ -90,6 +92,17 @@ pub enum Command {
     /// Fetch and fast-forward every eligible worktree
     #[command(visible_alias = "tend")]
     Sync,
+    /// Give an unpublished grove a remote and push it
+    #[command(visible_alias = "propagate")]
+    Publish {
+        url: OsString,
+        /// Name for the remote to create
+        #[arg(long, default_value = "origin")]
+        remote: OsString,
+        /// Publish every local branch in one atomic push
+        #[arg(long)]
+        all_branches: bool,
+    },
     /// Generate shell completion code
     Completion { shell: CompletionShell },
 }

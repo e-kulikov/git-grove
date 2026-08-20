@@ -13,7 +13,7 @@ fn release_version_requires_a_strict_matching_tag() {
     let manifest = repo_root().join("Cargo.toml");
 
     let valid = Command::new(&script)
-        .args(["v0.2.0", manifest.to_str().unwrap()])
+        .args(["v0.3.0", manifest.to_str().unwrap()])
         .output()
         .expect("run version validator");
     assert!(
@@ -21,9 +21,9 @@ fn release_version_requires_a_strict_matching_tag() {
         "{}",
         String::from_utf8_lossy(&valid.stderr)
     );
-    assert_eq!(valid.stdout, b"0.2.0\n");
+    assert_eq!(valid.stdout, b"0.3.0\n");
 
-    for tag in ["0.2.0", "v01.2.0", "v0.2", "v0.2.0-rc.1", "v0.1.0"] {
+    for tag in ["0.3.0", "v01.3.0", "v0.3", "v0.3.0-rc.1", "v0.2.0"] {
         let invalid = Command::new(&script)
             .args([tag, manifest.to_str().unwrap()])
             .output()
@@ -47,6 +47,8 @@ fn release_docs_describe_real_metadata_and_the_narrow_environment_consent() {
             "grove.defaultBranch",
             "grove.remote",
             "grove.publishState",
+            "grove.publishRemote",
+            "grove.publishUrl",
         ] {
             assert!(
                 document.contains(required),
@@ -105,13 +107,10 @@ fn release_docs_describe_sync_and_its_safety_contract() {
             document.contains("status `2`") || document.contains(".B 2"),
             "{relative} must describe exit 2 for an unresolved or blocked state"
         );
-        for unimplemented in ["publish", "adopt"] {
-            assert!(
-                !document.contains(&format!("git grove {unimplemented}"))
-                    && !document.contains(&format!("git-grove {unimplemented}")),
-                "{relative} must not advertise unimplemented command {unimplemented}"
-            );
-        }
+        assert!(
+            !document.contains("git grove adopt") && !document.contains("git-grove adopt"),
+            "{relative} must not advertise the unimplemented adopt command"
+        );
         assert!(
             !rendered_words.contains("--no-overwrite-ignore @{upstream}"),
             "{relative} must not claim the merge targets the symbolic @{{upstream}} revision"
@@ -120,11 +119,80 @@ fn release_docs_describe_sync_and_its_safety_contract() {
 }
 
 #[test]
-fn grove_format_version_is_unchanged_by_the_0_2_0_package_version() {
+fn release_docs_describe_publish_and_its_transaction_contract() {
+    for relative in ["README.md", "man/git-grove.1"] {
+        let document = fs::read_to_string(repo_root().join(relative)).unwrap();
+        let rendered_words = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        for required in [
+            "publish",
+            "propagate",
+            "unpublished",
+            "publishing",
+            "published",
+            "grove.publishRemote",
+            "grove.publishUrl",
+            "--remote",
+            "--all-branches",
+        ] {
+            assert!(
+                document.contains(required),
+                "{relative} omits publish contract term {required}"
+            );
+        }
+        assert!(
+            rendered_words.contains(
+                "before the first step that mutates the remote or the local remote configuration"
+            ),
+            "{relative} must state the receipt write point as the mutation-only rule"
+        );
+        assert!(
+            !rendered_words.contains("before any remote-affecting step"),
+            "{relative} must not paraphrase the receipt rule back to the wider wording"
+        );
+        assert!(
+            rendered_words.contains("left untouched") && rendered_words.contains("corrected URL"),
+            "{relative} must state the user-visible consequence: a grove refused while \
+             inspecting the target is left untouched and can simply be republished"
+        );
+        assert!(
+            rendered_words.contains("one atomic push"),
+            "{relative} must describe --all-branches as a single atomic push"
+        );
+        assert!(
+            rendered_words.contains("does not advertise atomic push"),
+            "{relative} must describe the refusal when the target cannot do atomic push"
+        );
+        assert!(
+            rendered_words.contains("never force-pushes"),
+            "{relative} must state that publish never force-pushes"
+        );
+        assert!(
+            rendered_words.contains("diverged") || rendered_words.contains("divergent"),
+            "{relative} must describe the divergent-target refusal"
+        );
+        assert!(
+            rendered_words.contains("unrelated"),
+            "{relative} must describe the unrelated-target refusal"
+        );
+        assert!(
+            rendered_words.contains("stays in the publishing state"),
+            "{relative} must describe the unconfirmed hosting-side default branch outcome"
+        );
+        for unimplemented in ["--create", "adopt"] {
+            assert!(
+                !rendered_words.contains(&format!("publish {unimplemented}")),
+                "{relative} must not advertise unimplemented {unimplemented}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grove_format_version_is_unchanged_by_the_0_3_0_package_version() {
     let source = fs::read_to_string(repo_root().join("src/grove/metadata.rs")).unwrap();
     assert!(
         source.contains("pub const FORMAT_VERSION: u32 = 1;"),
-        "grove layout format must remain version 1 across the 0.2.0 package bump"
+        "grove layout format must remain version 1 across the 0.3.0 package bump"
     );
 }
 
@@ -164,7 +232,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
     run_packager(&binary, &first);
     run_packager(&binary, &second);
 
-    let archive_name = "git-grove_0.2.0_linux_x86_64.tar.gz";
+    let archive_name = "git-grove_0.3.0_linux_x86_64.tar.gz";
     assert_eq!(
         fs::read(first.join(archive_name)).unwrap(),
         fs::read(second.join(archive_name)).unwrap(),
@@ -188,7 +256,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
         .output()
         .unwrap();
     assert!(listing.status.success());
-    let prefix = "git-grove_0.2.0_linux_x86_64";
+    let prefix = "git-grove_0.3.0_linux_x86_64";
     let expected = [
         format!("{prefix}/"),
         format!("{prefix}/LICENSE"),
@@ -240,7 +308,7 @@ fn run_packager(binary: &Path, destination: &Path) {
     let output = Command::new(repo_root().join("scripts/package-release.sh"))
         .env("SOURCE_DATE_EPOCH", "946684800")
         .args([
-            "0.2.0",
+            "0.3.0",
             binary.to_str().unwrap(),
             destination.to_str().unwrap(),
         ])

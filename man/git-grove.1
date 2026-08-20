@@ -1,4 +1,4 @@
-.TH GIT-GROVE 1 "2026-08-19" "git-grove 0.2.0" "Git Extensions"
+.TH GIT-GROVE 1 "2026-08-20" "git-grove 0.3.0" "Git Extensions"
 .SH NAME
 git-grove \- manage repositories as a bare clone surrounded by Git worktrees
 .SH SYNOPSIS
@@ -35,8 +35,9 @@ The command aliases are
 .BR seed = init ,
 .BR sprout = add ,
 .BR survey = list ,
+.BR tend = sync ,
 and
-.BR tend = sync .
+.BR propagate = publish .
 .SH COMMANDS
 .TP
 .B clone \fR[\fB-b\fR|\fB--branch \fIbranch\fR] \fIurl\fR [\fIdir\fR] [\fB--\fR \fIgit-options\fR...]
@@ -110,6 +111,78 @@ otherwise unresolved causes exit status
 The alias is
 .BR tend .
 .TP
+.B publish \fR[\fB--remote \fIname\fR] [\fB--all-branches\fR] \fIurl\fR
+Give an unpublished grove a remote and push it, as a transaction with three
+states \(em
+.BR unpublished ,
+.BR publishing ,
+and
+.BR published \(em
+recorded in
+.BR grove.publishState .
+Its receipt,
+.B grove.publishRemote
+and
+.BR grove.publishUrl ,
+is written before the first step that mutates the remote or the local remote
+configuration, and is never rolled back.  The read-only inspection of the
+target therefore runs first, so a grove refused while the target is being
+inspected is left untouched and can simply be republished to a corrected URL.
+.RS
+.PP
+.B --remote
+names the remote to create and defaults to
+.BR origin .
+.B --all-branches
+publishes every local branch rather than the default branch alone.
+.PP
+The target is inspected with
+.B "git ls-remote --symref"
+before anything is configured, and a branch already present there is compared
+through a probe ref this transaction owns under
+.BR refs/grove/publish-probe/ ,
+deleted after the decision.
+.B publish
+never force-pushes, never rewrites history, never merges a host-created
+commit, never deletes a remote reference, and never calls a hosting provider.
+A target whose default branch has diverged from this grove's, or whose history
+is unrelated to it, and a target whose
+.B HEAD
+names another branch, are each refused with exit status
+.BR 2 .
+.PP
+The push is a single
+.B "git push --atomic"
+invocation, carrying one refspec per published branch.  If the receiving end
+does not advertise atomic push, Git refuses before sending any reference
+update; the command reports that and exits with status
+.BR 2 ,
+and nothing is published.
+.B --all-branches
+is one atomic push precisely so a rejected branch cannot leave the others
+half-published.  Upstream tracking is written explicitly through
+.B "git config"
+and verified, never through
+.BR "push --set-upstream" .
+.PP
+Success is reported only after re-asking the hosting side whether its
+.B HEAD
+resolves to this grove's default branch.  If it does not, the branch is pushed
+but the grove stays in the publishing state and the command exits with status
+.BR 2 ,
+asking for the hosting side's default branch to be set by hand; a rerun then
+completes the transaction.  A rerun naming a different URL or remote name than
+the receipt records is refused with exit status
+.BR 2 ,
+naming both values.  Comparison is exact and byte for byte.
+.B publish
+does not rewrite
+.BR AGENTS.md .
+.RE
+.PP
+The alias is
+.BR propagate .
+.TP
 .B completion \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR}
 Write completion source for the selected shell to standard output.
 .SH OPTIONS
@@ -143,9 +216,11 @@ The real Git configuration also stores metadata under
 .BR grove.version ,
 .BR grove.defaultBranch ,
 .BR grove.remote ,
+.BR grove.publishState ,
+.BR grove.publishRemote ,
 and
-.BR grove.publishState .
-Version 0.2 refuses a newer
+.BR grove.publishUrl .
+Version 0.3 refuses a newer
 .B grove.version
 before writing.
 .TP
@@ -212,7 +287,7 @@ Usage error, refused option or environment, unsupported context without an
 override, or no grove where one is required.
 .SH FILES
 .TP
-.I git-grove_0.2.0_linux_x86_64.tar.gz
+.I git-grove_0.3.0_linux_x86_64.tar.gz
 Static Linux x86_64 release archive containing the executable, license,
 README, this manual, and generated Bash, Zsh, and Fish completions.
 .TP

@@ -9,7 +9,7 @@ fn reports_its_version() {
         .grove(&["--version"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("git-grove 0.2.0"));
+        .stdout(predicates::str::contains("git-grove 0.3.0"));
 }
 
 #[test]
@@ -47,8 +47,9 @@ fn lists_only_the_supported_lifecycle_aliases_in_help() {
         .stdout(predicates::str::contains("sprout=add"))
         .stdout(predicates::str::contains("survey=list"))
         .stdout(predicates::str::contains("tend=sync"))
+        .stdout(predicates::str::contains("propagate=publish"))
         .stdout(predicates::str::contains("transplant").not())
-        .stdout(predicates::str::contains("propagate").not());
+        .stdout(predicates::str::contains("adopt").not());
 }
 
 #[test]
@@ -91,8 +92,88 @@ fn emits_sync_and_tend_in_runtime_completion() {
             .assert()
             .success()
             .stdout(predicates::str::contains("sync"))
-            .stdout(predicates::str::contains("tend"));
+            .stdout(predicates::str::contains("tend"))
+            .stdout(predicates::str::contains("publish"))
+            .stdout(predicates::str::contains("propagate"));
     }
+}
+
+#[test]
+fn explicit_publish_outside_a_grove_keeps_the_usage_path() {
+    let sandbox = Sandbox::new();
+    for command in ["publish", "propagate"] {
+        sandbox
+            .grove(&[command, "https://example.invalid/r.git"])
+            .assert()
+            .code(64)
+            .stderr(predicates::str::contains("not inside a grove"));
+    }
+}
+
+#[test]
+fn publish_requires_a_url() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["publish"])
+        .assert()
+        .code(64)
+        .stderr(predicates::str::starts_with("git-grove:"));
+}
+
+/// `publish` and `propagate` are commands, so the bare-locator clone shortcut
+/// must never read `git grove publish` as `git grove clone publish`.
+#[test]
+fn publish_is_not_reachable_through_the_clone_shortcut() {
+    let sandbox = Sandbox::new();
+    for command in ["publish", "propagate"] {
+        sandbox
+            .grove(&[command, "https://example.invalid/r.git"])
+            .assert()
+            .code(64)
+            .stderr(predicates::str::contains("not inside a grove"))
+            .stderr(predicates::str::contains("git clone").not());
+    }
+}
+
+#[test]
+fn propagate_dispatches_identically_to_publish() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["init", "g", "--branch", "main"])
+        .assert()
+        .success();
+    let root = sandbox.root().join("g");
+    let origin = sandbox.root().join("empty.git");
+    sandbox.git(
+        sandbox.root(),
+        &[
+            "init",
+            "--quiet",
+            "--bare",
+            "--initial-branch=main",
+            origin.to_str().unwrap(),
+        ],
+    );
+
+    // An unborn grove is refused identically by both spellings.
+    for command in ["publish", "propagate"] {
+        sandbox
+            .grove_in(&root, &[command, origin.to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("no commit to publish"));
+    }
+}
+
+#[test]
+fn publish_defaults_the_remote_name_to_origin() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .grove(&["publish", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("origin"))
+        .stdout(predicates::str::contains("--all-branches"));
 }
 
 #[test]
