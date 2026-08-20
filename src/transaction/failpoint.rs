@@ -74,6 +74,7 @@ impl Checkpoints {
     }
 
     pub fn checkpoint(&mut self) -> Result<()> {
+        crate::transaction::signal::check_interrupted()?;
         let checkpoint = self.next;
         self.next = self
             .next
@@ -81,9 +82,11 @@ impl Checkpoints {
             .ok_or_else(|| GroveError::failure("failure checkpoint counter overflow"))?;
         self.total = checkpoint;
         match self.mode {
-            Some(FailpointMode::Error(target)) if checkpoint == target => Err(GroveError::failure(
-                format!("injected failure after checkpoint {checkpoint}"),
-            )),
+            Some(FailpointMode::Error(target)) if checkpoint == target => {
+                Err(GroveError::needs_decision(format!(
+                    "injected failure after checkpoint {checkpoint}"
+                )))
+            }
             Some(FailpointMode::Kill(target)) if checkpoint == target => {
                 rustix::process::kill_process(
                     rustix::process::getpid(),

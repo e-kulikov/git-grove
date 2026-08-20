@@ -111,6 +111,13 @@ impl Sandbox {
         self.grove_in(self.root(), args)
     }
 
+    pub fn grove_process(&self, cwd: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("git-grove"));
+        command.current_dir(cwd).args(args);
+        self.apply_env(&mut command);
+        command
+    }
+
     #[cfg(unix)]
     pub fn grove_os(&self, args: &[OsString]) -> assert_cmd::Command {
         let mut cmd = assert_cmd::Command::cargo_bin("git-grove").unwrap();

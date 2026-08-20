@@ -2,7 +2,7 @@ use crate::error::{GroveError, Result};
 use crate::fsx::held::{FileIdentity, HeldDirectory};
 use crate::fsx::lock::{GroveLock, LockMode};
 use crate::git::runner::{GitRunner, Invocation};
-use crate::transaction::journal::{Journal, JOURNAL_CURRENT, JOURNAL_NEW};
+use crate::transaction::journal::{Journal, Progress, JOURNAL_CURRENT, JOURNAL_NEW};
 use bstr::ByteSlice;
 use rustix::fs::{openat, renameat, unlinkat, AtFlags, Mode, OFlags};
 use std::ffi::{OsStr, OsString};
@@ -19,6 +19,13 @@ pub struct Recovered {
     pub root: HeldDirectory,
     pub transaction: HeldDirectory,
     pub journal: Journal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum RecoveryRegion {
+    Forward,
+    Committed,
+    None,
 }
 
 pub fn resolve_root(requested: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
@@ -38,9 +45,51 @@ pub fn resolve_root(requested: Option<&Path>, cwd: &Path) -> Result<PathBuf> {
             return Ok(current);
         }
         if !current.pop() {
-            return Err(GroveError::usage("no interrupted adoption was found")
+            return Err(GroveError::failure("no interrupted adoption was found")
                 .with_detail("pass the original repository root to --continue or --abort"));
         }
+    }
+}
+
+pub fn inspect_region(root_path: &Path) -> Result<RecoveryRegion> {
+    let names = candidate_names(root_path)?;
+    if names.is_empty() {
+        return Ok(RecoveryRegion::None);
+    }
+    if names.len() != 1 {
+        return Err(GroveError::needs_decision(
+            "multiple adoption transactions require inspection",
+        ));
+    }
+    let name = &names[0];
+    validate_candidate_metadata(root_path, name)?;
+    let root = HeldDirectory::open(root_path)?;
+    let transaction = HeldDirectory::open(&root_path.join(name))?;
+    let current = read_optional(&transaction, JOURNAL_CURRENT)?
+        .map(|bytes| Journal::parse_strict(&bytes))
+        .transpose()?;
+    let new = read_optional(&transaction, JOURNAL_NEW)?
+        .map(|bytes| Journal::parse_strict(&bytes))
+        .transpose()
+        .ok()
+        .flatten();
+    let selected = match (current, new) {
+        (Some(current), Some(next)) if current.validate_next(&next).is_ok() => next,
+        (Some(current), _) => current,
+        (None, Some(initial)) if initial.generation == 1 => initial,
+        _ => {
+            return Err(GroveError::needs_decision(
+                "no valid adoption journal generation can be selected",
+            ))
+        }
+    };
+    validate_binding(&root, name, &selected)?;
+    match selected.progress {
+        Progress::Forward => Ok(RecoveryRegion::Forward),
+        Progress::Committed => Ok(RecoveryRegion::Committed),
+        Progress::Aborting | Progress::Aborted => Err(GroveError::needs_decision(
+            "adoption journal is in the abort direction",
+        )),
     }
 }
 
@@ -62,7 +111,7 @@ pub fn discover(root_path: &Path) -> Result<Recovered> {
     let root = HeldDirectory::open(root_path)?;
     let names = candidate_names(root_path)?;
     if names.is_empty() {
-        return Err(GroveError::usage("no interrupted adoption was found"));
+        return Err(GroveError::failure("no interrupted adoption was found"));
     }
     if names.len() != 1 {
         let listed = names

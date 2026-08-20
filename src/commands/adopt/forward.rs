@@ -83,8 +83,9 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
     let mut checkpoints = Checkpoints::from_env()?;
     durable_replace(&transaction, &journal, &mut checkpoints).map_err(|error| {
         error.with_detail(format!(
-            "the transaction is at {}; inspect it and run `git grove adopt --abort {}`",
+            "the transaction is at {}; run `git grove adopt --continue {}` or `git grove adopt --abort {}`",
             transaction_path.as_os_str().as_bytes().escape_bytes(),
+            root.as_os_str().as_bytes().escape_bytes(),
             root.as_os_str().as_bytes().escape_bytes()
         ))
     })?;
@@ -101,11 +102,18 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
         &guide,
     );
     if let Err(error) = result {
+        if !transaction.path().exists() {
+            return Err(error);
+        }
+        reconcile_after_signal(&error, &transaction, &journal)?;
         return Err(error.with_detail(format!(
             "adoption can be resumed with `git grove adopt --continue {}` or reversed with `git grove adopt --abort {}`",
             root.as_os_str().as_bytes().escape_bytes(),
             root.as_os_str().as_bytes().escape_bytes()
         )));
+    }
+    if checkpoints.is_counting() {
+        eprintln!("git-grove: failpoint checkpoints: {}", checkpoints.total());
     }
 
     println!(
@@ -141,7 +149,7 @@ pub(super) fn resume(
                 .transpose()?;
             let pointer = payload_pointer(recovered.root.path(), &payload)?;
             let guide = recovered.journal.plan.generated.guide.bytes.decode();
-            execute(
+            let result = execute(
                 runner,
                 &recovered.root,
                 &recovered.transaction,
@@ -151,12 +159,17 @@ pub(super) fn resume(
                 default.as_deref(),
                 &pointer,
                 &guide,
-            )
+            );
+            if let Err(error) = &result {
+                reconcile_after_signal(error, &recovered.transaction, &recovered.journal)?;
+            }
+            result
         }
-        Progress::Committed => {
-            cleanup_transaction(&recovered.transaction)?;
-            sync_dir(recovered.root.path())
-        }
+        Progress::Committed => cleanup_and_sync(
+            &recovered.transaction,
+            recovered.root.path(),
+            &mut checkpoints,
+        ),
         Progress::Aborting | Progress::Aborted => Err(GroveError::needs_decision(
             "this adoption is aborting or aborted and cannot be continued",
         )),
@@ -167,6 +180,19 @@ pub(super) fn abort(
     runner: &dyn GitRunner,
     mut recovered: crate::transaction::recovery::Recovered,
 ) -> Result<()> {
+    let result = abort_inner(runner, &mut recovered);
+    if let Err(error) = &result {
+        if recovered.transaction.path().exists() {
+            reconcile_after_signal(error, &recovered.transaction, &recovered.journal)?;
+        }
+    }
+    result
+}
+
+fn abort_inner(
+    runner: &dyn GitRunner,
+    recovered: &mut crate::transaction::recovery::Recovered,
+) -> Result<()> {
     let mut checkpoints = Checkpoints::from_env()?;
     match recovered.journal.progress {
         Progress::Committed => {
@@ -175,8 +201,11 @@ pub(super) fn abort(
             ))
         }
         Progress::Aborted => {
-            cleanup_transaction(&recovered.transaction)?;
-            return sync_dir(recovered.root.path());
+            return cleanup_and_sync(
+                &recovered.transaction,
+                recovered.root.path(),
+                &mut checkpoints,
+            );
         }
         Progress::Forward => {
             normalize_pending_phase(
@@ -221,8 +250,11 @@ pub(super) fn abort(
         &recovered.transaction,
         &mut checkpoints,
     )?;
-    cleanup_transaction(&recovered.transaction)?;
-    sync_dir(recovered.root.path())
+    cleanup_and_sync(
+        &recovered.transaction,
+        recovered.root.path(),
+        &mut checkpoints,
+    )
 }
 
 fn normalize_pending_phase(
@@ -316,7 +348,7 @@ fn reverse_phase(
     let pointer = payload_pointer(root, &payload_relative)?;
     let admin = pointer_admin(&pointer)?;
     match index {
-        8 => Ok(()),
+        8 => relock_generated_worktrees(runner, plan, root, &bare),
         7 => remove_generated_guide(plan, root),
         6 => remove_default_worktree(runner, plan, root, &bare),
         5 => restore_private_state(runner, plan, &bare, &admin),
@@ -334,6 +366,21 @@ fn reverse_phase(
         }
         _ => Err(GroveError::failure("unknown adoption phase")),
     }
+}
+
+fn relock_generated_worktrees(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    root: &Path,
+    bare: &Path,
+) -> Result<()> {
+    let reason = format!("git-grove adopt transaction {}", "rollback");
+    let payload = root.join(raw_path(&plan.decisions.payload_path)?);
+    lock_if_unlocked(runner, bare, &payload, &reason)?;
+    if let Some(default) = &plan.decisions.default_path {
+        lock_if_unlocked(runner, bare, &root.join(raw_path(default)?), &reason)?;
+    }
+    Ok(())
 }
 
 fn remove_generated_guide(plan: &ImmutablePlan, root: &Path) -> Result<()> {
@@ -687,8 +734,7 @@ fn execute(
     journal.validate_next(&committed)?;
     durable_replace(transaction, &committed, checkpoints)?;
     *journal = committed;
-    cleanup_transaction(transaction)?;
-    sync_dir(root)
+    cleanup_and_sync(transaction, root, checkpoints)
 }
 
 fn immutable_plan(
@@ -1362,6 +1408,28 @@ fn unlock_if_locked(runner: &dyn GitRunner, bare: &Path, path: &Path) -> Result<
     Ok(())
 }
 
+fn lock_if_unlocked(runner: &dyn GitRunner, bare: &Path, path: &Path, reason: &str) -> Result<()> {
+    let pointer = std::fs::read(path.join(".git")).map_err(|error| {
+        GroveError::needs_decision(format!(
+            "cannot read worktree pointer before relock: {error}"
+        ))
+    })?;
+    let admin = pointer_admin(&pointer)?;
+    if !path_exists(&admin.join("locked"))? {
+        run_ok(
+            runner,
+            Invocation::new()
+                .git_dir(bare)
+                .args(["worktree", "lock", "--reason"])
+                .arg(reason)
+                .arg("--")
+                .arg(path),
+            "relock adopted worktree for rollback",
+        )?;
+    }
+    Ok(())
+}
+
 fn run_ok(runner: &dyn GitRunner, invocation: Invocation, action: &str) -> Result<GitOutput> {
     let output = runner.run(invocation)?;
     if output.ok() {
@@ -1438,6 +1506,42 @@ fn cleanup_transaction(transaction: &HeldDirectory) -> Result<()> {
     std::fs::remove_dir(transaction.path()).map_err(|error| {
         GroveError::failure(format!("cannot remove committed transaction: {error}"))
     })
+}
+
+fn cleanup_and_sync(
+    transaction: &HeldDirectory,
+    root: &Path,
+    checkpoints: &mut Checkpoints,
+) -> Result<()> {
+    cleanup_transaction(transaction)?;
+    post_cleanup_checkpoint(checkpoints)?;
+    sync_dir(root)?;
+    post_cleanup_checkpoint(checkpoints)
+}
+
+fn post_cleanup_checkpoint(checkpoints: &mut Checkpoints) -> Result<()> {
+    checkpoints.checkpoint().map_err(|error| {
+        if error.message.starts_with("injected failure") {
+            GroveError::failure(error.message)
+                .with_detail("adoption is already committed and its transaction is cleaned up")
+        } else {
+            error
+        }
+    })
+}
+
+fn reconcile_after_signal(
+    error: &GroveError,
+    transaction: &HeldDirectory,
+    journal: &Journal,
+) -> Result<()> {
+    if error
+        .exit_code
+        .is_some_and(|code| matches!(code, 129 | 130 | 143))
+    {
+        durable_replace(transaction, journal, &mut Checkpoints::disabled())?;
+    }
+    Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {

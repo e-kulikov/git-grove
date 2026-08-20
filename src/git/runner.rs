@@ -3,7 +3,7 @@ use crate::policy::env;
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {
@@ -160,18 +160,34 @@ pub trait GitRunner {
     }
 }
 
-#[derive(Default)]
-pub struct RealGit;
+pub struct RealGit {
+    program: OsString,
+}
+
+impl Default for RealGit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RealGit {
     pub fn new() -> Self {
-        Self
+        Self {
+            program: OsString::from("git"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_program(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+        }
     }
 }
 
 impl GitRunner for RealGit {
     fn run(&self, invocation: Invocation) -> Result<GitOutput> {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(&self.program);
         cmd.args(invocation.argv());
         if let Some(cwd) = &invocation.cwd {
             cmd.current_dir(cwd);
@@ -180,9 +196,20 @@ impl GitRunner for RealGit {
         for (key, value) in invocation.environment_for_test() {
             cmd.env(key, value);
         }
-        let out = cmd
-            .output()
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| GroveError::failure(format!("cannot run git: {error}")))?;
+        if let Err(error) = crate::transaction::signal::begin_child(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|error| GroveError::failure(format!("cannot wait for git: {error}")))?;
+        crate::transaction::signal::finish_child()?;
         Ok(GitOutput {
             status: out.status.code().unwrap_or(-1),
             stdout: out.stdout,
@@ -235,6 +262,8 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn builds_the_argument_vector_with_pins_first() {
@@ -401,6 +430,27 @@ mod tests {
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_drains_stdout_and_stderr_larger_than_pipe_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("large-output");
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\ndd if=/dev/zero bs=131072 count=1 2>/dev/null\ndd if=/dev/zero bs=131072 count=1 1>&2 2>/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = RealGit::with_program(script)
+            .run(Invocation::new())
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.len(), 131_072);
+        assert_eq!(output.stderr.len(), 131_072);
     }
 
     #[cfg(unix)]

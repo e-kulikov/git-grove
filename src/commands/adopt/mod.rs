@@ -63,6 +63,7 @@ fn recover(
             "the recoverable Git directory no longer matches the journal",
         ));
     }
+    crate::transaction::signal::activate()?;
     if abort {
         forward::abort(runner, recovered)
     } else {
