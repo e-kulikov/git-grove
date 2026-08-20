@@ -517,13 +517,12 @@ impl Journal {
             if current.id != candidate.id || current.primitive != candidate.primitive {
                 return Err(invalid("journal operation identity or primitive changed"));
             }
-            if current.state != candidate.state {
-                if state_change
+            if current.state != candidate.state
+                && state_change
                     .replace((index, current.state, candidate.state))
                     .is_some()
-                {
-                    return Err(invalid("more than one journal operation state changed"));
-                }
+            {
+                return Err(invalid("more than one journal operation state changed"));
             }
         }
         let progress_changed = self.progress != next.progress;

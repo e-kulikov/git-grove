@@ -33,7 +33,7 @@ impl LockHolder {
         } else {
             command.arg("--exclusive");
         }
-        let child = command
+        let mut child = command
             .arg(".bare")
             .args(["sh", "-c", "touch \"$1\"; cat >/dev/null", "sh"])
             .arg(&ready)
@@ -49,6 +49,9 @@ impl LockHolder {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
         panic!("lock holder did not become ready");
     }
 }

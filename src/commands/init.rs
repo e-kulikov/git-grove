@@ -258,7 +258,7 @@ pub(crate) fn post_mutation_layout_error(error: GroveError) -> GroveError {
 
 fn identity_matches(path: &Path, expected: DirectoryIdentity) -> bool {
     statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
-        .is_ok_and(|stat| stat.st_dev as u64 == expected.dev && stat.st_ino as u64 == expected.ino)
+        .is_ok_and(|stat| stat.st_dev == expected.dev && stat.st_ino == expected.ino)
 }
 
 pub(crate) fn retain_partial(

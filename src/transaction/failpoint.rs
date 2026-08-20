@@ -28,7 +28,7 @@ impl Checkpoints {
     pub fn from_env() -> Result<Self> {
         #[cfg(feature = "failpoints")]
         {
-            return Self::from_value(std::env::var_os("GIT_GROVE_FAILPOINT").as_deref());
+            Self::from_value(std::env::var_os("GIT_GROVE_FAILPOINT").as_deref())
         }
         #[cfg(not(feature = "failpoints"))]
         {

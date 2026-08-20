@@ -670,7 +670,7 @@ fn pattern_match<'a>(pattern: &[u8], value: &'a [u8]) -> Option<&'a [u8]> {
     }
 }
 
-fn map_refspec(spec: &[u8], source_ref: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn map_refspec(spec: &[u8], source_ref: &[u8]) -> Option<Vec<u8>> {
     let spec = spec.strip_prefix(b"+").unwrap_or(spec);
     if spec.starts_with(b"^") {
         return None;
@@ -692,7 +692,7 @@ fn map_refspec(spec: &[u8], source_ref: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn excludes_source(spec: &[u8], source_ref: &[u8]) -> bool {
+pub(crate) fn excludes_source(spec: &[u8], source_ref: &[u8]) -> bool {
     spec.strip_prefix(b"^")
         .is_some_and(|pattern| pattern_match(pattern, source_ref).is_some())
 }

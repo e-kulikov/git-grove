@@ -11,6 +11,7 @@ pub struct Invocation {
     work_tree: Option<PathBuf>,
     cwd: Option<PathBuf>,
     args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
     c_locale: bool,
 }
 
@@ -44,6 +45,17 @@ impl Invocation {
         self
     }
 
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.environment
+            .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self
+    }
+
     /// Pin this child's locale so its diagnostics are the untranslated C-locale
     /// text. This is a parsing contract for one invocation, not a change to the
     /// environment policy: every other git child keeps the user's locale, so
@@ -59,6 +71,15 @@ impl Invocation {
     /// Whether this invocation carries the locale pin.
     pub fn is_c_locale(&self) -> bool {
         self.c_locale
+    }
+
+    pub fn environment_for_test(&self) -> Vec<(OsString, OsString)> {
+        let mut environment = self.environment.clone();
+        if self.c_locale {
+            environment.push((OsString::from("LC_ALL"), OsString::from("C")));
+            environment.push((OsString::from("LANGUAGE"), OsString::new()));
+        }
+        environment
     }
 
     fn argv(&self) -> Vec<OsString> {
@@ -139,6 +160,7 @@ pub trait GitRunner {
     }
 }
 
+#[derive(Default)]
 pub struct RealGit;
 
 impl RealGit {
@@ -155,8 +177,8 @@ impl GitRunner for RealGit {
             cmd.current_dir(cwd);
         }
         env::sanitize(&mut cmd);
-        if invocation.c_locale {
-            cmd.env("LC_ALL", "C").env("LANGUAGE", "");
+        for (key, value) in invocation.environment_for_test() {
+            cmd.env(key, value);
         }
         let out = cmd
             .output()
@@ -237,6 +259,23 @@ mod tests {
                 "--git-dir=/g/.bare/worktrees/main",
                 "--work-tree=/g/main",
                 "status"
+            ]
+        );
+    }
+
+    #[test]
+    fn per_child_environment_preserves_order_and_locale_pin_wins_last() {
+        let invocation = Invocation::new()
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("LC_ALL", "caller")
+            .c_locale();
+        assert_eq!(
+            invocation.environment_for_test(),
+            vec![
+                (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")),
+                (OsString::from("LC_ALL"), OsString::from("caller")),
+                (OsString::from("LC_ALL"), OsString::from("C")),
+                (OsString::from("LANGUAGE"), OsString::new()),
             ]
         );
     }

@@ -470,17 +470,17 @@ fn identity_from_stat(
     sha256: Option<[u8; 32]>,
 ) -> FileIdentity {
     FileIdentity {
-        dev: stat.st_dev as u64,
-        ino: stat.st_ino as u64,
-        mode: stat.st_mode as u32,
-        nlink: stat.st_nlink as u64,
+        dev: stat.st_dev,
+        ino: stat.st_ino,
+        mode: stat.st_mode,
+        nlink: stat.st_nlink,
         size: stat.st_size.max(0) as u64,
         mtime: Timespec {
-            seconds: stat.st_mtime as i64,
+            seconds: stat.st_mtime,
             nanoseconds: stat.st_mtime_nsec as u32,
         },
         ctime: Timespec {
-            seconds: stat.st_ctime as i64,
+            seconds: stat.st_ctime,
             nanoseconds: stat.st_ctime_nsec as u32,
         },
         mount_id,

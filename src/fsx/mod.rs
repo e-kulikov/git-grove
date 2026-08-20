@@ -324,6 +324,7 @@ fn retain_temporary(
     };
     let retained = parent.join(name);
     let class = original.class;
+    let exit_code = original.exit_code;
     let message = match fsync_directory(directory, parent) {
         Ok(()) => format!("{original}; retained temporary file {}", retained.display()),
         Err(sync_error) => format!(
@@ -333,6 +334,7 @@ fn retain_temporary(
     };
     GroveError {
         class,
+        exit_code,
         message,
         detail: None,
     }

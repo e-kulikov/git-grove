@@ -22,6 +22,7 @@ impl ExitClass {
 #[derive(Debug)]
 pub struct GroveError {
     pub class: ExitClass,
+    pub exit_code: Option<u8>,
     pub message: String,
     pub detail: Option<String>,
 }
@@ -30,6 +31,7 @@ impl GroveError {
     pub fn usage(message: impl Into<String>) -> Self {
         Self {
             class: ExitClass::Usage,
+            exit_code: None,
             message: message.into(),
             detail: None,
         }
@@ -38,6 +40,7 @@ impl GroveError {
     pub fn failure(message: impl Into<String>) -> Self {
         Self {
             class: ExitClass::Failure,
+            exit_code: None,
             message: message.into(),
             detail: None,
         }
@@ -46,6 +49,7 @@ impl GroveError {
     pub fn needs_decision(message: impl Into<String>) -> Self {
         Self {
             class: ExitClass::NeedsDecision,
+            exit_code: None,
             message: message.into(),
             detail: None,
         }
@@ -54,6 +58,15 @@ impl GroveError {
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
+    }
+
+    pub fn with_exit_code(mut self, exit_code: u8) -> Self {
+        self.exit_code = Some(exit_code);
+        self
+    }
+
+    pub fn code(&self) -> u8 {
+        self.exit_code.unwrap_or_else(|| self.class.code())
     }
 }
 
@@ -87,7 +100,15 @@ mod tests {
     fn carries_message_and_detail() {
         let err = GroveError::usage("not a grove").with_detail("run `git grove clone` first");
         assert_eq!(err.class, ExitClass::Usage);
+        assert_eq!(err.exit_code, None);
         assert_eq!(err.message, "not a grove");
         assert_eq!(err.detail.as_deref(), Some("run `git grove clone` first"));
+    }
+
+    #[test]
+    fn exact_exit_code_overrides_the_class_code() {
+        let error = GroveError::failure("interrupted").with_exit_code(143);
+        assert_eq!(error.code(), 143);
+        assert_eq!(error.class, ExitClass::Failure);
     }
 }

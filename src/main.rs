@@ -26,7 +26,7 @@ fn render(result: Result<()>) -> ExitCode {
         Ok(()) => ExitCode::from(ExitClass::Ok.code()),
         Err(err) => {
             eprintln!("git-grove: {err}");
-            ExitCode::from(err.class.code())
+            ExitCode::from(err.code())
         }
     }
 }
