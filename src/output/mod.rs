@@ -50,6 +50,20 @@ pub fn write_rows(
         .map_err(|error| GroveError::failure(format!("cannot write stdout: {error}")))
 }
 
+/// Write a small ordered report, one line each. Used by `publish`, which has no
+/// per-worktree state to render as `list`/`sync` rows.
+pub fn write_lines(writer: &mut dyn Write, lines: &[String]) -> crate::error::Result<()> {
+    let mut text = String::new();
+    for line in lines {
+        text.push_str(line);
+        text.push('\n');
+    }
+    writer
+        .write_all(text.as_bytes())
+        .and_then(|_| writer.flush())
+        .map_err(|error| GroveError::failure(format!("cannot write stdout: {error}")))
+}
+
 fn escaped(bytes: &[u8]) -> String {
     bytes.escape_bytes().to_string()
 }
