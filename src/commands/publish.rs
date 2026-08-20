@@ -643,33 +643,52 @@ fn resolve(runner: &dyn GitRunner, grove: &Grove, reference: &[u8]) -> Result<BS
     Ok(BString::from(trim_one_line(output.stdout, "object ID")?))
 }
 
-/// Specification step 6, second half: point the local `refs/remotes/<r>/HEAD`
-/// at the remote's default branch and verify what git wrote.
+/// Specification step 6, first half: the tracking ref the push is expected to
+/// have created.
 ///
 /// Measured: the step-5 push creates `refs/remotes/<remote>/<branch>` itself,
 /// because step 4 wrote `remote.<name>.fetch` before it — so this verifies the
 /// tracking ref rather than assuming it, and fetches only as an explicit
 /// fallback if it is somehow absent.
-fn point_remote_head(
+fn verify_tracking_ref(
     runner: &dyn GitRunner,
     grove: &Grove,
     request: &Request,
     flight: &Preflight,
 ) -> Result<()> {
     let tracking = tracking_ref(&request.remote, &flight.default_branch);
-    if !ref_exists(runner, grove, &tracking)? {
-        FetchPlan {
-            remotes: vec![BString::from(request.remote.as_bytes().to_vec())],
-        }
-        .execute(runner, grove)?;
-        if !ref_exists(runner, grove, &tracking)? {
-            return Err(GroveError::failure(format!(
-                "the push did not create {}",
-                escaped(&tracking)
-            )));
-        }
+    if ref_exists(runner, grove, &tracking)? {
+        return Ok(());
     }
+    FetchPlan {
+        remotes: vec![BString::from(request.remote.as_bytes().to_vec())],
+    }
+    .execute(runner, grove)?;
+    if !ref_exists(runner, grove, &tracking)? {
+        return Err(GroveError::failure(format!(
+            "the push did not create {}",
+            escaped(&tracking)
+        )));
+    }
+    Ok(())
+}
 
+/// Specification step 6, second half: point the local `refs/remotes/<r>/HEAD`
+/// at the remote's default branch and verify what git wrote.
+///
+/// Runs only after step 7 has confirmed the hosting side resolves `HEAD` to
+/// this grove's default branch. `remote set-head --auto` asks the remote the
+/// same question and can only answer it as an exit code — measured, it exits 1
+/// with `error: Cannot determine remote HEAD` against a dangling remote `HEAD`,
+/// which is precisely the state the specification says to report as a decision.
+/// Asking structurally first turns that into the exit `2` the specification
+/// names; it changes no mutation ordering, since both steps are local.
+fn point_remote_head(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    request: &Request,
+    flight: &Preflight,
+) -> Result<()> {
     // `--auto` is the mode argument and must precede `--`: with `--` first, git
     // reads `--auto` as the positional <branch> and fails with
     // `error: Not a valid ref: refs/remotes/<remote>/--auto`. The `--` still
@@ -781,7 +800,7 @@ fn publish_and_verify(
         &request.remote,
         &[wildcard_refspec(&request.remote)],
     )?;
-    point_remote_head(runner, grove, request, flight)?;
+    verify_tracking_ref(runner, grove, request, flight)?;
 
     let mut lines = vec![format!(
         "published {} to {} at {}",
@@ -799,6 +818,7 @@ fn publish_and_verify(
     if !server_head_matches(runner, request, flight)? {
         return Ok(unconfirmed_head_report(request, flight, lines, diagnostics));
     }
+    point_remote_head(runner, grove, request, flight)?;
 
     lines.extend(stale_guide_line(grove));
 
@@ -887,7 +907,7 @@ fn repair_published(
         }
     }
 
-    point_remote_head(runner, grove, request, flight)?;
+    verify_tracking_ref(runner, grove, request, flight)?;
 
     if !server_head_matches(runner, request, flight)? {
         // The same condition specification step 7 prescribes `publishing` and
@@ -901,6 +921,7 @@ fn repair_published(
         )?;
         return Ok(unconfirmed_head_report(request, flight, lines, Vec::new()));
     }
+    point_remote_head(runner, grove, request, flight)?;
 
     Ok(PublishReport {
         class: ExitClass::Ok,
@@ -1630,11 +1651,11 @@ mod tests {
         fake.push_response(values(&[b"origin"]));
         fake.push_response(values(&[b"refs/heads/main"]));
         fake.push_response(out(0, b"")); // ref_exists refs/remotes/origin/main
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
         fake.push_response(out(0, b"")); // remote set-head --auto
         fake.push_response(out(0, b"refs/remotes/origin/main\n")); // symbolic-ref
         fake.push_response(out(0, format!("{OID}\n").as_bytes())); // show-ref --hash
         fake.push_response(out(0, format!("{OID}\n").as_bytes())); // rev-parse
-        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
         for _ in 0..3 {
             fake.push_response(out(0, b"")); // the published receipt
         }
@@ -2158,11 +2179,11 @@ mod tests {
         fake.push_response(out(1, b"")); // tracking ref absent
         fake.push_response(out(0, b"")); // fallback fetch
         fake.push_response(out(0, b"")); // present now
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
         fake.push_response(out(0, b"")); // set-head
         fake.push_response(out(0, b"refs/remotes/origin/main\n"));
         fake.push_response(out(0, format!("{OID}\n").as_bytes()));
         fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
         for _ in 0..3 {
             fake.push_response(out(0, b""));
         }
@@ -2201,12 +2222,8 @@ mod tests {
         fake.push_response(out(0, b""));
         fake.push_response(values(&[b"origin"]));
         fake.push_response(values(&[b"refs/heads/main"]));
-        fake.push_response(out(0, b""));
-        fake.push_response(out(0, b""));
-        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
-        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        // The target advertises the branch but no HEAD symref.
+        fake.push_response(out(0, b"")); // tracking ref exists
+                                         // The target advertises the branch but no HEAD symref.
         fake.push_response(out(0, format!("{OID}\trefs/heads/main\n").as_bytes()));
 
         let report = run(&fake, &grove(), &unpublished(), &request()).unwrap();
@@ -2274,11 +2291,11 @@ mod tests {
 
     fn script_repair_tail(fake: &RecordingFake) {
         fake.push_response(out(0, b"")); // tracking ref exists
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
         fake.push_response(out(0, b"")); // set-head
         fake.push_response(out(0, b"refs/remotes/origin/main\n"));
         fake.push_response(out(0, format!("{OID}\n").as_bytes()));
         fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
     }
 
     #[test]
@@ -2374,10 +2391,6 @@ mod tests {
         fake.push_response(out(0, format!("{OID}\n").as_bytes()));
         fake.push_response(out(0, format!("{OID}\n").as_bytes()));
         fake.push_response(out(0, b"")); // tracking ref exists
-        fake.push_response(out(0, b"")); // set-head
-        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
-        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
         fake.push_response(advert_of("refs/heads/master", &[("refs/heads/main", OID)]));
         for _ in 0..3 {
             fake.push_response(out(0, b""));

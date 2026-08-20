@@ -161,6 +161,87 @@ impl Sandbox {
         origin
     }
 
+    /// A bare repository with **no** commit, usable as a publication target.
+    pub fn empty_origin(&self, name: &str) -> PathBuf {
+        self.empty_origin_with_head(name, "main")
+    }
+
+    /// A bare repository with no commit whose unborn `HEAD` names `branch`.
+    pub fn empty_origin_with_head(&self, name: &str, branch: &str) -> PathBuf {
+        let origin = self.root().join(format!("{name}.git"));
+        self.git(
+            self.root(),
+            &[
+                "init",
+                "--quiet",
+                "--bare",
+                &format!("--initial-branch={branch}"),
+                origin.to_str().unwrap(),
+            ],
+        );
+        origin
+    }
+
+    /// Every ref in `repo`, as `(refname, oid)`, in `for-each-ref` order.
+    pub fn remote_refs(&self, repo: &Path) -> Vec<(String, String)> {
+        let output = self.git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let (name, oid) = line.split_once(' ').expect("for-each-ref format");
+                (name.to_string(), oid.to_string())
+            })
+            .collect()
+    }
+
+    /// What `HEAD` resolves to in `repo`, or `None` when it does not resolve.
+    pub fn remote_head_symref(&self, repo: &Path) -> Option<String> {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(repo)
+            .args(["symbolic-ref", "--quiet", "HEAD"]);
+        self.apply_env(&mut cmd);
+        let out = cmd.output().expect("git must be installed");
+        out.status.success().then(|| {
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .trim_end()
+                .to_string()
+        })
+    }
+
+    /// Read one configuration value from `repo`, or `None` when it is unset.
+    pub fn repo_config(&self, repo: &Path, key: &str) -> Option<String> {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(repo).args(["config", "--get-all", key]);
+        self.apply_env(&mut cmd);
+        let out = cmd.output().expect("git must be installed");
+        out.status.success().then(|| {
+            String::from_utf8(out.stdout)
+                .unwrap()
+                .trim_end()
+                .to_string()
+        })
+    }
+
+    /// Set one configuration value in `repo`.
+    pub fn set_repo_config(&self, repo: &Path, key: &str, value: &str) {
+        self.git(repo, &["config", key, value]);
+    }
+
+    /// Remove a configuration key from `repo`, tolerating its absence.
+    pub fn unset_repo_config(&self, repo: &Path, key: &str) {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(repo).args(["config", "--unset-all", key]);
+        self.apply_env(&mut cmd);
+        let out = cmd.output().expect("git must be installed");
+        assert!(
+            out.status.success() || out.status.code() == Some(5),
+            "git config --unset-all {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Clone `origin` into a fresh peer directory under the sandbox root.
     pub fn peer_clone(&self, origin: &Path, name: &str) -> PathBuf {
         let peer = self.root().join(name);
