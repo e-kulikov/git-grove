@@ -15,12 +15,58 @@ pub fn run(
     args.validate()?;
     match args.action {
         AdoptAction::Fresh => forward::run(runner, args, cwd),
-        AdoptAction::Continue => Err(GroveError::needs_decision(
-            "adoption recovery is not implemented yet; preserve the transaction and retry with this release's recovery command",
-        )),
-        AdoptAction::Abort => Err(GroveError::needs_decision(
-            "adoption rollback is not implemented yet; preserve the transaction for recovery",
-        )),
+        AdoptAction::Continue => recover(runner, args, cwd, false),
+        AdoptAction::Abort => recover(runner, args, cwd, true),
+    }
+}
+
+fn recover(
+    runner: &dyn crate::git::runner::GitRunner,
+    args: &AdoptArgs,
+    cwd: &std::path::Path,
+    abort: bool,
+) -> Result<()> {
+    let root = crate::transaction::recovery::resolve_root(args.path.as_deref(), cwd)?;
+    let recovered = match crate::transaction::recovery::discover(&root) {
+        Ok(recovered) => recovered,
+        Err(error) if abort => {
+            if crate::transaction::recovery::abort_torn_bootstrap(runner, &root)? {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let repository = if root
+        .join(".bare")
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        root.join(".bare")
+    } else {
+        root.join(".git")
+    };
+    let lock = crate::fsx::lock::GroveLock::acquire_path(
+        &repository,
+        crate::fsx::lock::LockMode::Exclusive,
+        if abort {
+            "git grove adopt --abort"
+        } else {
+            "git grove adopt --continue"
+        },
+    )?;
+    if !crate::transaction::recovery::same_held_identity(
+        lock.directory().identity()?,
+        recovered.journal.plan.original.repository_identity,
+    ) {
+        return Err(GroveError::needs_decision(
+            "the recoverable Git directory no longer matches the journal",
+        ));
+    }
+    if abort {
+        forward::abort(runner, recovered)
+    } else {
+        forward::resume(runner, recovered)
     }
 }
 

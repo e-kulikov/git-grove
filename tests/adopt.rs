@@ -169,6 +169,37 @@ fn preflight_selects_the_only_remote_and_refuses_ambiguous_metadata() {
 }
 
 #[test]
+fn abort_removes_only_a_strict_untouched_torn_bootstrap() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "torn-bootstrap");
+    let transaction = root.join(".grove-adopt-deadbeef");
+    std::fs::create_dir(&transaction).unwrap();
+    let mut permissions = std::fs::metadata(&transaction).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
+    std::fs::set_permissions(&transaction, permissions).unwrap();
+    std::fs::write(transaction.join("journal.json.new"), b"{").unwrap();
+
+    sandbox
+        .grove_in(
+            sandbox.root(),
+            &["adopt", "--continue", root.to_str().unwrap()],
+        )
+        .assert()
+        .code(2);
+    assert!(transaction.exists());
+
+    sandbox
+        .grove_in(
+            sandbox.root(),
+            &["adopt", "--abort", root.to_str().unwrap()],
+        )
+        .assert()
+        .success();
+    assert!(!transaction.exists());
+    assert!(root.join(".git").is_dir());
+}
+
+#[test]
 fn fresh_adopt_preserves_the_payload_and_builds_a_grove() {
     let sandbox = Sandbox::new();
     let root = flat_repository(&sandbox, "fresh");
@@ -442,4 +473,107 @@ fn branch_matrix_keeps_worktree_config_private_and_bare_layout_separate() {
         Some("true")
     );
     assert!(!root.join("main/.git").is_dir());
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn continue_replays_durable_phase_boundaries_and_torn_replacements() {
+    let sandbox = Sandbox::new();
+    for checkpoint in [1, 2, 5, 6, 10, 25, 50] {
+        let root = flat_repository(&sandbox, &format!("continue-{checkpoint}"));
+        std::fs::write(root.join("tracked"), format!("checkpoint {checkpoint}\n")).unwrap();
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+            .env("GIT_GROVE_FAILPOINT", format!("error:{checkpoint}"))
+            .assert()
+            .failure();
+        assert!(std::fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".grove-adopt-")));
+
+        sandbox
+            .grove_in(
+                sandbox.root(),
+                &["adopt", "--continue", root.to_str().unwrap()],
+            )
+            .assert()
+            .success();
+        assert_eq!(
+            std::fs::read(root.join("main/tracked")).unwrap(),
+            format!("checkpoint {checkpoint}\n").as_bytes()
+        );
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".grove-adopt-")));
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn abort_reverses_each_completed_or_physically_completed_phase() {
+    let sandbox = Sandbox::new();
+    for checkpoint in [1, 5, 10, 15, 20, 25, 30, 35, 40, 45] {
+        let root = flat_repository(&sandbox, &format!("abort-{checkpoint}"));
+        std::fs::write(root.join("tracked"), format!("abort {checkpoint}\n")).unwrap();
+        std::fs::write(root.join("untracked"), b"untracked\n").unwrap();
+        let before_status = sandbox
+            .git(
+                &root,
+                &[
+                    "status",
+                    "--porcelain=v2",
+                    "-z",
+                    "--branch",
+                    "--untracked-files=all",
+                    "--ignored=matching",
+                ],
+            )
+            .stdout;
+
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+            .env("GIT_GROVE_FAILPOINT", format!("error:{checkpoint}"))
+            .assert()
+            .failure();
+        sandbox
+            .grove_in(
+                sandbox.root(),
+                &["adopt", "--abort", root.to_str().unwrap()],
+            )
+            .assert()
+            .success();
+
+        assert!(root.join(".git").is_dir(), "checkpoint {checkpoint}");
+        assert!(!root.join(".bare").exists(), "checkpoint {checkpoint}");
+        assert_eq!(
+            std::fs::read(root.join("tracked")).unwrap(),
+            format!("abort {checkpoint}\n").as_bytes()
+        );
+        assert_eq!(
+            sandbox
+                .git(
+                    &root,
+                    &[
+                        "status",
+                        "--porcelain=v2",
+                        "-z",
+                        "--branch",
+                        "--untracked-files=all",
+                        "--ignored=matching",
+                    ],
+                )
+                .stdout,
+            before_status,
+            "checkpoint {checkpoint}"
+        );
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".grove-adopt-")));
+    }
 }

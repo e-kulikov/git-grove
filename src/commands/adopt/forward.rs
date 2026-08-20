@@ -51,7 +51,12 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
     })?;
     let transaction_path = root.join(&transaction_name);
     let transaction = HeldDirectory::open(&transaction_path)?;
-    let payload_pointer = predicted_payload_pointer(&root, &payload_relative)?;
+    let payload_pointer = payload_pointer(&root, &payload_relative)?;
+    if pointer_admin(&payload_pointer)?.exists() {
+        return Err(GroveError::needs_decision(
+            "the predicted payload administrative directory already exists",
+        ));
+    }
     let guide = guide(&plan);
     let immutable = immutable_plan(
         &plan,
@@ -86,7 +91,7 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
 
     let result = execute(
         runner,
-        &plan,
+        &plan.root,
         &transaction,
         &mut journal,
         &mut checkpoints,
@@ -118,10 +123,466 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn resume(
+    runner: &dyn GitRunner,
+    mut recovered: crate::transaction::recovery::Recovered,
+) -> Result<()> {
+    let mut checkpoints = Checkpoints::from_env()?;
+    match recovered.journal.progress {
+        Progress::Forward => {
+            let payload = raw_path(&recovered.journal.plan.decisions.payload_path)?;
+            let default = recovered
+                .journal
+                .plan
+                .decisions
+                .default_path
+                .as_ref()
+                .map(raw_path)
+                .transpose()?;
+            let pointer = payload_pointer(recovered.root.path(), &payload)?;
+            let guide = recovered.journal.plan.generated.guide.bytes.decode();
+            execute(
+                runner,
+                &recovered.root,
+                &recovered.transaction,
+                &mut recovered.journal,
+                &mut checkpoints,
+                &payload,
+                default.as_deref(),
+                &pointer,
+                &guide,
+            )
+        }
+        Progress::Committed => {
+            cleanup_transaction(&recovered.transaction)?;
+            sync_dir(recovered.root.path())
+        }
+        Progress::Aborting | Progress::Aborted => Err(GroveError::needs_decision(
+            "this adoption is aborting or aborted and cannot be continued",
+        )),
+    }
+}
+
+pub(super) fn abort(
+    runner: &dyn GitRunner,
+    mut recovered: crate::transaction::recovery::Recovered,
+) -> Result<()> {
+    let mut checkpoints = Checkpoints::from_env()?;
+    match recovered.journal.progress {
+        Progress::Committed => {
+            return Err(GroveError::needs_decision(
+                "a committed adoption cannot be aborted",
+            ))
+        }
+        Progress::Aborted => {
+            cleanup_transaction(&recovered.transaction)?;
+            return sync_dir(recovered.root.path());
+        }
+        Progress::Forward => {
+            normalize_pending_phase(
+                &mut recovered.journal,
+                &recovered.root,
+                &recovered.transaction,
+                &mut checkpoints,
+            )?;
+            set_progress(
+                &mut recovered.journal,
+                Progress::Aborting,
+                &recovered.transaction,
+                &mut checkpoints,
+            )?;
+        }
+        Progress::Aborting => {}
+    }
+
+    while let Some(index) = recovered
+        .journal
+        .operations
+        .iter()
+        .rposition(|operation| operation.state == OperationState::Done)
+    {
+        reverse_phase(
+            runner,
+            &recovered.journal.plan,
+            index,
+            recovered.root.path(),
+            recovered.transaction.path(),
+        )?;
+        mark_phase_reversed(
+            &mut recovered.journal,
+            index,
+            &recovered.transaction,
+            &mut checkpoints,
+        )?;
+    }
+    set_progress(
+        &mut recovered.journal,
+        Progress::Aborted,
+        &recovered.transaction,
+        &mut checkpoints,
+    )?;
+    cleanup_transaction(&recovered.transaction)?;
+    sync_dir(recovered.root.path())
+}
+
+fn normalize_pending_phase(
+    journal: &mut Journal,
+    root: &HeldDirectory,
+    transaction: &HeldDirectory,
+    checkpoints: &mut Checkpoints,
+) -> Result<()> {
+    let Some(index) = journal
+        .operations
+        .iter()
+        .position(|operation| operation.state == OperationState::Pending)
+    else {
+        return Ok(());
+    };
+    if phase_is_after(&journal.plan, index, root.path(), transaction.path())? {
+        finish_phase(journal, index, transaction, checkpoints)?;
+    }
+    Ok(())
+}
+
+fn phase_is_after(
+    plan: &ImmutablePlan,
+    index: usize,
+    root: &Path,
+    transaction: &Path,
+) -> Result<bool> {
+    let payload_relative = raw_path(&plan.decisions.payload_path)?;
+    let payload = root.join(&payload_relative);
+    let staging = transaction.join("payload");
+    let pointer = payload_pointer(root, &payload_relative)?;
+    let admin = pointer_admin(&pointer)?;
+    match index {
+        0 => real_directory(&staging),
+        1 => Ok(real_directory(&root.join(".bare"))?
+            && std::fs::read(root.join(".git")).ok().as_deref()
+                == Some(layout::POINTER_CONTENTS.as_bytes())),
+        2 => Ok(payload_top_level(plan)?
+            .iter()
+            .all(|name| staging.join(name).exists())),
+        3 => Ok(std::fs::read(payload.join(".git")).ok().as_deref() == Some(pointer.as_slice())),
+        4 => Ok(!path_exists(&staging)?
+            && !path_exists(&transaction.join("payload.git"))?
+            && std::fs::read(payload.join(".git")).ok().as_deref() == Some(pointer.as_slice())),
+        5 => {
+            for named in &plan.original.private_state {
+                if !blob_matches(&admin.join(named.path.to_path_buf()), &named.blob)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        6 => match &plan.decisions.default_path {
+            Some(path) => Ok(path_exists(&root.join(raw_path(path)?).join(".git"))?),
+            None => Ok(true),
+        },
+        7 => Ok(std::fs::read(root.join("AGENTS.md")).ok().as_deref()
+            == Some(plan.generated.guide.bytes.decode().as_slice())),
+        8 => {
+            if path_exists(&admin.join("locked"))? {
+                return Ok(false);
+            }
+            if let Some(default) = &plan.decisions.default_path {
+                let default_pointer = std::fs::read(root.join(raw_path(default)?).join(".git"))
+                    .map_err(|error| {
+                        GroveError::needs_decision(format!(
+                            "cannot inspect default worktree lock: {error}"
+                        ))
+                    })?;
+                if path_exists(&pointer_admin(&default_pointer)?.join("locked"))? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Err(GroveError::failure("unknown adoption phase")),
+    }
+}
+
+fn reverse_phase(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    index: usize,
+    root: &Path,
+    transaction: &Path,
+) -> Result<()> {
+    let bare = root.join(".bare");
+    let payload_relative = raw_path(&plan.decisions.payload_path)?;
+    let payload = root.join(&payload_relative);
+    let staging = transaction.join("payload");
+    let pointer = payload_pointer(root, &payload_relative)?;
+    let admin = pointer_admin(&pointer)?;
+    match index {
+        8 => Ok(()),
+        7 => remove_generated_guide(plan, root),
+        6 => remove_default_worktree(runner, plan, root, &bare),
+        5 => restore_private_state(runner, plan, &bare, &admin),
+        4 => stage_installed_payload(plan, root, transaction, &payload, &staging),
+        3 => remove_payload_registration(runner, &bare, &payload),
+        2 => restore_payload_entries(plan, root, &staging),
+        1 => restore_git_directory(plan, root, &bare),
+        0 => {
+            std::fs::remove_dir(&staging).map_err(|error| {
+                GroveError::needs_decision(format!(
+                    "cannot remove payload staging directory: {error}"
+                ))
+            })?;
+            sync_dir(transaction)
+        }
+        _ => Err(GroveError::failure("unknown adoption phase")),
+    }
+}
+
+fn remove_generated_guide(plan: &ImmutablePlan, root: &Path) -> Result<()> {
+    let agents = root.join("AGENTS.md");
+    if std::fs::read(&agents).map_err(|error| {
+        GroveError::needs_decision(format!("cannot verify generated AGENTS.md: {error}"))
+    })? != plan.generated.guide.bytes.decode()
+    {
+        return Err(GroveError::needs_decision(
+            "generated AGENTS.md was modified; refusing rollback",
+        ));
+    }
+    let claude = root.join("CLAUDE.md");
+    if std::fs::read_link(&claude).ok().as_deref() != Some(Path::new("AGENTS.md")) {
+        return Err(GroveError::needs_decision(
+            "generated CLAUDE.md link was modified; refusing rollback",
+        ));
+    }
+    std::fs::remove_file(&claude)
+        .and_then(|_| std::fs::remove_file(&agents))
+        .map_err(|error| GroveError::failure(format!("cannot remove generated guide: {error}")))?;
+    sync_dir(root)
+}
+
+fn remove_default_worktree(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    root: &Path,
+    bare: &Path,
+) -> Result<()> {
+    let Some(default_relative) = &plan.decisions.default_path else {
+        return Ok(());
+    };
+    let default = root.join(raw_path(default_relative)?);
+    if path_exists(&default)? {
+        let status = run_ok(
+            runner,
+            Invocation::new()
+                .cwd(&default)
+                .args(["status", "--porcelain", "-z"]),
+            "verify generated default worktree",
+        )?;
+        if !status.stdout.is_empty() {
+            return Err(GroveError::needs_decision(
+                "generated default worktree was modified; refusing rollback",
+            ));
+        }
+        unlock_if_locked(runner, bare, &default)?;
+        run_ok(
+            runner,
+            Invocation::new()
+                .git_dir(bare)
+                .args(["worktree", "remove", "--force", "--"])
+                .arg(&default),
+            "remove generated default worktree",
+        )?;
+    }
+    let mut local = b"refs/heads/".to_vec();
+    local.extend_from_slice(&plan.decisions.default_branch.decode());
+    let existed = plan
+        .original
+        .refs
+        .iter()
+        .any(|named| named.path.to_path_buf().as_os_str().as_bytes() == local);
+    if !existed {
+        run_ok(
+            runner,
+            Invocation::new()
+                .git_dir(bare)
+                .args(["update-ref", "-d", "--"])
+                .arg(OsString::from_vec(local)),
+            "remove generated local default branch",
+        )?;
+    }
+    Ok(())
+}
+
+fn restore_private_state(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    bare: &Path,
+    admin: &Path,
+) -> Result<()> {
+    for named in plan.original.private_state.iter().rev() {
+        let relative = named.path.to_path_buf();
+        let source = admin.join(&relative);
+        let destination = bare.join(&relative);
+        if blob_matches(&destination, &named.blob)? {
+            continue;
+        }
+        if !blob_matches(&source, &named.blob)? {
+            return Err(GroveError::needs_decision(format!(
+                "private state {} was modified; refusing rollback",
+                relative.as_os_str().as_bytes().escape_bytes()
+            )));
+        }
+        if path_exists(&destination)? {
+            let removable = relative == Path::new("HEAD")
+                || (relative == Path::new("config.worktree")
+                    && config_bool(runner, &destination, "core.bare")?);
+            if !removable {
+                return Err(GroveError::needs_decision(format!(
+                    "private-state destination {} is unexpectedly occupied",
+                    relative.as_os_str().as_bytes().escape_bytes()
+                )));
+            }
+            std::fs::remove_file(&destination).map_err(|error| {
+                GroveError::failure(format!("cannot remove generated private state: {error}"))
+            })?;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                GroveError::failure(format!("cannot restore private-state parent: {error}"))
+            })?;
+        }
+        std::fs::rename(&source, &destination).map_err(|error| {
+            GroveError::failure(format!("cannot restore private state: {error}"))
+        })?;
+    }
+    restore_blob(&bare.join("config"), &plan.original.config)?;
+    sync_dir(bare)
+}
+
+fn stage_installed_payload(
+    plan: &ImmutablePlan,
+    root: &Path,
+    transaction: &Path,
+    payload: &Path,
+    staging: &Path,
+) -> Result<()> {
+    verify_manifest_roots(plan, payload)?;
+    let aside = transaction.join("payload.git");
+    std::fs::rename(payload.join(".git"), &aside)
+        .map_err(|error| GroveError::failure(format!("cannot stage payload pointer: {error}")))?;
+    std::fs::rename(payload, staging)
+        .map_err(|error| GroveError::failure(format!("cannot restage payload: {error}")))?;
+    std::fs::create_dir(payload).map_err(|error| {
+        GroveError::failure(format!(
+            "cannot recreate generated payload directory: {error}"
+        ))
+    })?;
+    std::fs::rename(&aside, payload.join(".git")).map_err(|error| {
+        GroveError::failure(format!("cannot restore generated payload pointer: {error}"))
+    })?;
+    sync_dir(root)
+}
+
+fn remove_payload_registration(runner: &dyn GitRunner, bare: &Path, payload: &Path) -> Result<()> {
+    unlock_if_locked(runner, bare, payload)?;
+    run_ok(
+        runner,
+        Invocation::new()
+            .git_dir(bare)
+            .args(["worktree", "remove", "--force", "--"])
+            .arg(payload),
+        "remove generated payload registration",
+    )?;
+    Ok(())
+}
+
+fn restore_payload_entries(plan: &ImmutablePlan, root: &Path, staging: &Path) -> Result<()> {
+    for name in payload_top_level(plan)? {
+        let source = staging.join(&name);
+        let destination = root.join(&name);
+        if path_exists(&destination)? || !path_exists(&source)? {
+            return Err(GroveError::needs_decision(format!(
+                "cannot safely restore payload entry {}",
+                name.as_bytes().escape_bytes()
+            )));
+        }
+        std::fs::rename(&source, &destination).map_err(|error| {
+            GroveError::failure(format!("cannot restore payload entry: {error}"))
+        })?;
+    }
+    sync_dir(root)
+}
+
+fn restore_git_directory(plan: &ImmutablePlan, root: &Path, bare: &Path) -> Result<()> {
+    restore_blob(&bare.join("config"), &plan.original.config)?;
+    let pointer = root.join(".git");
+    if std::fs::read(&pointer).ok().as_deref() != Some(layout::POINTER_CONTENTS.as_bytes()) {
+        return Err(GroveError::needs_decision(
+            "root .git pointer was modified; refusing rollback",
+        ));
+    }
+    std::fs::remove_file(&pointer).map_err(|error| {
+        GroveError::failure(format!("cannot remove root .git pointer: {error}"))
+    })?;
+    std::fs::rename(bare, &pointer)
+        .map_err(|error| GroveError::failure(format!("cannot restore .git directory: {error}")))?;
+    sync_dir(root)
+}
+
+fn verify_manifest_roots(plan: &ImmutablePlan, payload: &Path) -> Result<()> {
+    for name in payload_top_level(plan)? {
+        if !path_exists(&payload.join(name))? {
+            return Err(GroveError::needs_decision(
+                "payload contents changed; refusing rollback",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_blob(path: &Path, proof: &BlobProof) -> Result<()> {
+    if blob_matches(path, proof)? {
+        return Ok(());
+    }
+    crate::fsx::write_atomic(path, &proof.bytes.decode())?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(proof.mode & 0o7777))
+        .map_err(|error| GroveError::failure(format!("cannot restore file mode: {error}")))
+}
+
+fn mark_phase_reversed(
+    journal: &mut Journal,
+    index: usize,
+    transaction: &HeldDirectory,
+    checkpoints: &mut Checkpoints,
+) -> Result<()> {
+    checkpoints.checkpoint()?;
+    let mut next = journal.clone();
+    next.generation += 1;
+    next.operations[index].state = OperationState::Pending;
+    journal.validate_next(&next)?;
+    durable_replace(transaction, &next, checkpoints)?;
+    *journal = next;
+    Ok(())
+}
+
+fn set_progress(
+    journal: &mut Journal,
+    progress: Progress,
+    transaction: &HeldDirectory,
+    checkpoints: &mut Checkpoints,
+) -> Result<()> {
+    let mut next = journal.clone();
+    next.generation += 1;
+    next.progress = progress;
+    journal.validate_next(&next)?;
+    durable_replace(transaction, &next, checkpoints)?;
+    *journal = next;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute(
     runner: &dyn GitRunner,
-    plan: &AdoptPlan,
+    root_directory: &HeldDirectory,
     transaction: &HeldDirectory,
     journal: &mut Journal,
     checkpoints: &mut Checkpoints,
@@ -130,216 +591,96 @@ fn execute(
     predicted_pointer: &[u8],
     guide: &[u8],
 ) -> Result<()> {
-    let root = plan.root.path();
+    let immutable = journal.plan.clone();
+    let plan = &immutable;
+    let root = root_directory.path();
     let bare = root.join(".bare");
     let staging = transaction.path().join("payload");
 
-    std::fs::create_dir(&staging).map_err(|error| {
-        GroveError::failure(format!("cannot create payload staging directory: {error}"))
-    })?;
-    sync_dir(transaction.path())?;
-    finish_phase(journal, 0, transaction, checkpoints)?;
-
-    std::fs::rename(root.join(".git"), &bare)
-        .map_err(|error| GroveError::failure(format!("cannot rename .git to .bare: {error}")))?;
-    sync_dir(root)?;
-    crate::fsx::write_atomic_if_absent(&root.join(".git"), layout::POINTER_CONTENTS.as_bytes())?;
-    unset_layout(runner, &bare.join("config"))?;
-    run_ok(
-        runner,
-        Invocation::new().args([
-            OsStr::new("config"),
-            OsStr::new("--file"),
-            bare.join("config").as_os_str(),
-            OsStr::new("core.bare"),
-            OsStr::new("true"),
-        ]),
-        "mark converted repository bare",
-    )?;
-    let bare_check = run_ok(
-        runner,
-        Invocation::new()
-            .git_dir(&bare)
-            .args(["rev-parse", "--is-bare-repository"]),
-        "verify bare conversion",
-    )?;
-    if bare_check.stdout != b"true\n" || !bare_check.stderr.is_empty() {
-        return Err(GroveError::needs_decision(
-            "Git did not verify the converted repository as warning-free and bare",
-        ));
+    if pending(journal, 0) {
+        match std::fs::symlink_metadata(&staging) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(GroveError::needs_decision(
+                    "payload staging path is no longer a real directory",
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&staging).map_err(|error| {
+                    GroveError::failure(format!("cannot create payload staging directory: {error}"))
+                })?;
+            }
+            Err(error) => {
+                return Err(GroveError::failure(format!(
+                    "cannot inspect payload staging directory: {error}"
+                )))
+            }
+        }
+        sync_dir(transaction.path())?;
+        finish_phase(journal, 0, transaction, checkpoints)?;
     }
-    finish_phase(journal, 1, transaction, checkpoints)?;
 
-    for name in payload_top_level(plan)? {
-        std::fs::rename(root.join(&name), staging.join(&name)).map_err(|error| {
-            GroveError::failure(format!(
-                "cannot stage payload entry {}: {error}",
-                name.as_bytes().escape_bytes()
-            ))
-        })?;
-        sync_dir(root)?;
-        sync_dir(&staging)?;
+    if pending(journal, 1) {
+        install_bare_repository(runner, journal, root, &bare)?;
+        finish_phase(journal, 1, transaction, checkpoints)?;
     }
-    finish_phase(journal, 2, transaction, checkpoints)?;
 
-    create_parents(root, payload_relative)?;
+    if pending(journal, 2) {
+        stage_payload(plan, root, &staging)?;
+        finish_phase(journal, 2, transaction, checkpoints)?;
+    }
+
     let payload_path = root.join(payload_relative);
     let reason = format!("git-grove adopt transaction {}", hex(&journal.nonce));
-    let mut invocation = Invocation::new().git_dir(&bare);
-    match &plan.decisions.payload_head {
-        HeadProof::Attached { branch } => {
-            invocation = invocation
-                .args(["worktree", "add", "--no-checkout", "--lock", "--reason"])
-                .arg(&reason)
-                .arg("--")
-                .arg(&payload_path)
-                .arg(branch.as_os_string());
-        }
-        HeadProof::Detached { oid } => {
-            invocation = invocation
-                .args([
-                    "worktree",
-                    "add",
-                    "--detach",
-                    "--no-checkout",
-                    "--lock",
-                    "--reason",
-                ])
-                .arg(&reason)
-                .arg("--")
-                .arg(&payload_path)
-                .arg(oid.as_os_string());
-        }
+    if pending(journal, 3) {
+        create_payload_worktree(
+            runner,
+            plan,
+            root,
+            &bare,
+            &payload_path,
+            &reason,
+            predicted_pointer,
+        )?;
+        finish_phase(journal, 3, transaction, checkpoints)?;
     }
-    run_ok(runner, invocation, "create payload worktree")?;
-    let generated_pointer = std::fs::read(payload_path.join(".git")).map_err(|error| {
-        GroveError::failure(format!("cannot read generated payload pointer: {error}"))
-    })?;
-    if generated_pointer != predicted_pointer {
-        return Err(GroveError::needs_decision(
-            "Git generated an unexpected payload administrative path",
-        ));
-    }
-    finish_phase(journal, 3, transaction, checkpoints)?;
+    let generated_pointer = predicted_pointer.to_vec();
 
-    let pointer_aside = transaction.path().join("payload.git");
-    std::fs::rename(payload_path.join(".git"), &pointer_aside).map_err(|error| {
-        GroveError::failure(format!(
-            "cannot preserve generated payload pointer: {error}"
-        ))
-    })?;
-    std::fs::remove_dir(&payload_path).map_err(|error| {
-        GroveError::failure(format!(
-            "generated payload directory was not empty: {error}"
-        ))
-    })?;
-    std::fs::rename(&staging, &payload_path)
-        .map_err(|error| GroveError::failure(format!("cannot install staged payload: {error}")))?;
-    std::fs::rename(&pointer_aside, payload_path.join(".git"))
-        .map_err(|error| GroveError::failure(format!("cannot install payload pointer: {error}")))?;
-    sync_dir(root)?;
-    sync_dir(&payload_path)?;
-    finish_phase(journal, 4, transaction, checkpoints)?;
+    if pending(journal, 4) {
+        install_payload(
+            transaction.path(),
+            root,
+            &staging,
+            &payload_path,
+            predicted_pointer,
+        )?;
+        finish_phase(journal, 4, transaction, checkpoints)?;
+    }
 
     let admin = pointer_admin(&generated_pointer)?;
-    let worktree_config = config_bool(runner, &bare.join("config"), "extensions.worktreeConfig")?;
-    migrate_private_state(runner, plan, &bare, &admin)?;
-    if worktree_config {
-        unset_layout(runner, &bare.join("config"))?;
-        run_ok(
-            runner,
-            Invocation::new()
-                .args(["config", "--file"])
-                .arg(bare.join("config.worktree"))
-                .args(["core.bare", "true"]),
-            "mark the bare main worktree configuration",
-        )?;
+    if pending(journal, 5) {
+        install_private_state(runner, plan, &bare, &admin, &payload_path)?;
+        finish_phase(journal, 5, transaction, checkpoints)?;
     }
-    write_bare_head(&bare, &plan.decisions.default_branch)?;
-    verify_payload_snapshots(runner, plan, &payload_path)?;
-    finish_phase(journal, 5, transaction, checkpoints)?;
 
-    if let Some(default_relative) = default_relative {
-        create_parents(root, default_relative)?;
-        let default_path = root.join(default_relative);
-        let default = plan.decisions.default_branch.as_os_string();
-        let mut local_ref = OsString::from("refs/heads/");
-        local_ref.push(&default);
-        let local = runner.run(
-            Invocation::new()
-                .git_dir(&bare)
-                .args(["show-ref", "--verify", "--quiet"])
-                .arg(&local_ref),
-        )?;
-        let mut add = Invocation::new()
-            .git_dir(&bare)
-            .args(["worktree", "add", "--lock", "--reason"])
-            .arg(&reason);
-        if local.status == 0 {
-            add = add.arg("--").arg(&default_path).arg(&default);
-        } else if local.status == 1 {
-            let remote = plan.decisions.selected_remote.as_ref().ok_or_else(|| {
-                GroveError::needs_decision("remote-only default branch has no selected remote")
-            })?;
-            let mut tracking = remote.as_os_string();
-            tracking.push("/");
-            tracking.push(&default);
-            add = add
-                .args(["--track", "-b"])
-                .arg(&default)
-                .arg("--")
-                .arg(&default_path)
-                .arg(tracking);
-        } else {
-            return Err(GroveError::failure(
-                "cannot determine whether the default branch is local",
-            ));
+    if pending(journal, 6) {
+        install_default_worktree(runner, plan, root, &bare, default_relative, &reason)?;
+        finish_phase(journal, 6, transaction, checkpoints)?;
+    }
+
+    if pending(journal, 7) {
+        install_metadata(runner, plan, root, guide)?;
+        finish_phase(journal, 7, transaction, checkpoints)?;
+    }
+
+    if pending(journal, 8) {
+        verify_payload_snapshots(runner, plan, &payload_path)?;
+        unlock_if_locked(runner, &bare, &payload_path)?;
+        if let Some(default) = default_relative {
+            unlock_if_locked(runner, &bare, &root.join(default))?;
         }
-        run_ok(runner, add, "create default worktree")?;
+        finish_phase(journal, 8, transaction, checkpoints)?;
     }
-    run_ok(
-        runner,
-        Invocation::new()
-            .git_dir(&bare)
-            .args(["config", "worktree.guessRemote", "true"]),
-        "enable worktree remote guessing",
-    )?;
-    finish_phase(journal, 6, transaction, checkpoints)?;
-
-    let grove = Grove {
-        root: root.to_path_buf(),
-    };
-    let remote = plan
-        .decisions
-        .selected_remote
-        .as_ref()
-        .map(|value| BString::from(value.decode()));
-    metadata::write(
-        runner,
-        &grove,
-        &Metadata {
-            version: Some(FORMAT_VERSION),
-            default_branch: Some(BString::from(plan.decisions.default_branch.decode())),
-            remote: remote.clone(),
-            publish_state: if remote.is_some() {
-                PublishState::Published
-            } else {
-                PublishState::Unpublished
-            },
-            publish_remote: None,
-            publish_url: None,
-        },
-    )?;
-    crate::fsx::write_atomic_if_absent(&root.join("AGENTS.md"), guide)?;
-    crate::fsx::symlink_relative(&root.join("CLAUDE.md"), "AGENTS.md")?;
-    finish_phase(journal, 7, transaction, checkpoints)?;
-
-    verify_payload_snapshots(runner, plan, &payload_path)?;
-    unlock(runner, &bare, &payload_path)?;
-    if let Some(default) = default_relative {
-        unlock(runner, &bare, &root.join(default))?;
-    }
-    finish_phase(journal, 8, transaction, checkpoints)?;
     let mut committed = journal.clone();
     committed.generation += 1;
     committed.progress = Progress::Committed;
@@ -452,7 +793,345 @@ fn finish_phase(
     Ok(())
 }
 
-fn payload_top_level(plan: &AdoptPlan) -> Result<Vec<OsString>> {
+fn pending(journal: &Journal, index: usize) -> bool {
+    journal.operations[index].state == OperationState::Pending
+}
+
+fn install_bare_repository(
+    runner: &dyn GitRunner,
+    journal: &Journal,
+    root: &Path,
+    bare: &Path,
+) -> Result<()> {
+    let git = root.join(".git");
+    let bare_exists = real_directory(bare)?;
+    let git_is_directory = real_directory(&git)?;
+    if !bare_exists && git_is_directory {
+        let held = HeldDirectory::open(&git)?;
+        if !crate::transaction::recovery::same_held_identity(
+            held.identity()?,
+            journal.plan.original.repository_identity,
+        ) {
+            return Err(GroveError::needs_decision(
+                "the original .git directory no longer matches the journal",
+            ));
+        }
+        std::fs::rename(&git, bare).map_err(|error| {
+            GroveError::failure(format!("cannot rename .git to .bare: {error}"))
+        })?;
+        sync_dir(root)?;
+    } else if !bare_exists || git_is_directory {
+        return Err(GroveError::needs_decision(
+            "repository is at neither the exact pre-conversion nor converted layout",
+        ));
+    }
+    let held_bare = HeldDirectory::open(bare)?;
+    if !crate::transaction::recovery::same_held_identity(
+        held_bare.identity()?,
+        journal.plan.original.repository_identity,
+    ) {
+        return Err(GroveError::needs_decision(
+            "the converted .bare directory no longer matches the original .git inode",
+        ));
+    }
+    match std::fs::read(&git) {
+        Ok(bytes) if bytes == layout::POINTER_CONTENTS.as_bytes() => {}
+        Ok(_) => {
+            return Err(GroveError::needs_decision(
+                "the root .git pointer was replaced",
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::fsx::write_atomic_if_absent(&git, layout::POINTER_CONTENTS.as_bytes())?;
+        }
+        Err(error) => {
+            return Err(GroveError::failure(format!(
+                "cannot inspect the root .git pointer: {error}"
+            )))
+        }
+    }
+    unset_layout(runner, &bare.join("config"))?;
+    run_ok(
+        runner,
+        Invocation::new().args([
+            OsStr::new("config"),
+            OsStr::new("--file"),
+            bare.join("config").as_os_str(),
+            OsStr::new("core.bare"),
+            OsStr::new("true"),
+        ]),
+        "mark converted repository bare",
+    )?;
+    let bare_check = run_ok(
+        runner,
+        Invocation::new()
+            .git_dir(bare)
+            .args(["rev-parse", "--is-bare-repository"]),
+        "verify bare conversion",
+    )?;
+    if bare_check.stdout != b"true\n" || !bare_check.stderr.is_empty() {
+        return Err(GroveError::needs_decision(
+            "Git did not verify the converted repository as warning-free and bare",
+        ));
+    }
+    Ok(())
+}
+
+fn stage_payload(plan: &ImmutablePlan, root: &Path, staging: &Path) -> Result<()> {
+    for name in payload_top_level(plan)? {
+        let source = root.join(&name);
+        let destination = staging.join(&name);
+        match (path_exists(&source)?, path_exists(&destination)?) {
+            (true, false) => {
+                std::fs::rename(&source, &destination).map_err(|error| {
+                    GroveError::failure(format!(
+                        "cannot stage payload entry {}: {error}",
+                        name.as_bytes().escape_bytes()
+                    ))
+                })?;
+                sync_dir(root)?;
+                sync_dir(staging)?;
+            }
+            (false, true) => {}
+            _ => {
+                return Err(GroveError::needs_decision(format!(
+                    "payload entry {} is at neither its exact before nor after location",
+                    name.as_bytes().escape_bytes()
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_payload_worktree(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    root: &Path,
+    bare: &Path,
+    payload_path: &Path,
+    reason: &str,
+    expected_pointer: &[u8],
+) -> Result<()> {
+    if !path_exists(payload_path)? {
+        create_parents(
+            root,
+            payload_path.strip_prefix(root).unwrap_or(payload_path),
+        )?;
+        let mut invocation = Invocation::new().git_dir(bare);
+        match &plan.decisions.payload_head {
+            HeadProof::Attached { branch } => {
+                invocation = invocation
+                    .args(["worktree", "add", "--no-checkout", "--lock", "--reason"])
+                    .arg(reason)
+                    .arg("--")
+                    .arg(payload_path)
+                    .arg(branch.as_os_string());
+            }
+            HeadProof::Detached { oid } => {
+                invocation = invocation
+                    .args([
+                        "worktree",
+                        "add",
+                        "--detach",
+                        "--no-checkout",
+                        "--lock",
+                        "--reason",
+                    ])
+                    .arg(reason)
+                    .arg("--")
+                    .arg(payload_path)
+                    .arg(oid.as_os_string());
+            }
+        }
+        run_ok(runner, invocation, "create payload worktree")?;
+    }
+    let generated = std::fs::read(payload_path.join(".git")).map_err(|error| {
+        GroveError::needs_decision(format!("cannot verify generated payload pointer: {error}"))
+    })?;
+    if generated != expected_pointer {
+        return Err(GroveError::needs_decision(
+            "Git generated an unexpected payload administrative path",
+        ));
+    }
+    Ok(())
+}
+
+fn install_payload(
+    transaction: &Path,
+    root: &Path,
+    staging: &Path,
+    payload: &Path,
+    expected_pointer: &[u8],
+) -> Result<()> {
+    let aside = transaction.join("payload.git");
+    if path_exists(staging)? && path_exists(&payload.join(".git"))? && !path_exists(&aside)? {
+        std::fs::rename(payload.join(".git"), &aside).map_err(|error| {
+            GroveError::failure(format!(
+                "cannot preserve generated payload pointer: {error}"
+            ))
+        })?;
+    }
+    if path_exists(&aside)? && path_exists(payload)? {
+        std::fs::remove_dir(payload).map_err(|error| {
+            GroveError::needs_decision(format!(
+                "generated payload directory was not empty: {error}"
+            ))
+        })?;
+    }
+    if path_exists(staging)? && !path_exists(payload)? {
+        std::fs::rename(staging, payload).map_err(|error| {
+            GroveError::failure(format!("cannot install staged payload: {error}"))
+        })?;
+    }
+    if path_exists(&aside)? && !path_exists(&payload.join(".git"))? {
+        std::fs::rename(&aside, payload.join(".git")).map_err(|error| {
+            GroveError::failure(format!("cannot install payload pointer: {error}"))
+        })?;
+    }
+    if path_exists(staging)?
+        || path_exists(&aside)?
+        || std::fs::read(payload.join(".git")).ok().as_deref() != Some(expected_pointer)
+    {
+        return Err(GroveError::needs_decision(
+            "payload replacement is at neither its exact before nor after state",
+        ));
+    }
+    sync_dir(root)?;
+    sync_dir(payload)
+}
+
+fn install_private_state(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    bare: &Path,
+    admin: &Path,
+    payload: &Path,
+) -> Result<()> {
+    let worktree_config = config_bool(runner, &bare.join("config"), "extensions.worktreeConfig")?;
+    migrate_private_state(runner, plan, bare, admin)?;
+    if worktree_config {
+        unset_layout(runner, &bare.join("config"))?;
+        run_ok(
+            runner,
+            Invocation::new()
+                .args(["config", "--file"])
+                .arg(bare.join("config.worktree"))
+                .args(["core.bare", "true"]),
+            "mark the bare main worktree configuration",
+        )?;
+    }
+    write_bare_head(bare, &plan.decisions.default_branch)?;
+    verify_payload_snapshots(runner, plan, payload)
+}
+
+fn install_default_worktree(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    root: &Path,
+    bare: &Path,
+    default_relative: Option<&Path>,
+    reason: &str,
+) -> Result<()> {
+    if let Some(default_relative) = default_relative {
+        create_parents(root, default_relative)?;
+        let default_path = root.join(default_relative);
+        if !path_exists(&default_path.join(".git"))? {
+            if path_exists(&default_path)? {
+                return Err(GroveError::needs_decision(
+                    "default worktree path is occupied by partial or foreign state",
+                ));
+            }
+            let default = plan.decisions.default_branch.as_os_string();
+            let mut local_ref = OsString::from("refs/heads/");
+            local_ref.push(&default);
+            let local = runner.run(
+                Invocation::new()
+                    .git_dir(bare)
+                    .args(["show-ref", "--verify", "--quiet"])
+                    .arg(&local_ref),
+            )?;
+            let mut add = Invocation::new()
+                .git_dir(bare)
+                .args(["worktree", "add", "--lock", "--reason"])
+                .arg(reason);
+            if local.status == 0 {
+                add = add.arg("--").arg(&default_path).arg(&default);
+            } else if local.status == 1 {
+                let remote = plan.decisions.selected_remote.as_ref().ok_or_else(|| {
+                    GroveError::needs_decision("remote-only default branch has no selected remote")
+                })?;
+                let mut tracking = remote.as_os_string();
+                tracking.push("/");
+                tracking.push(&default);
+                add = add
+                    .args(["--track", "-b"])
+                    .arg(&default)
+                    .arg("--")
+                    .arg(&default_path)
+                    .arg(tracking);
+            } else {
+                return Err(GroveError::failure(
+                    "cannot determine whether the default branch is local",
+                ));
+            }
+            run_ok(runner, add, "create default worktree")?;
+        }
+    }
+    run_ok(
+        runner,
+        Invocation::new()
+            .git_dir(bare)
+            .args(["config", "worktree.guessRemote", "true"]),
+        "enable worktree remote guessing",
+    )?;
+    Ok(())
+}
+
+fn install_metadata(
+    runner: &dyn GitRunner,
+    plan: &ImmutablePlan,
+    root: &Path,
+    guide: &[u8],
+) -> Result<()> {
+    let grove = Grove {
+        root: root.to_path_buf(),
+    };
+    let remote = plan
+        .decisions
+        .selected_remote
+        .as_ref()
+        .map(|value| BString::from(value.decode()));
+    metadata::write(
+        runner,
+        &grove,
+        &Metadata {
+            version: Some(FORMAT_VERSION),
+            default_branch: Some(BString::from(plan.decisions.default_branch.decode())),
+            remote: remote.clone(),
+            publish_state: if remote.is_some() {
+                PublishState::Published
+            } else {
+                PublishState::Unpublished
+            },
+            publish_remote: None,
+            publish_url: None,
+        },
+    )?;
+    if crate::fsx::write_atomic_if_absent(&root.join("AGENTS.md"), guide)? {
+        // The helper durably installed the planned bytes.
+    } else if std::fs::read(root.join("AGENTS.md")).map_err(|error| {
+        GroveError::failure(format!("cannot verify generated AGENTS.md: {error}"))
+    })? != guide
+    {
+        return Err(GroveError::needs_decision(
+            "the generated AGENTS.md was changed during adoption",
+        ));
+    }
+    crate::fsx::symlink_relative(&root.join("CLAUDE.md"), "AGENTS.md")
+}
+
+fn payload_top_level(plan: &ImmutablePlan) -> Result<Vec<OsString>> {
     let mut names = BTreeSet::new();
     for entry in &plan.original.payload_manifest {
         let path = entry.path.to_path_buf();
@@ -467,17 +1146,23 @@ fn payload_top_level(plan: &AdoptPlan) -> Result<Vec<OsString>> {
 
 fn migrate_private_state(
     runner: &dyn GitRunner,
-    plan: &AdoptPlan,
+    plan: &ImmutablePlan,
     bare: &Path,
     admin: &Path,
 ) -> Result<()> {
     for named in &plan.original.private_state {
         let relative = named.path.to_path_buf();
         let source = bare.join(&relative);
-        if !source.exists() {
+        let destination = admin.join(&relative);
+        if blob_matches(&destination, &named.blob)? {
             continue;
         }
-        let destination = admin.join(&relative);
+        if !blob_matches(&source, &named.blob)? {
+            return Err(GroveError::needs_decision(format!(
+                "private state {} is at neither its exact source nor destination",
+                relative.as_os_str().as_bytes().escape_bytes()
+            )));
+        }
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 GroveError::failure(format!("cannot create private-state parent: {error}"))
@@ -545,7 +1230,7 @@ fn write_bare_head(bare: &Path, branch: &RawBytes) -> Result<()> {
 
 fn verify_payload_snapshots(
     runner: &dyn GitRunner,
-    plan: &AdoptPlan,
+    plan: &ImmutablePlan,
     payload: &Path,
 ) -> Result<()> {
     for (args, expected, description) in [
@@ -587,16 +1272,11 @@ fn verify_payload_snapshots(
     Ok(())
 }
 
-fn predicted_payload_pointer(root: &Path, payload: &Path) -> Result<Vec<u8>> {
+fn payload_pointer(root: &Path, payload: &Path) -> Result<Vec<u8>> {
     let id = payload
         .file_name()
         .ok_or_else(|| GroveError::usage("payload path has no final component"))?;
     let admin = root.join(".bare/worktrees").join(id);
-    if admin.exists() {
-        return Err(GroveError::needs_decision(
-            "the predicted payload administrative directory already exists",
-        ));
-    }
     let mut bytes = b"gitdir: ".to_vec();
     bytes.extend_from_slice(admin.as_os_str().as_bytes());
     bytes.push(b'\n');
@@ -669,6 +1349,19 @@ fn unlock(runner: &dyn GitRunner, bare: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn unlock_if_locked(runner: &dyn GitRunner, bare: &Path, path: &Path) -> Result<()> {
+    let pointer = std::fs::read(path.join(".git")).map_err(|error| {
+        GroveError::needs_decision(format!(
+            "cannot read worktree pointer before unlock: {error}"
+        ))
+    })?;
+    let admin = pointer_admin(&pointer)?;
+    if path_exists(&admin.join("locked"))? {
+        unlock(runner, bare, path)?;
+    }
+    Ok(())
+}
+
 fn run_ok(runner: &dyn GitRunner, invocation: Invocation, action: &str) -> Result<GitOutput> {
     let output = runner.run(invocation)?;
     if output.ok() {
@@ -687,6 +1380,39 @@ fn sync_dir(path: &Path) -> Result<()> {
     std::fs::File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| GroveError::failure(format!("cannot fsync {}: {error}", path.display())))
+}
+
+fn path_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GroveError::failure(format!(
+            "cannot inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn real_directory(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GroveError::failure(format!(
+            "cannot inspect {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn blob_matches(path: &Path, proof: &BlobProof) -> Result<bool> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(sha256(&bytes) == proof.sha256),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(GroveError::failure(format!(
+            "cannot verify {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn cleanup_transaction(transaction: &HeldDirectory) -> Result<()> {

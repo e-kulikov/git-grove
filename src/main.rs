@@ -105,6 +105,7 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
             let _lock = fsx::lock::GroveLock::acquire_path(
                 &grove.bare_dir(),
                 fsx::lock::LockMode::Exclusive,
@@ -123,6 +124,7 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
             let _lock = fsx::lock::GroveLock::acquire_path(
                 &grove.bare_dir(),
                 fsx::lock::LockMode::Shared,
@@ -149,6 +151,7 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
             let _lock = fsx::lock::GroveLock::acquire_path(
                 &grove.bare_dir(),
                 fsx::lock::LockMode::Exclusive,
@@ -188,6 +191,7 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
             let _lock = fsx::lock::GroveLock::acquire_path(
                 &grove.bare_dir(),
                 fsx::lock::LockMode::Exclusive,

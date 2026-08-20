@@ -330,6 +330,7 @@ pub struct AdoptDecisionsProof {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OriginalEvidence {
+    pub repository_identity: FileIdentity,
     pub worktree_list_porcelain_z: ByteSnapshot,
     pub status_porcelain_v2_z: ByteSnapshot,
     pub ls_files_stage_z: ByteSnapshot,
@@ -952,6 +953,7 @@ mod tests {
     fn journal() -> Journal {
         let path = || ValidatedBytePath::component(b"file").unwrap();
         let original = OriginalEvidence {
+            repository_identity: identity(9),
             worktree_list_porcelain_z: snapshot(),
             status_porcelain_v2_z: snapshot(),
             ls_files_stage_z: snapshot(),

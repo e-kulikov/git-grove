@@ -194,6 +194,7 @@ pub fn plan(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<Adop
         .with_detail(detail));
     }
     let original = OriginalEvidence {
+        repository_identity: git.original_identity(),
         worktree_list_porcelain_z: worktrees,
         status_porcelain_v2_z: status,
         ls_files_stage_z: stages,

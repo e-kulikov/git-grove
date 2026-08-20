@@ -269,6 +269,7 @@ mod tests {
                     default_path: None,
                 },
                 original: OriginalEvidence {
+                    repository_identity: identity(),
                     worktree_list_porcelain_z: snapshot(),
                     status_porcelain_v2_z: snapshot(),
                     ls_files_stage_z: snapshot(),
