@@ -114,3 +114,43 @@ jobs:
         run: |
           set -euo pipefail
           cargo "+$BUILD_TOOLCHAIN" test --all-targets --locked
+
+  failpoints:
+    name: failpoints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends git
+          git version
+
+      - name: Install the test toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$BUILD_TOOLCHAIN" --profile minimal
+
+      # A separate cache: the feature changes the compiled artifacts, so sharing the
+      # `build` key with clippy and test would evict their entries on every run.
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: failpoints
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      # The recovery tests in tests/failure_matrix.rs are gated behind
+      # `#[cfg(feature = "failpoints")]`, so the default suite compiles the file and
+      # silently drops every injection case. Without this job, nothing in CI proves that
+      # `adopt` recovers from an interruption at any checkpoint.
+      - name: Run the test suite with failure injection
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$BUILD_TOOLCHAIN" test --all-targets --locked --features failpoints
