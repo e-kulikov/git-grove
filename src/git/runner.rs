@@ -197,6 +197,7 @@ impl GitRunner for RealGit {
             cmd.env(key, value);
         }
         let mut child = cmd
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -451,6 +452,26 @@ mod tests {
         assert_eq!(output.status, 0);
         assert_eq!(output.stdout.len(), 131_072);
         assert_eq!(output.stderr.len(), 131_072);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_closes_child_stdin_so_git_never_blocks_on_a_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("stdin-probe");
+        std::fs::write(&script, b"#!/bin/sh\nreadlink /proc/self/fd/0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = RealGit::with_program(script)
+            .run(Invocation::new())
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "/dev/null",
+            "a spawned git child must never inherit stdin, or an interactive prompt (credentials, passphrase, editor) would hang it"
+        );
     }
 
     #[cfg(unix)]

@@ -69,9 +69,12 @@ impl MountTable {
             .filter(move |entry| entry.mountpoint.starts_with(root))
     }
 
-    pub fn ensure_no_boundary_at_or_below(&self, root: &HeldDirectory) -> Result<()> {
+    pub fn ensure_no_boundary_below(&self, root: &HeldDirectory) -> Result<()> {
         let kernel_path = root.kernel_path()?;
-        if let Some(entry) = self.at_or_below(&kernel_path).next() {
+        if let Some(entry) = self
+            .at_or_below(&kernel_path)
+            .find(|entry| entry.mountpoint != kernel_path)
+        {
             return Err(GroveError::needs_decision(format!(
                 "mount boundary at {} prevents safe adoption",
                 entry.mountpoint.display()
@@ -159,5 +162,30 @@ mod tests {
     fn live_mountinfo_parser_smoke() {
         let table = MountTable::read_live().unwrap();
         assert!(table.longest_enclosing(Path::new("/proc/self")).is_some());
+    }
+
+    #[test]
+    fn a_root_that_is_itself_a_mountpoint_is_not_a_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let held = HeldDirectory::open(root.path()).unwrap();
+        let kernel_path = held.kernel_path().unwrap();
+
+        let at_root = MountTable {
+            entries: vec![MountEntry {
+                id: 1,
+                parent_id: 0,
+                mountpoint: kernel_path.clone(),
+            }],
+        };
+        at_root.ensure_no_boundary_below(&held).unwrap();
+
+        let below_root = MountTable {
+            entries: vec![MountEntry {
+                id: 1,
+                parent_id: 0,
+                mountpoint: kernel_path.join("nested"),
+            }],
+        };
+        assert!(below_root.ensure_no_boundary_below(&held).is_err());
     }
 }

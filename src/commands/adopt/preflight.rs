@@ -74,7 +74,7 @@ pub fn plan(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<Adop
         GroveLock::acquire_path(&git_path, LockMode::Exclusive, "git grove adopt")?;
     crate::transaction::signal::activate()?;
     let git = repository_lock.directory();
-    MountTable::read_live()?.ensure_no_boundary_at_or_below(&root)?;
+    MountTable::read_live()?.ensure_no_boundary_below(&root)?;
 
     let worktrees = snapshot(
         runner,
