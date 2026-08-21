@@ -9,7 +9,7 @@ fn reports_its_version() {
         .grove(&["--version"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("git-grove 0.3.0"));
+        .stdout(predicates::str::contains("git-grove 0.4.0"));
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn tend_dispatches_identically_to_sync() {
 }
 
 #[test]
-fn emits_sync_and_tend_in_runtime_completion() {
+fn emits_all_lifecycle_commands_and_public_aliases_in_runtime_completion() {
     let sandbox = Sandbox::new();
     for shell in ["zsh", "bash", "fish"] {
         sandbox
@@ -93,9 +93,30 @@ fn emits_sync_and_tend_in_runtime_completion() {
             .success()
             .stdout(predicates::str::contains("sync"))
             .stdout(predicates::str::contains("tend"))
+            .stdout(predicates::str::contains("adopt"))
+            .stdout(predicates::str::contains("transplant").not())
             .stdout(predicates::str::contains("publish"))
             .stdout(predicates::str::contains("propagate"));
     }
+}
+
+#[test]
+fn adopt_help_documents_decisions_and_recovery_while_the_alias_stays_hidden() {
+    let sandbox = Sandbox::new();
+    for command in ["adopt", "transplant"] {
+        sandbox
+            .grove(&[command, "--help"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains("--remote"))
+            .stdout(predicates::str::contains("--default-branch"))
+            .stdout(predicates::str::contains("--continue"))
+            .stdout(predicates::str::contains("--abort"));
+    }
+    sandbox
+        .grove(&["adopt", "--continue", "--abort"])
+        .assert()
+        .code(64);
 }
 
 #[test]

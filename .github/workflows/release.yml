@@ -130,6 +130,34 @@ jobs:
           zsh -n "$temp/$stage/completions/_git-grove"
           fish --no-execute "$temp/$stage/completions/git-grove.fish"
 
+          # Packaged flat-repository adopt smoke: preserve exact status/index
+          # evidence and content, create the default/payload worktree, and prove
+          # the shipped featureless binary ignores the test-only failpoint.
+          flat="$temp/flat"
+          git init --quiet --initial-branch=main "$flat"
+          git -C "$flat" config user.email test@example.invalid
+          git -C "$flat" config user.name Test
+          echo base >"$flat/tracked"
+          git -C "$flat" add tracked
+          git -C "$flat" commit --quiet -m base
+          echo modified >"$flat/tracked"
+          echo staged >"$flat/staged"
+          git -C "$flat" add staged
+          echo untracked >"$flat/untracked"
+          before_status=$(git -C "$flat" status --porcelain=v2 -z --branch --untracked-files=all | sha256sum)
+          before_index=$(git -C "$flat" ls-files --stage -z | sha256sum)
+          GIT_GROVE_FAILPOINT=error:1 "$binary" adopt "$flat"
+          test -d "$flat/.bare"
+          test "$(cat "$flat/.git")" = 'gitdir: ./.bare'
+          test "$(cat "$flat/main/tracked")" = modified
+          test "$(cat "$flat/main/staged")" = staged
+          test "$(cat "$flat/main/untracked")" = untracked
+          after_status=$(git -C "$flat/main" status --porcelain=v2 -z --branch --untracked-files=all | sha256sum)
+          after_index=$(git -C "$flat/main" ls-files --stage -z | sha256sum)
+          test "$before_status" = "$after_status"
+          test "$before_index" = "$after_index"
+          test "$(git -C "$flat/main" branch --show-current)" = main
+
           # Packaged local-remote sync smoke: clone, advance from a peer,
           # sync, and verify the worktree fast-forwarded. Local temporary
           # repositories only; no network access.

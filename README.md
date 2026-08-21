@@ -1,9 +1,10 @@
 # git-grove
 
 `git-grove` manages a repository as a bare clone surrounded by Git worktrees.
-Version 0.3 has a small, explicit lifecycle of six commands: create or clone a
-grove, add worktrees, inspect their state, fetch and fast-forward eligible
-worktrees, and publish an unpublished grove to a remote.
+Version 0.4 has a small, explicit lifecycle of seven commands: clone or
+initialize a grove, adopt an ordinary repository, add worktrees, inspect their
+state, fetch and fast-forward eligible worktrees, and publish an unpublished
+grove to an existing remote URL.
 
 ## Requirements
 
@@ -19,28 +20,28 @@ With [mise](https://mise.jdx.dev/dev-tools/backends/github.html) and GitHub as
 the backend:
 
 ```sh
-mise use -g 'github:e-kulikov/git-grove@0.3.0'
+mise use -g 'github:e-kulikov/git-grove@0.4.0'
 ```
 
 For declarative mise configuration:
 
 ```toml
 [tools]
-"github:e-kulikov/git-grove" = { version = "0.3.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
+"github:e-kulikov/git-grove" = { version = "0.4.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
 ```
 
-The GitHub backend can install this only after the `v0.3.0` release and its
+The GitHub backend can install this only after the `v0.4.0` release and its
 assets have been published. The release workflow produces an attestation and
 `SHA256SUMS`; mise can lock the published checksum with `mise lock`.
 
 For a direct installation, download
-`git-grove_0.3.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
+`git-grove_0.4.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
 verify the archive, then install its binary:
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf git-grove_0.3.0_linux_x86_64.tar.gz
-install -m 0755 git-grove_0.3.0_linux_x86_64/git-grove ~/.local/bin/git-grove
+tar -xzf git-grove_0.4.0_linux_x86_64.tar.gz
+install -m 0755 git-grove_0.4.0_linux_x86_64/git-grove ~/.local/bin/git-grove
 ```
 
 The archive also contains the man page and generated Bash, Zsh, and Fish
@@ -55,6 +56,9 @@ Using `git-grove` directly is equivalent.
 # Clone and create the first worktree.
 git grove clone https://github.com/example/project.git project
 cd project
+
+# Or convert an existing ordinary, single-worktree repository in place.
+git grove adopt ../ordinary-project
 
 # Add an existing local or uniquely matching remote branch.
 git grove add feature/login
@@ -75,7 +79,8 @@ git grove publish https://github.com/example/project.git
 The aliases are `plant` for `clone`, `seed` for `init`, `sprout` for `add`,
 `survey` for `list`, `tend` for `sync`, and `propagate` for `publish`. Inside a grove, invoking
 `git grove` without a command runs `list`. A repository locator as the first
-argument selects `clone`.
+argument selects `clone`. `transplant` remains a hidden compatibility alias for
+`adopt`.
 
 `add` always names its branch explicitly:
 
@@ -94,20 +99,68 @@ named `detached-<short-oid>`.
 project/
 ├── .bare/       bare Git repository and shared administration
 ├── .git         pointer containing: gitdir: ./.bare
-├── AGENTS.md    generated repository facts and 0.3 command guide
+├── AGENTS.md    generated repository facts and 0.4 command guide
 ├── CLAUDE.md    relative link to AGENTS.md
 ├── main/        worktree
 └── feature/     another worktree
 ```
 
 Grove metadata is stored in the real Git configuration at `.bare/config`, not
-in a separate metadata file. Version 0.3 uses `grove.version`,
+in a separate metadata file. Version 0.4 uses `grove.version`,
 `grove.defaultBranch`, `grove.remote`, `grove.publishState`,
 `grove.publishRemote`, and `grove.publishUrl`.
 
 All managed worktree paths must remain strictly below the grove root. Existing
 files, symlinks, nonempty destinations, ambiguous remote branches, and
 unrecognized repository state are preserved for a human decision.
+
+An adopted repository keeps its current checkout byte-for-byte as the payload
+worktree. If that checkout is on `topic` while `main` is selected as the
+default, the resulting tree is:
+
+```text
+ordinary-project/
+├── .bare/
+├── .git
+├── AGENTS.md
+├── CLAUDE.md
+├── main/         generated default worktree
+└── topic/        adopted payload, including staged and untracked state
+```
+
+## Adopt
+
+`git grove adopt [path]` (hidden alias `transplant`) converts an ordinary
+repository in place without fetching or checking out over its current files:
+
+```sh
+git grove adopt ./project
+git grove adopt --remote origin --default-branch main ./project
+```
+
+Adopt requires a real `.git` directory, exactly one worktree, a quiescent
+repository with no operation markers, lock files, conflict stages, sparse
+checkout, initialized submodules, hard-linked payload files, or nested mount
+boundaries, and unambiguous remote/default-branch choices. It preserves raw
+path bytes, the index and staged state, ignored and untracked files, worktree
+private Git state, refs, reflogs, and configuration. Existing unsupported or
+ambiguous state is refused before mutation.
+
+Before the first layout mutation, adopt durably creates one
+`.grove-adopt-<nonce>/` transaction. An interrupted run prints exact recovery
+commands; use only the command matching your intent:
+
+```sh
+git grove adopt --continue ./project
+git grove adopt --abort ./project
+```
+
+Recovery validates the journal, repository identity, and exact before/after
+evidence. It never guesses through a corrupt journal or overwrites manual edits.
+SIGINT, SIGTERM, and SIGHUP are forwarded to an active Git child and exit as
+`128 + signal` after durable reconciliation; SIGKILL is recovered on the next
+explicit continue or abort. `GIT_GROVE_FAILPOINT` exists only in test-feature
+builds and is inert in the shipped binary.
 
 ## Sync
 
@@ -216,7 +269,9 @@ failure (including a failed `sync` fetch), `2` means repository state needs a
 human decision (including a worktree `sync` left behind or blocked), and `64`
 means a usage error or refused unsupported context. `list --porcelain` emits
 the versioned, NUL-delimited `git-grove-list-v1` protocol for automation;
-`sync` and `publish` have no porcelain output in 0.3.
+`sync`, `adopt`, and `publish` have no porcelain output in 0.4. Publish still
+requires an existing repository URL; version 0.4 does not create hosting-side
+repositories and does not implement `publish --create`.
 
 ## Completions and manual
 
@@ -242,10 +297,10 @@ mise exec -- cargo fmt --all -- --check
 mise exec -- cargo test --all-targets --locked
 mise exec -- cargo clippy --all-targets --locked -- -D warnings
 mise exec -- cargo build --release --locked --target x86_64-unknown-linux-musl
-scripts/package-release.sh 0.3.0 \
+scripts/package-release.sh 0.4.0 \
   target/x86_64-unknown-linux-musl/release/git-grove dist
 ```
 
 Release tags must be strict `vX.Y.Z` and match the package version exactly.
-For 0.3.0 the uploaded files are
-`git-grove_0.3.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
+For 0.4.0 the uploaded files are
+`git-grove_0.4.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
