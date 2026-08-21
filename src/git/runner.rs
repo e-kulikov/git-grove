@@ -3,7 +3,7 @@ use crate::policy::env;
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {
@@ -11,6 +11,7 @@ pub struct Invocation {
     work_tree: Option<PathBuf>,
     cwd: Option<PathBuf>,
     args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
     c_locale: bool,
 }
 
@@ -44,6 +45,17 @@ impl Invocation {
         self
     }
 
+    pub fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.environment
+            .push((key.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self
+    }
+
     /// Pin this child's locale so its diagnostics are the untranslated C-locale
     /// text. This is a parsing contract for one invocation, not a change to the
     /// environment policy: every other git child keeps the user's locale, so
@@ -59,6 +71,15 @@ impl Invocation {
     /// Whether this invocation carries the locale pin.
     pub fn is_c_locale(&self) -> bool {
         self.c_locale
+    }
+
+    pub fn environment_for_test(&self) -> Vec<(OsString, OsString)> {
+        let mut environment = self.environment.clone();
+        if self.c_locale {
+            environment.push((OsString::from("LC_ALL"), OsString::from("C")));
+            environment.push((OsString::from("LANGUAGE"), OsString::new()));
+        }
+        environment
     }
 
     fn argv(&self) -> Vec<OsString> {
@@ -139,28 +160,57 @@ pub trait GitRunner {
     }
 }
 
-pub struct RealGit;
+pub struct RealGit {
+    program: OsString,
+}
+
+impl Default for RealGit {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RealGit {
     pub fn new() -> Self {
-        Self
+        Self {
+            program: OsString::from("git"),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_program(program: impl Into<OsString>) -> Self {
+        Self {
+            program: program.into(),
+        }
     }
 }
 
 impl GitRunner for RealGit {
     fn run(&self, invocation: Invocation) -> Result<GitOutput> {
-        let mut cmd = Command::new("git");
+        let mut cmd = Command::new(&self.program);
         cmd.args(invocation.argv());
         if let Some(cwd) = &invocation.cwd {
             cmd.current_dir(cwd);
         }
         env::sanitize(&mut cmd);
-        if invocation.c_locale {
-            cmd.env("LC_ALL", "C").env("LANGUAGE", "");
+        for (key, value) in invocation.environment_for_test() {
+            cmd.env(key, value);
         }
-        let out = cmd
-            .output()
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| GroveError::failure(format!("cannot run git: {error}")))?;
+        if let Err(error) = crate::transaction::signal::begin_child(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|error| GroveError::failure(format!("cannot wait for git: {error}")))?;
+        crate::transaction::signal::finish_child()?;
         Ok(GitOutput {
             status: out.status.code().unwrap_or(-1),
             stdout: out.stdout,
@@ -213,6 +263,8 @@ mod tests {
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn builds_the_argument_vector_with_pins_first() {
@@ -237,6 +289,23 @@ mod tests {
                 "--git-dir=/g/.bare/worktrees/main",
                 "--work-tree=/g/main",
                 "status"
+            ]
+        );
+    }
+
+    #[test]
+    fn per_child_environment_preserves_order_and_locale_pin_wins_last() {
+        let invocation = Invocation::new()
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("LC_ALL", "caller")
+            .c_locale();
+        assert_eq!(
+            invocation.environment_for_test(),
+            vec![
+                (OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")),
+                (OsString::from("LC_ALL"), OsString::from("caller")),
+                (OsString::from("LC_ALL"), OsString::from("C")),
+                (OsString::from("LANGUAGE"), OsString::new()),
             ]
         );
     }
@@ -361,6 +430,47 @@ mod tests {
             String::from_utf8_lossy(&out.stderr).contains("does not appear to be a git repository"),
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_drains_stdout_and_stderr_larger_than_pipe_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("large-output");
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\ndd if=/dev/zero bs=131072 count=1 2>/dev/null\ndd if=/dev/zero bs=131072 count=1 1>&2 2>/dev/null\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = RealGit::with_program(script)
+            .run(Invocation::new())
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout.len(), 131_072);
+        assert_eq!(output.stderr.len(), 131_072);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_runner_closes_child_stdin_so_git_never_blocks_on_a_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("stdin-probe");
+        std::fs::write(&script, b"#!/bin/sh\nreadlink /proc/self/fd/0\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let output = RealGit::with_program(script)
+            .run(Invocation::new())
+            .unwrap();
+
+        assert_eq!(output.status, 0);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "/dev/null",
+            "a spawned git child must never inherit stdin, or an interactive prompt (credentials, passphrase, editor) would hang it"
         );
     }
 

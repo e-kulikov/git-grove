@@ -1,6 +1,6 @@
 [package]
 name = "git-grove"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Manage repositories as a bare clone surrounded by git worktrees"
@@ -14,10 +14,16 @@ bstr = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 getrandom = "0.2"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+signal-hook = "0.3"
 thiserror = "2"
+
+[features]
+default = []
+failpoints = []
 
 [dev-dependencies]
 assert_cmd = "2"

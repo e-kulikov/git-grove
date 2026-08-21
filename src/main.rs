@@ -1,18 +1,6 @@
-mod cli;
-mod commands;
-pub mod error;
-#[allow(dead_code)]
-mod fsx;
-#[allow(dead_code)]
-mod git;
-#[allow(dead_code)]
-mod grove;
-mod output;
-#[allow(dead_code)]
-mod policy;
-
 use clap::{CommandFactory, Parser};
-use error::{ExitClass, GroveError, Result};
+use git_grove::error::{ExitClass, GroveError, Result};
+use git_grove::{cli, commands, fsx, git, grove, output, policy};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -38,7 +26,7 @@ fn render(result: Result<()>) -> ExitCode {
         Ok(()) => ExitCode::from(ExitClass::Ok.code()),
         Err(err) => {
             eprintln!("git-grove: {err}");
-            ExitCode::from(err.class.code())
+            ExitCode::from(err.code())
         }
     }
 }
@@ -75,6 +63,38 @@ fn run(cli: cli::Cli) -> Result<()> {
             })?;
             commands::init::run(&runner, dir, branch, &cwd).map(|_| ())
         }
+        cli::Command::Adopt {
+            path,
+            remote,
+            default_branch,
+            continue_adoption,
+            abort,
+        } => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let action = if continue_adoption {
+                commands::adopt::AdoptAction::Continue
+            } else if abort {
+                commands::adopt::AdoptAction::Abort
+            } else {
+                commands::adopt::AdoptAction::Fresh
+            };
+            commands::adopt::run(
+                &runner,
+                &commands::adopt::AdoptArgs {
+                    path,
+                    remote,
+                    default_branch,
+                    action,
+                },
+                &cwd,
+            )
+        }
         cli::Command::Add(args) => {
             let mode = args.resolve()?;
             let runner = git::runner::RealGit::new();
@@ -85,6 +105,12 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove add",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             commands::add::run(&runner, &grove, mode).map(|_| ())
@@ -98,6 +124,12 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Shared,
+                "git grove list",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             match commands::list::run(&runner, &grove, porcelain)? {
@@ -119,6 +151,12 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove sync",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             let report = commands::sync::run(&runner, &grove)?;
@@ -153,6 +191,12 @@ fn run(cli: cli::Cli) -> Result<()> {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
             let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove publish",
+            )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
             let request = commands::publish::Request {

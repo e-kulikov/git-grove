@@ -1,16 +1,16 @@
 use crate::error::{GroveError, Result};
 use crate::fsx;
+use crate::fsx::held::{open_directory_at, FileIdentity as DirectoryIdentity, HeldDirectory};
 use crate::git::runner::{GitOutput, GitRunner, Invocation};
 use crate::grove::agents_md::{self, Facts};
 use crate::grove::discover::Grove;
 use crate::grove::layout;
 use crate::grove::metadata::{self, Metadata, PublishState, FORMAT_VERSION};
 use bstr::{BString, ByteSlice};
-use rustix::fs::{fstat, mkdirat, openat, statat, AtFlags, Mode, OFlags, CWD};
+use rustix::fs::{mkdirat, openat, statat, AtFlags, Mode, OFlags, CWD};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -48,132 +48,10 @@ pub(crate) fn normalize_absolute(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-#[derive(Debug)]
-pub(crate) struct HeldDirectory {
-    pub(crate) file: File,
-    pub(crate) named_path: PathBuf,
-    pub(crate) anchored_path: PathBuf,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
-}
-
 #[derive(Default)]
 pub(crate) struct RecoveryState {
     pub(crate) root: Option<DirectoryIdentity>,
     pub(crate) bare: Option<DirectoryIdentity>,
-}
-
-impl HeldDirectory {
-    fn new(file: File, named_path: PathBuf) -> Result<Self> {
-        let anchored_path = PathBuf::from(format!(
-            "/proc/{}/fd/{}",
-            std::process::id(),
-            file.as_raw_fd()
-        ));
-        let held = Self {
-            file,
-            named_path,
-            anchored_path,
-        };
-        held.validate()?;
-        Ok(held)
-    }
-
-    pub(crate) fn validate(&self) -> Result<()> {
-        let held = fstat(&self.file).map_err(|error| {
-            GroveError::failure(format!("cannot inspect held directory: {error}"))
-        })?;
-        let named = statat(CWD, &self.named_path, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
-            state_conflict(
-                format!(
-                    "{} changed during initialization",
-                    escaped_path(&self.named_path)
-                ),
-                format!("the held directory is retained; inspect it before retrying: {error}"),
-            )
-        })?;
-        if held.st_dev != named.st_dev || held.st_ino != named.st_ino {
-            return Err(state_conflict(
-                format!(
-                    "{} changed during initialization",
-                    escaped_path(&self.named_path)
-                ),
-                "the replacement was preserved",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn identity(&self) -> Result<DirectoryIdentity> {
-        let stat = fstat(&self.file).map_err(|error| {
-            GroveError::failure(format!("cannot inspect held directory: {error}"))
-        })?;
-        Ok(DirectoryIdentity {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-        })
-    }
-
-    pub(crate) fn ensure_empty(&self) -> Result<()> {
-        self.validate()?;
-        let mut entries = std::fs::read_dir(&self.anchored_path).map_err(|error| {
-            GroveError::failure(format!(
-                "cannot read {}: {error}",
-                escaped_path(&self.named_path)
-            ))
-        })?;
-        if entries.next().is_some() {
-            return Err(state_conflict(
-                format!("{} is not empty", escaped_path(&self.named_path)),
-                "use `git grove adopt` to convert an existing repository",
-            ));
-        }
-        self.validate()
-    }
-
-    pub(crate) fn ensure_only_entry(&self, expected: &OsStr) -> Result<()> {
-        self.validate()?;
-        let entries = std::fs::read_dir(&self.anchored_path).map_err(|error| {
-            GroveError::failure(format!(
-                "cannot read {}: {error}",
-                escaped_path(&self.named_path)
-            ))
-        })?;
-        let mut names = entries
-            .map(|entry| entry.map(|entry| entry.file_name()))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| {
-                GroveError::failure(format!(
-                    "cannot read {}: {error}",
-                    escaped_path(&self.named_path)
-                ))
-            })?;
-        if names.len() != 1 || names.pop().as_deref() != Some(expected) {
-            return Err(state_conflict(
-                format!(
-                    "{} changed during initialization",
-                    escaped_path(&self.named_path)
-                ),
-                "the concurrently created entries were preserved",
-            ));
-        }
-        self.validate()
-    }
-}
-
-fn open_directory_at(parent: &File, name: &OsStr) -> std::io::Result<File> {
-    openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(File::from)
-    .map_err(Into::into)
 }
 
 pub(crate) fn open_or_create_root(root: &Path, mutated: &mut bool) -> Result<HeldDirectory> {
@@ -380,7 +258,7 @@ pub(crate) fn post_mutation_layout_error(error: GroveError) -> GroveError {
 
 fn identity_matches(path: &Path, expected: DirectoryIdentity) -> bool {
     statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)
-        .is_ok_and(|stat| stat.st_dev == expected.device && stat.st_ino == expected.inode)
+        .is_ok_and(|stat| stat.st_dev == expected.dev && stat.st_ino == expected.ino)
 }
 
 pub(crate) fn retain_partial(

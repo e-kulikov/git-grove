@@ -1,4 +1,4 @@
-.TH GIT-GROVE 1 "2026-08-20" "git-grove 0.3.0" "Git Extensions"
+.TH GIT-GROVE 1 "2026-08-21" "git-grove 0.4.0" "Git Extensions"
 .SH NAME
 git-grove \- manage repositories as a bare clone surrounded by Git worktrees
 .SH SYNOPSIS
@@ -33,6 +33,7 @@ A repository locator in command position selects
 The command aliases are
 .BR plant = clone ,
 .BR seed = init ,
+.BR transplant = adopt " (hidden),"
 .BR sprout = add ,
 .BR survey = list ,
 .BR tend = sync ,
@@ -58,6 +59,43 @@ Create an empty repository directly as a grove.  The destination must be
 missing or an existing empty directory.  If a branch is supplied it becomes
 the unborn initial branch and the first worktree name; otherwise Git's initial
 branch setting is used.
+.TP
+.B adopt \fR[\fB--remote \fIname\fR] [\fB--default-branch \fIbranch\fR] [\fIpath\fR]
+Convert an ordinary repository in place into a grove without fetching or
+checking out over its current files.  The repository must have a real
+.B .git
+directory, exactly one worktree, and quiescent state: no operation marker,
+lock, conflict stage, sparse checkout, initialized submodule, hard-linked
+payload file, nested mount boundary, or ambiguous remote/default choice.
+Raw path bytes, index and staged state, ignored and untracked files, private
+Git state, references, reflogs, and configuration are preserved.
+.RS
+.PP
+.B --remote
+selects the configured remote recorded in grove metadata.
+.B --default-branch
+selects the default worktree when it cannot be derived unambiguously.
+The current checkout becomes the payload worktree; a distinct default branch
+is materialized as a second worktree.
+.PP
+Before layout mutation, adopt durably creates exactly one
+.B .grove-adopt-<nonce>/
+transaction.  An interrupted run prints the exact recovery commands:
+.PP
+.B git grove adopt --continue \fIpath
+.br
+.B git grove adopt --abort \fIpath
+.PP
+Recovery validates the journal, root identity, and exact before/after evidence.
+It refuses corrupt, foreign, or ambiguous evidence and never overwrites manual
+edits.  The hidden compatibility alias is
+.BR transplant .
+The test-only
+.B GIT_GROVE_FAILPOINT
+environment variable is inert in release builds.  Publish still requires an
+existing repository URL; this release does not implement
+.BR "publish --create" .
+.RE
 .TP
 .B add \fIbranch\fR [\fIdir\fR]
 Add a worktree for an existing local branch or a branch found through exactly
@@ -220,7 +258,7 @@ The real Git configuration also stores metadata under
 .BR grove.publishRemote ,
 and
 .BR grove.publishUrl .
-Version 0.3 refuses a newer
+Version 0.4 refuses a newer
 .B grove.version
 before writing.
 .TP
@@ -285,9 +323,17 @@ branches, an occupied destination, or an invalid worktree record.
 .B 64
 Usage error, refused option or environment, unsupported context without an
 override, or no grove where one is required.
+.PP
+During adoption, handled SIGINT, SIGTERM, and SIGHUP are forwarded to the
+active Git child and exit as 128 plus the signal number after durable
+reconciliation (130, 143, and 129 respectively).  SIGKILL leaves recovery to
+an explicit
+.B --continue
+or
+.BR --abort .
 .SH FILES
 .TP
-.I git-grove_0.3.0_linux_x86_64.tar.gz
+.I git-grove_0.4.0_linux_x86_64.tar.gz
 Static Linux x86_64 release archive containing the executable, license,
 README, this manual, and generated Bash, Zsh, and Fish completions.
 .TP

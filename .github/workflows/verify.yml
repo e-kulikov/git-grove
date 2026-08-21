@@ -1,0 +1,116 @@
+name: verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_TOOLCHAIN: "1.97.1"
+  MSRV_TOOLCHAIN: "1.85.1"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install the format-only toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$BUILD_TOOLCHAIN" --profile minimal --component rustfmt
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$BUILD_TOOLCHAIN" fmt --all -- --check
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install the MSRV toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Check the minimum supported Rust version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$MSRV_TOOLCHAIN" check --all-targets --locked
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install the lint toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$BUILD_TOOLCHAIN" --profile minimal --component clippy
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$BUILD_TOOLCHAIN" clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends git
+          git version
+
+      - name: Install the test toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$BUILD_TOOLCHAIN" --profile minimal
+
+      - name: Cache cargo registry and target directory
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+      - name: Run the test suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$BUILD_TOOLCHAIN" test --all-targets --locked

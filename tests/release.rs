@@ -13,7 +13,7 @@ fn release_version_requires_a_strict_matching_tag() {
     let manifest = repo_root().join("Cargo.toml");
 
     let valid = Command::new(&script)
-        .args(["v0.3.0", manifest.to_str().unwrap()])
+        .args(["v0.4.0", manifest.to_str().unwrap()])
         .output()
         .expect("run version validator");
     assert!(
@@ -21,9 +21,9 @@ fn release_version_requires_a_strict_matching_tag() {
         "{}",
         String::from_utf8_lossy(&valid.stderr)
     );
-    assert_eq!(valid.stdout, b"0.3.0\n");
+    assert_eq!(valid.stdout, b"0.4.0\n");
 
-    for tag in ["0.3.0", "v01.3.0", "v0.3", "v0.3.0-rc.1", "v0.2.0"] {
+    for tag in ["0.4.0", "v01.4.0", "v0.4", "v0.4.0-rc.1", "v0.3.0"] {
         let invalid = Command::new(&script)
             .args([tag, manifest.to_str().unwrap()])
             .output()
@@ -108,10 +108,6 @@ fn release_docs_describe_sync_and_its_safety_contract() {
             "{relative} must describe exit 2 for an unresolved or blocked state"
         );
         assert!(
-            !document.contains("git grove adopt") && !document.contains("git-grove adopt"),
-            "{relative} must not advertise the unimplemented adopt command"
-        );
-        assert!(
             !rendered_words.contains("--no-overwrite-ignore @{upstream}"),
             "{relative} must not claim the merge targets the symbolic @{{upstream}} revision"
         );
@@ -178,21 +174,53 @@ fn release_docs_describe_publish_and_its_transaction_contract() {
             rendered_words.contains("stays in the publishing state"),
             "{relative} must describe the unconfirmed hosting-side default branch outcome"
         );
-        for unimplemented in ["--create", "adopt"] {
-            assert!(
-                !rendered_words.contains(&format!("publish {unimplemented}")),
-                "{relative} must not advertise unimplemented {unimplemented}"
-            );
-        }
+        assert!(
+            !rendered_words.contains("publish adopt"),
+            "{relative} must not advertise `publish adopt`"
+        );
     }
 }
 
 #[test]
-fn grove_format_version_is_unchanged_by_the_0_3_0_package_version() {
+fn release_docs_describe_adopt_and_its_recovery_contract() {
+    for relative in ["README.md", "man/git-grove.1"] {
+        let document = fs::read_to_string(repo_root().join(relative)).unwrap();
+        for required in [
+            "adopt",
+            "transplant",
+            "--remote",
+            "--default-branch",
+            "--continue",
+            "--abort",
+            ".grove-adopt-",
+            "SIGINT",
+            "SIGTERM",
+            "SIGHUP",
+        ] {
+            assert!(
+                document.contains(required),
+                "{relative} omits adopt contract term {required}"
+            );
+        }
+        let rendered = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            rendered.contains("exactly one worktree"),
+            "{relative} must document the single-worktree precondition"
+        );
+        assert!(
+            rendered.to_lowercase().contains("publish still requires")
+                && document.contains("--create"),
+            "{relative} must keep publish --create out of scope"
+        );
+    }
+}
+
+#[test]
+fn grove_format_version_is_unchanged_by_the_0_4_0_package_version() {
     let source = fs::read_to_string(repo_root().join("src/grove/metadata.rs")).unwrap();
     assert!(
         source.contains("pub const FORMAT_VERSION: u32 = 1;"),
-        "grove layout format must remain version 1 across the 0.3.0 package bump"
+        "grove layout format must remain version 1 across the 0.4.0 package bump"
     );
 }
 
@@ -214,6 +242,10 @@ fn release_workflow_proves_static_linkage_from_elf_headers() {
         2,
         "both the built and packaged binaries must reject dynamic dependencies"
     );
+    assert!(workflow.contains("flat-repository adopt smoke"));
+    assert!(workflow.contains("GIT_GROVE_FAILPOINT=error:1"));
+    assert!(workflow.contains("status --porcelain=v2"));
+    assert!(workflow.contains("ls-files --stage"));
 }
 
 #[test]
@@ -232,7 +264,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
     run_packager(&binary, &first);
     run_packager(&binary, &second);
 
-    let archive_name = "git-grove_0.3.0_linux_x86_64.tar.gz";
+    let archive_name = "git-grove_0.4.0_linux_x86_64.tar.gz";
     assert_eq!(
         fs::read(first.join(archive_name)).unwrap(),
         fs::read(second.join(archive_name)).unwrap(),
@@ -256,7 +288,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
         .output()
         .unwrap();
     assert!(listing.status.success());
-    let prefix = "git-grove_0.3.0_linux_x86_64";
+    let prefix = "git-grove_0.4.0_linux_x86_64";
     let expected = [
         format!("{prefix}/"),
         format!("{prefix}/LICENSE"),
@@ -308,7 +340,7 @@ fn run_packager(binary: &Path, destination: &Path) {
     let output = Command::new(repo_root().join("scripts/package-release.sh"))
         .env("SOURCE_DATE_EPOCH", "946684800")
         .args([
-            "0.3.0",
+            "0.4.0",
             binary.to_str().unwrap(),
             destination.to_str().unwrap(),
         ])

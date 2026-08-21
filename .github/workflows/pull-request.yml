@@ -1,0 +1,49 @@
+name: pull request
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify
+    if: >-
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'),
+               github.event.pull_request.author_association)
+      || contains(github.event.pull_request.labels.*.name, 'safe-to-test')
+    uses: ./.github/workflows/verify.yml
+    permissions:
+      contents: read
+
+  checks:
+    name: Pull request checks
+    needs: verify
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report a definite conclusion
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="${{ needs.verify.result }}"
+          echo "verify result: $result"
+          case "$result" in
+            success)
+              exit 0
+              ;;
+            skipped)
+              echo "verify was skipped: author association '${{ github.event.pull_request.author_association }}' is outside the trusted set (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR) and this pull request is not labelled safe-to-test"
+              exit 0
+              ;;
+            *)
+              echo "verify did not succeed: $result" >&2
+              exit 1
+              ;;
+          esac

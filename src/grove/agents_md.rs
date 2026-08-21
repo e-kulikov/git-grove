@@ -79,6 +79,7 @@ pub fn render(facts: &Facts) -> String {
          ## Available commands\n\n\
          ```bash\n\
          git grove list                 # inspect worktrees and their branches\n\
+         git grove adopt <repository>   # convert an ordinary repository into a grove\n\
          git grove add <branch>         # create a worktree for a branch\n\
          git grove sync                 # fetch and fast-forward eligible worktrees\n\
          git grove publish <url>        # give an unpublished grove a remote and push it\n\
@@ -163,6 +164,9 @@ mod tests {
             .find("git grove list")
             .expect("list must be documented");
         let add = text.find("git grove add").expect("add must be documented");
+        let adopt = text
+            .find("git grove adopt")
+            .expect("adopt must be documented");
         let sync = text
             .find("git grove sync")
             .expect("sync must be documented");
@@ -174,7 +178,8 @@ mod tests {
             .find("git grove publish")
             .expect("publish must be documented");
 
-        assert!(list < add);
+        assert!(list < adopt);
+        assert!(adopt < add);
         assert!(add < sync);
         assert!(sync < publish);
         assert!(publish < raw);
@@ -184,7 +189,7 @@ mod tests {
         assert!(text.contains(
             "git grove publish <url>        # give an unpublished grove a remote and push it"
         ));
-        for unavailable in ["git grove adopt", "git grove ls", "git grove new"] {
+        for unavailable in ["git grove ls", "git grove new"] {
             assert!(
                 !text.contains(unavailable),
                 "must not recommend {unavailable}"
