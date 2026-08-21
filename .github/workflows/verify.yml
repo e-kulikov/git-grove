@@ -1,0 +1,54 @@
+name: verify
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_TOOLCHAIN: "1.97.1"
+  MSRV_TOOLCHAIN: "1.85.1"
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  verify:
+    name: Check MSRV, format, test, and lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Install Git and build prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends file fish git musl-tools zsh
+          git version
+
+      - name: Install locked Rust toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$BUILD_TOOLCHAIN" \
+            --profile default \
+            --component rustfmt,clippy \
+            --target "$TARGET"
+          rustup toolchain install "$MSRV_TOOLCHAIN" --profile minimal
+
+      - name: Verify the minimum supported Rust version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$MSRV_TOOLCHAIN" check --all-targets --locked
+
+      - name: Format, test, and lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo "+$BUILD_TOOLCHAIN" fmt --all -- --check
+          cargo "+$BUILD_TOOLCHAIN" test --all-targets --locked
+          cargo "+$BUILD_TOOLCHAIN" clippy --all-targets --locked -- -D warnings
