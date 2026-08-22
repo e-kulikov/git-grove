@@ -1342,15 +1342,18 @@ enum RepoViewOutcome {
     Missing,
 }
 
-fn indeterminate_repo_view_failure(create_request: &CreateRequest) -> GroveError {
+fn indeterminate_repo_view_failure(
+    create_request: &CreateRequest,
+    cause: &GroveError,
+) -> GroveError {
     GroveError::failure(format!(
         "cannot confirm whether {} exists on {}",
         escaped(create_target(create_request).as_bytes()),
         create_request.provider.host_env().1,
     ))
-    .with_detail(
-        "this grove stays in `creating`; clear grove.publishProvider, grove.publishOwner, grove.publishName, and grove.publishRemote by hand to force a fresh attempt, or rerun once the failure is resolved",
-    )
+    .with_detail(format!(
+        "{cause}. This grove stays in `creating`; clear grove.publishProvider, grove.publishOwner, grove.publishName, and grove.publishRemote by hand to force a fresh attempt, or rerun once the failure is resolved",
+    ))
 }
 
 fn query_repo_view(
@@ -1376,7 +1379,7 @@ fn query_repo_view(
     };
     let output = provider_runner
         .run(create_request.provider, &args)
-        .map_err(|_| indeterminate_repo_view_failure(create_request))?;
+        .map_err(|error| indeterminate_repo_view_failure(create_request, &error))?;
     if !output.ok() {
         return Ok(RepoViewOutcome::Missing);
     }
@@ -3764,7 +3767,12 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.class, ExitClass::Failure);
-        assert!(error.detail.unwrap().contains("grove.publishProvider"));
+        let detail = error.detail.unwrap();
+        assert!(detail.contains("grove.publishProvider"));
+        assert!(
+            detail.contains("cannot run gh: No such file or directory"),
+            "the underlying spawn failure must not be discarded: {detail}"
+        );
         assert!(
             git.calls().is_empty(),
             "the receipt is never rolled back here"
