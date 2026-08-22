@@ -27,6 +27,7 @@ use crate::git::config::{
     required, set_config, trim_one_line, validate_refspec_destinations,
 };
 use crate::git::fetch::FetchPlan;
+use crate::git::provider::{self, Provider, ProviderOutput, ProviderRunner};
 use crate::git::query;
 use crate::git::remote::{self, Ancestry};
 use crate::git::runner::{GitRunner, Invocation};
@@ -66,6 +67,16 @@ pub struct PublishReport {
     pub class: ExitClass,
     pub lines: Vec<String>,
     pub diagnostics: Vec<String>,
+}
+
+/// The byte string recorded in `grove.publishProvider` for each provider —
+/// the same spelling `--host <github|gitlab>` accepts, not the CLI binary
+/// name (`gh`/`glab`).
+fn provider_slug(provider: Provider) -> &'static [u8] {
+    match provider {
+        Provider::GitHub => b"github",
+        Provider::GitLab => b"gitlab",
+    }
 }
 
 fn conflict(message: impl Into<String>, detail: impl Into<String>) -> GroveError {
@@ -235,7 +246,18 @@ fn preflight(
         return Err(GroveError::usage("`publish` requires a URL"));
     }
     validate_remote_name(runner, &request.remote)?;
+    check_publishable_repository(runner, grove, metadata)
+}
 
+/// The URL-independent half of [`preflight`]: this grove has a commit and a
+/// default branch it can push, regardless of whether it has a remote yet.
+/// `--create` runs this before ever touching a provider, with no URL in
+/// hand at all.
+fn check_publishable_repository(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    metadata: &Metadata,
+) -> Result<Preflight> {
     if !query::has_any_commit(runner, grove)? {
         return Err(conflict(
             "this grove has no commit to publish",
@@ -810,12 +832,20 @@ fn unconfirmed_head_report(
 
 /// Steps 5 to 7, shared by a fresh publication and by resuming an interrupted
 /// one. The receipt is already `publishing` and the remote already configured.
+///
+/// `provider_runner` is `Some` only on the `--create` hand-off path (never
+/// for a bare `publish <url>`, which always passes `None` through
+/// [`run`]'s unmodified signature); the `gh`-default-branch repair below is a
+/// no-op whenever it is `None`, regardless of what `metadata` records.
+#[allow(clippy::too_many_arguments)]
 fn publish_and_verify(
     runner: &dyn GitRunner,
     grove: &Grove,
+    metadata: &Metadata,
     request: &Request,
     flight: &Preflight,
     diagnostics: Vec<String>,
+    provider_runner: Option<&dyn ProviderRunner>,
 ) -> Result<PublishReport> {
     let refspecs = push_refspecs(runner, grove, request, flight)?;
     push(runner, grove, request, &refspecs)?;
@@ -845,7 +875,10 @@ fn publish_and_verify(
     }
 
     if !server_head_matches(runner, request, flight)? {
-        return Ok(unconfirmed_head_report(request, flight, lines, diagnostics));
+        attempt_gh_default_branch_repair(provider_runner, metadata, request, flight)?;
+        if !server_head_matches(runner, request, flight)? {
+            return Ok(unconfirmed_head_report(request, flight, lines, diagnostics));
+        }
     }
     point_remote_head(runner, grove, request, flight)?;
 
@@ -874,8 +907,10 @@ fn publish_and_verify(
 fn repair_published(
     runner: &dyn GitRunner,
     grove: &Grove,
+    metadata: &Metadata,
     request: &Request,
     flight: &Preflight,
+    provider_runner: Option<&dyn ProviderRunner>,
 ) -> Result<PublishReport> {
     FetchPlan {
         remotes: vec![BString::from(request.remote.as_bytes().to_vec())],
@@ -939,16 +974,20 @@ fn repair_published(
     verify_tracking_ref(runner, grove, request, flight)?;
 
     if !server_head_matches(runner, request, flight)? {
-        // The same condition specification step 7 prescribes `publishing` and
-        // exit 2 for on a first publish, so a rerun applies the same rule. The
-        // receipt is untouched, so the acceptance matrix still resumes cleanly.
-        metadata::write_receipt(
-            runner,
-            grove,
-            PublishState::Publishing,
-            &published_receipt(request),
-        )?;
-        return Ok(unconfirmed_head_report(request, flight, lines, Vec::new()));
+        attempt_gh_default_branch_repair(provider_runner, metadata, request, flight)?;
+        if !server_head_matches(runner, request, flight)? {
+            // The same condition specification step 7 prescribes `publishing`
+            // and exit 2 for on a first publish, so a rerun applies the same
+            // rule. The receipt is untouched, so the acceptance matrix still
+            // resumes cleanly.
+            metadata::write_receipt(
+                runner,
+                grove,
+                PublishState::Publishing,
+                &published_receipt(request),
+            )?;
+            return Ok(unconfirmed_head_report(request, flight, lines, Vec::new()));
+        }
     }
     point_remote_head(runner, grove, request, flight)?;
 
@@ -959,19 +998,112 @@ fn repair_published(
     })
 }
 
+/// Decision 8: a repository `--create` itself made gets `gh`'s configured
+/// default branch name, not necessarily this grove's — `glab` never needs
+/// this, since `--defaultBranch` at creation time already closed the gap.
+/// Gated on this grove's own creating keys being present, recorded as
+/// `github`, and naming the same remote as `request`: never applied to a
+/// repository published by a bare `publish <url>`, and never to `gitlab`.
+/// Best-effort: `gh repo edit`'s own failure is not surfaced here, since the
+/// caller always re-checks the server-side `HEAD` afterward and falls back to
+/// its existing exit-`2` report if the repair did not help.
+fn attempt_gh_default_branch_repair(
+    provider_runner: Option<&dyn ProviderRunner>,
+    metadata: &Metadata,
+    request: &Request,
+    flight: &Preflight,
+) -> Result<()> {
+    let Some(provider_runner) = provider_runner else {
+        return Ok(());
+    };
+    let Some(creating) = metadata::creating_receipt(metadata)? else {
+        return Ok(());
+    };
+    if creating.provider.as_slice() != provider_slug(Provider::GitHub)
+        || creating.remote.as_slice() != request.remote.as_bytes()
+    {
+        return Ok(());
+    }
+
+    let mut target = OsString::from_vec(creating.owner.to_vec());
+    target.push("/");
+    target.push(OsString::from_vec(creating.name.to_vec()));
+    let branch = OsString::from_vec(flight.default_branch.to_vec());
+
+    let _ = provider_runner.run(
+        Provider::GitHub,
+        &[
+            OsStr::new("repo"),
+            OsStr::new("edit"),
+            &target,
+            OsStr::new("--default-branch"),
+            &branch,
+        ],
+    );
+    Ok(())
+}
+
+/// A grove left in `creating` with an incomplete four-key set — some but not
+/// all of provider/owner/name/remote present — by a process killed mid-write
+/// or mid-rollback. Not a torn-grove failure: clear whatever partial keys
+/// exist and write `unpublished` (Decision 2's clear-then-state-last
+/// ordering, via [`metadata::rollback_creating_receipt`]), then let the
+/// caller proceed as an ordinary fresh attempt in the same invocation.
+///
+/// Runs on `publish`'s own path, under the exclusive lock it already holds,
+/// **before** [`metadata::creating_receipt`] is ever asked to classify this
+/// grove — never inside `metadata::read`, which every command calls,
+/// including read-only ones holding only a shared lock. Both a bare
+/// `publish <url>` and `publish --create` call this identically.
+///
+/// A *complete* four-key receipt is untouched here: that case is not a
+/// repair, it is `accept_rerun`'s `(Creating, None)` arm for a bare
+/// `publish <url>`, or `reconcile_create`'s own classification for
+/// `--create`.
+fn heal_incomplete_creating_receipt(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    metadata: &Metadata,
+) -> Result<Metadata> {
+    if metadata.publish_state != PublishState::Creating {
+        return Ok(metadata.clone());
+    }
+    if metadata::creating_receipt(metadata).is_ok() {
+        return Ok(metadata.clone());
+    }
+    metadata::rollback_creating_receipt(runner, grove)?;
+    metadata::read(runner, grove)
+}
+
 /// Run the publication transaction.
+///
+/// This signature and its behaviour are unchanged by `--create`: it always
+/// runs with no `ProviderRunner`, so [`attempt_gh_default_branch_repair`] is
+/// always a no-op here, regardless of what `metadata` records. `--create`'s
+/// own hand-off calls [`run_with_provider`] directly.
 pub fn run(
     runner: &dyn GitRunner,
     grove: &Grove,
     metadata: &Metadata,
     request: &Request,
 ) -> Result<PublishReport> {
+    run_with_provider(runner, grove, metadata, request, None)
+}
+
+fn run_with_provider(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    metadata: &Metadata,
+    request: &Request,
+    provider_runner: Option<&dyn ProviderRunner>,
+) -> Result<PublishReport> {
+    let metadata = &heal_incomplete_creating_receipt(runner, grove, metadata)?;
     let live = live_remote_url(runner, grove, &request.remote)?;
     let resume = accept_rerun(metadata, live.as_ref(), request)?;
     let flight = preflight(runner, grove, metadata, request)?;
 
     if resume == Resume::RepairPublished {
-        return repair_published(runner, grove, request, &flight);
+        return repair_published(runner, grove, metadata, request, &flight, provider_runner);
     }
 
     let mut diagnostics = Vec::new();
@@ -987,12 +1119,549 @@ pub fn run(
     )?;
 
     configure_local_remote(runner, grove, request, live.is_some())?;
-    publish_and_verify(runner, grove, request, &flight, diagnostics)
+    publish_and_verify(
+        runner,
+        grove,
+        metadata,
+        request,
+        &flight,
+        diagnostics,
+        provider_runner,
+    )
+}
+
+// ============================================================================
+// `publish --create`
+// ============================================================================
+
+/// What `--create <owner>/<name> --host <provider>` asked for. Raw bytes
+/// throughout, like [`Request`]; never parsed or normalised beyond the
+/// `owner`/`name` split `cli::parse_create_target` already validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRequest {
+    pub owner: OsString,
+    pub name: OsString,
+    pub provider: Provider,
+    pub public: bool,
+    pub remote: OsString,
+    pub all_branches: bool,
+}
+
+/// What the durable state says a `--create` run is, decided from whatever is
+/// already recorded, before any provider CLI is ever touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreateResume {
+    /// No creating receipt at all, and `accept_rerun` (with a synthetic
+    /// request) confirms nothing else is in the way.
+    Fresh,
+    /// A creating receipt matching this exact request, state `creating`: a
+    /// real continuation of an earlier, interrupted `--create`.
+    Continue,
+    /// A creating receipt matching this exact request, state `publishing` or
+    /// `published`: the repository was already created (and possibly already
+    /// published); hand off to the existing, unmodified `run()` machinery
+    /// using the classic receipt already on record.
+    ResumeExisting(Request),
+}
+
+/// `--create`'s own state-0 reconciliation against whatever is already
+/// recorded (Decision 4 / the spec's "`--create` against every other state").
+/// Never re-derives `accept_rerun`'s own rules: when no creating receipt is
+/// recorded at all, this calls the real, unmodified `accept_rerun` with a
+/// synthetic request scoped to this one check.
+fn reconcile_create(
+    metadata: &Metadata,
+    live_remote_url: Option<&BString>,
+    create_request: &CreateRequest,
+) -> Result<CreateResume> {
+    let creating = metadata::creating_receipt(metadata)?;
+
+    let Some(recorded) = creating else {
+        let synthetic_url = metadata::receipt(metadata)?
+            .map(|receipt| OsString::from_vec(receipt.url.to_vec()))
+            .unwrap_or_default();
+        let synthetic = Request {
+            url: synthetic_url,
+            remote: create_request.remote.clone(),
+            all_branches: create_request.all_branches,
+        };
+        return match accept_rerun(metadata, live_remote_url, &synthetic) {
+            Ok(Resume::Fresh) => Ok(CreateResume::Fresh),
+            Ok(Resume::ResumePublishing | Resume::RepairPublished) => Err(conflict(
+                "this grove already has a publication in progress or complete",
+                "`--create` only applies before a remote exists",
+            )),
+            Err(error) => Err(error),
+        };
+    };
+
+    if recorded.provider.as_slice() != provider_slug(create_request.provider)
+        || recorded.owner.as_slice() != create_request.owner.as_bytes()
+        || recorded.name.as_slice() != create_request.name.as_bytes()
+        || recorded.remote.as_slice() != create_request.remote.as_bytes()
+    {
+        return Err(conflict(
+            "this grove records a different `--create` request",
+            format!(
+                "recorded {}/{} on {} via remote {}; requested {}/{} on {} via remote {}",
+                escaped(&recorded.owner),
+                escaped(&recorded.name),
+                escaped(&recorded.provider),
+                escaped(&recorded.remote),
+                escaped(create_request.owner.as_bytes()),
+                escaped(create_request.name.as_bytes()),
+                escaped(provider_slug(create_request.provider)),
+                escaped(create_request.remote.as_bytes()),
+            ),
+        ));
+    }
+
+    match metadata.publish_state {
+        PublishState::Creating => Ok(CreateResume::Continue),
+        PublishState::Publishing | PublishState::Published => {
+            let classic = metadata::receipt(metadata)?.ok_or_else(|| {
+                GroveError::failure(
+                    "this grove's creation receipt is complete but its classic publication receipt is missing",
+                )
+            })?;
+            Ok(CreateResume::ResumeExisting(Request {
+                url: OsString::from_vec(classic.url.to_vec()),
+                remote: OsString::from_vec(classic.remote.to_vec()),
+                all_branches: create_request.all_branches,
+            }))
+        }
+        PublishState::Unpublished => {
+            unreachable!("creating_receipt never returns Some for Unpublished")
+        }
+    }
+}
+
+/// `<owner>/<name>`, built without assuming either half is valid UTF-8.
+fn create_target(create_request: &CreateRequest) -> OsString {
+    let mut target = create_request.owner.clone();
+    target.push("/");
+    target.push(&create_request.name);
+    target
+}
+
+/// The ground truth `repo view` established for a target: the two URL forms
+/// and whether the target is empty, plus whether the query's own report of
+/// the target's identity agrees with what was requested (defence against a
+/// provider-side rename/redirect; see `reconcile_create`, which already
+/// refuses a mismatch between what is *recorded* and what was *requested*
+/// before this is ever reached — this is a second, independent check against
+/// what the *provider* itself reports for the query).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoView {
+    https_url: BString,
+    ssh_url: BString,
+    is_empty: bool,
+    matches_target: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct GhRepoView {
+    url: String,
+    #[serde(rename = "sshUrl")]
+    ssh_url: String,
+    #[serde(rename = "isEmpty")]
+    is_empty: bool,
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GlabRepoView {
+    http_url_to_repo: String,
+    ssh_url_to_repo: String,
+    empty_repo: bool,
+    path_with_namespace: String,
+}
+
+fn parse_repo_view(
+    provider: Provider,
+    stdout: &[u8],
+    create_request: &CreateRequest,
+) -> Result<RepoView> {
+    let requested = create_target(create_request);
+    match provider {
+        Provider::GitHub => {
+            let parsed: GhRepoView = serde_json::from_slice(stdout).map_err(|error| {
+                GroveError::failure(format!("cannot parse `gh repo view` output: {error}"))
+            })?;
+            Ok(RepoView {
+                matches_target: parsed.name_with_owner.as_bytes() == requested.as_bytes(),
+                https_url: BString::from(parsed.url),
+                ssh_url: BString::from(parsed.ssh_url),
+                is_empty: parsed.is_empty,
+            })
+        }
+        Provider::GitLab => {
+            let parsed: GlabRepoView = serde_json::from_slice(stdout).map_err(|error| {
+                GroveError::failure(format!("cannot parse `glab repo view` output: {error}"))
+            })?;
+            Ok(RepoView {
+                matches_target: parsed.path_with_namespace.as_bytes() == requested.as_bytes(),
+                https_url: BString::from(parsed.http_url_to_repo),
+                ssh_url: BString::from(parsed.ssh_url_to_repo),
+                is_empty: parsed.empty_repo,
+            })
+        }
+    }
+}
+
+/// The three ways `repo view <owner>/<name>` can leave the sequencing
+/// algorithm: it confirms the target is there, confirms it is not, or the
+/// query itself could not be classified at all.
+///
+/// The last case collapses to almost-never-reachable in practice: by the
+/// construction below, `Missing` is *every* non-zero exit from `repo view`,
+/// regardless of its status or stderr text, and `Err` (this function's
+/// `Result`) is reserved for the query never producing a `ProviderOutput` at
+/// all (a spawn failure). **This is a plan defect, not a specified rule**:
+/// neither `gh help exit-codes` nor `glab`'s undocumented convention gives a
+/// semantic "not found" exit code distinct from any other non-auth failure,
+/// and the plan's own measurement provenance never observed `repo view`
+/// against a genuinely nonexistent target (doing so would be exactly the
+/// real provider call the executor brief forbids). Consensus with
+/// `exec-advisor` (`.superpowers/sdd/2026-08-22-git-grove-publish-create/exec-advisor-repo-view-classification.md`):
+/// classify by the `Result`/`ProviderOutput` type boundary alone, never by
+/// exit-code value or stderr text — the only signal that isn't a guess.
+enum RepoViewOutcome {
+    Found(RepoView),
+    Missing,
+}
+
+fn indeterminate_repo_view_failure(create_request: &CreateRequest) -> GroveError {
+    GroveError::failure(format!(
+        "cannot confirm whether {} exists on {}",
+        escaped(create_target(create_request).as_bytes()),
+        create_request.provider.host_env().1,
+    ))
+    .with_detail(
+        "this grove stays in `creating`; clear grove.publishProvider, grove.publishOwner, grove.publishName, and grove.publishRemote by hand to force a fresh attempt, or rerun once the failure is resolved",
+    )
+}
+
+fn query_repo_view(
+    provider_runner: &dyn ProviderRunner,
+    create_request: &CreateRequest,
+) -> Result<RepoViewOutcome> {
+    let target = create_target(create_request);
+    let args: Vec<&OsStr> = match create_request.provider {
+        Provider::GitHub => vec![
+            OsStr::new("repo"),
+            OsStr::new("view"),
+            &target,
+            OsStr::new("--json"),
+            OsStr::new("url,sshUrl,isEmpty,nameWithOwner"),
+        ],
+        Provider::GitLab => vec![
+            OsStr::new("repo"),
+            OsStr::new("view"),
+            &target,
+            OsStr::new("-F"),
+            OsStr::new("json"),
+        ],
+    };
+    let output = provider_runner
+        .run(create_request.provider, &args)
+        .map_err(|_| indeterminate_repo_view_failure(create_request))?;
+    if !output.ok() {
+        return Ok(RepoViewOutcome::Missing);
+    }
+    Ok(RepoViewOutcome::Found(parse_repo_view(
+        create_request.provider,
+        &output.stdout,
+        create_request,
+    )?))
+}
+
+/// `<provider> repo create <owner>/<name> --private|--public`, and for
+/// `glab`, unconditionally `--skipGitInit --defaultBranch <branch>` too
+/// (Decision 5/8). Never `--clone`/`--push`/`--source`/anything that gives
+/// the repository an initial commit.
+fn call_create(
+    provider_runner: &dyn ProviderRunner,
+    create_request: &CreateRequest,
+    flight: &Preflight,
+) -> Result<ProviderOutput> {
+    let target = create_target(create_request);
+    let visibility = if create_request.public {
+        OsStr::new("--public")
+    } else {
+        OsStr::new("--private")
+    };
+    let branch = OsString::from_vec(flight.default_branch.to_vec());
+    let args: Vec<&OsStr> = match create_request.provider {
+        Provider::GitHub => vec![
+            OsStr::new("repo"),
+            OsStr::new("create"),
+            &target,
+            visibility,
+        ],
+        Provider::GitLab => vec![
+            OsStr::new("repo"),
+            OsStr::new("create"),
+            &target,
+            visibility,
+            OsStr::new("--skipGitInit"),
+            OsStr::new("--defaultBranch"),
+            &branch,
+        ],
+    };
+    provider_runner.run(create_request.provider, &args)
+}
+
+/// `gh`'s own documented "requires authentication" exit (`4`) maps to exit
+/// `2`; everything else maps to `1` with the provider's raw stderr attached.
+fn create_failure_error(create_request: &CreateRequest, output: &ProviderOutput) -> GroveError {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if create_request.provider == Provider::GitHub && output.status == 4 {
+        conflict(
+            format!(
+                "could not create {} on {}",
+                escaped(create_target(create_request).as_bytes()),
+                create_request.provider.host_env().1
+            ),
+            detail,
+        )
+    } else {
+        GroveError::failure(format!(
+            "cannot create {} on {}",
+            escaped(create_target(create_request).as_bytes()),
+            create_request.provider.host_env().1
+        ))
+        .with_detail(detail)
+    }
+}
+
+fn unrelated_existing_repository_error(create_request: &CreateRequest) -> GroveError {
+    conflict(
+        "the publication target is an unrelated existing repository",
+        format!(
+            "{} exists on {} but does not match what this grove recorded creating",
+            escaped(create_target(create_request).as_bytes()),
+            create_request.provider.host_env().1
+        ),
+    )
+}
+
+/// Confirm `view` belongs to this grove's own creating target, rolling the
+/// receipt back and refusing otherwise (the "unrelated existing repository"
+/// outcome — reachable defensively even though `reconcile_create` already
+/// refused a mismatch between what was *recorded* and *requested*, since
+/// this checks what the *provider* itself reports for the query).
+fn finish_repo_view(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    create_request: &CreateRequest,
+    view: RepoView,
+) -> Result<RepoView> {
+    if view.matches_target {
+        Ok(view)
+    } else {
+        metadata::rollback_creating_receipt(runner, grove)?;
+        Err(unrelated_existing_repository_error(create_request))
+    }
+}
+
+/// The spec's *Sequencing* steps 5–6 and their outcomes: a continuation
+/// queries `repo view` before ever calling `create` again; a fresh attempt,
+/// or a continuation that found the target missing, calls `create` and
+/// resolves the *outcome* from a follow-up query — never from `create`'s own
+/// stdout, which has no structured output and is a one-shot, unrepeatable
+/// observation.
+fn run_sequencing(
+    runner: &dyn GitRunner,
+    provider_runner: &dyn ProviderRunner,
+    grove: &Grove,
+    create_request: &CreateRequest,
+    flight: &Preflight,
+    continuing: bool,
+) -> Result<RepoView> {
+    if continuing {
+        if let RepoViewOutcome::Found(view) = query_repo_view(provider_runner, create_request)? {
+            return finish_repo_view(runner, grove, create_request, view);
+        }
+        // Missing: an earlier attempt never got far enough to create it.
+        // Fall through to the same call-create step the fresh path takes.
+    }
+
+    let create_output = call_create(provider_runner, create_request, flight)?;
+    if create_output.ok() {
+        match query_repo_view(provider_runner, create_request)? {
+            RepoViewOutcome::Found(view) => finish_repo_view(runner, grove, create_request, view),
+            RepoViewOutcome::Missing => Err(GroveError::failure(
+                "the hosting side reported success creating the repository, but a follow-up query cannot find it",
+            )),
+        }
+    } else {
+        match query_repo_view(provider_runner, create_request)? {
+            RepoViewOutcome::Missing => {
+                metadata::rollback_creating_receipt(runner, grove)?;
+                Err(create_failure_error(create_request, &create_output))
+            }
+            RepoViewOutcome::Found(view) => finish_repo_view(runner, grove, create_request, view),
+        }
+    }
+}
+
+/// The provider's own configured `git_protocol`, looked up **scoped to the
+/// pinned host** — never the unscoped form, which measurement showed
+/// disagrees with the host-scoped value on the machine this was specified
+/// on. Defaults to `https` on any failure or absence, exactly as the spec
+/// requires: this call's own errors are never surfaced to the user.
+fn configured_git_protocol(provider_runner: &dyn ProviderRunner, provider: Provider) -> BString {
+    let host = provider.host_env().1;
+    let args = [
+        OsStr::new("config"),
+        OsStr::new("get"),
+        OsStr::new("git_protocol"),
+        OsStr::new("--host"),
+        OsStr::new(host),
+    ];
+    let Ok(output) = provider_runner.run(provider, &args) else {
+        return BString::from("https");
+    };
+    if !output.ok() {
+        return BString::from("https");
+    }
+    let trimmed = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
+    if trimmed.is_empty() {
+        BString::from("https")
+    } else {
+        BString::from(trimmed.to_vec())
+    }
+}
+
+/// Deriving the URL (never parsed from `create`'s stdout): the field chosen
+/// by the host-scoped `git_protocol` lookup, recorded byte-verbatim into a
+/// classic receipt via the existing, unmodified [`metadata::write_receipt`],
+/// leaving the three creating keys untouched.
+fn derive_and_publish(
+    runner: &dyn GitRunner,
+    provider_runner: &dyn ProviderRunner,
+    grove: &Grove,
+    create_request: &CreateRequest,
+    view: RepoView,
+) -> Result<Request> {
+    let protocol = configured_git_protocol(provider_runner, create_request.provider);
+    let url_bytes = if protocol.as_slice() == b"ssh" {
+        view.ssh_url
+    } else {
+        view.https_url
+    };
+
+    metadata::write_receipt(
+        runner,
+        grove,
+        PublishState::Publishing,
+        &Receipt {
+            remote: BString::from(create_request.remote.as_bytes().to_vec()),
+            url: url_bytes.clone(),
+        },
+    )?;
+
+    Ok(Request {
+        url: OsString::from_vec(url_bytes.to_vec()),
+        remote: create_request.remote.clone(),
+        all_branches: create_request.all_branches,
+    })
+}
+
+/// Checked read-only, after the local preflight and before any provider
+/// mutation: `gh auth status` / `glab auth status`, judged by exit code
+/// alone. A non-zero exit maps to exit `2`, phrased as "could not confirm
+/// authentication" rather than "not authenticated" — both CLIs' `auth
+/// status` validate the stored token over the network, so a non-zero exit
+/// also covers an unreachable host.
+fn check_provider_auth(provider_runner: &dyn ProviderRunner, provider: Provider) -> Result<()> {
+    let output = provider_runner.run(provider, &[OsStr::new("auth"), OsStr::new("status")])?;
+    if output.ok() {
+        Ok(())
+    } else {
+        Err(conflict(
+            format!(
+                "could not confirm authentication for {}",
+                provider.host_env().1
+            ),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// Create the hosting-side repository through `gh`/`glab`, then publish to
+/// it, reusing the existing `publish` push/verification machinery unchanged
+/// from the point a URL exists (Decision 6's ordering: version gate → local
+/// preflight → auth check → reconciliation → sequencing → hand-off).
+pub fn run_create(
+    git_runner: &dyn GitRunner,
+    provider_runner: &dyn ProviderRunner,
+    grove: &Grove,
+    metadata: &Metadata,
+    create_request: &CreateRequest,
+) -> Result<PublishReport> {
+    let metadata = &heal_incomplete_creating_receipt(git_runner, grove, metadata)?;
+
+    provider::check_provider_version(provider_runner, create_request.provider)?;
+
+    validate_remote_name(git_runner, &create_request.remote)?;
+    let flight = check_publishable_repository(git_runner, grove, metadata)?;
+
+    check_provider_auth(provider_runner, create_request.provider)?;
+
+    let live = live_remote_url(git_runner, grove, &create_request.remote)?;
+    let resume = reconcile_create(metadata, live.as_ref(), create_request)?;
+
+    let request = match resume {
+        CreateResume::ResumeExisting(request) => request,
+        CreateResume::Fresh => {
+            metadata::write_creating_receipt(
+                git_runner,
+                grove,
+                &BString::from(provider_slug(create_request.provider)),
+                &BString::from(create_request.owner.as_bytes().to_vec()),
+                &BString::from(create_request.name.as_bytes().to_vec()),
+                &BString::from(create_request.remote.as_bytes().to_vec()),
+            )?;
+            let view = run_sequencing(
+                git_runner,
+                provider_runner,
+                grove,
+                create_request,
+                &flight,
+                false,
+            )?;
+            derive_and_publish(git_runner, provider_runner, grove, create_request, view)?
+        }
+        CreateResume::Continue => {
+            let view = run_sequencing(
+                git_runner,
+                provider_runner,
+                grove,
+                create_request,
+                &flight,
+                true,
+            )?;
+            derive_and_publish(git_runner, provider_runner, grove, create_request, view)?
+        }
+    };
+
+    let metadata = metadata::read(git_runner, grove)?;
+    run_with_provider(
+        git_runner,
+        grove,
+        &metadata,
+        &request,
+        Some(provider_runner),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::provider::{ProviderOutput as PO, RecordingFake as ProviderFake};
     use crate::git::runner::{GitOutput, RecordingFake};
 
     fn grove() -> Grove {
@@ -1256,6 +1925,122 @@ mod tests {
         assert!(detail.contains("--create"));
     }
 
+    // ---- self-healing an incomplete `creating` receipt ------------------
+
+    fn creating_metadata(
+        provider: Option<&str>,
+        owner: Option<&str>,
+        name: Option<&str>,
+        remote: Option<&str>,
+    ) -> Metadata {
+        let mut metadata = unpublished();
+        metadata.publish_state = PublishState::Creating;
+        metadata.publish_provider = provider.map(BString::from);
+        metadata.publish_owner = owner.map(BString::from);
+        metadata.publish_name = name.map(BString::from);
+        metadata.publish_remote = remote.map(BString::from);
+        metadata
+    }
+
+    #[test]
+    fn an_incomplete_creating_receipt_is_healed_before_accept_rerun_ever_sees_it() {
+        for missing in 0..4 {
+            let mut fields = [
+                Some("github"),
+                Some("acme"),
+                Some("widgets"),
+                Some("origin"),
+            ];
+            fields[missing] = None;
+            let metadata = creating_metadata(fields[0], fields[1], fields[2], fields[3]);
+            let fake = RecordingFake::new();
+            // rollback_creating_receipt: 4 unsets + 1 state write.
+            for _ in 0..5 {
+                fake.push_response(out(0, b""));
+            }
+            // The re-read metadata::read performs, landing on a plain
+            // unpublished grove with no receipt at all.
+            fake.push_response(absent()); // grove.version
+            fake.push_response(absent()); // grove.defaultBranch
+            fake.push_response(absent()); // grove.remote
+            fake.push_response(out(0, b"unpublished\n")); // grove.publishState
+            fake.push_response(absent()); // grove.publishRemote
+            fake.push_response(absent()); // grove.publishUrl
+            fake.push_response(absent()); // grove.publishProvider
+            fake.push_response(absent()); // grove.publishOwner
+            fake.push_response(absent()); // grove.publishName
+
+            let healed = heal_incomplete_creating_receipt(&fake, &grove(), &metadata).unwrap();
+
+            assert_eq!(
+                healed.publish_state,
+                PublishState::Unpublished,
+                "missing {missing}"
+            );
+            let calls = calls_of(&fake);
+            assert_eq!(calls.len(), 14, "missing {missing}");
+            assert_eq!(
+                calls[0],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "--unset-all",
+                    "grove.publishProvider"
+                ]
+            );
+            assert_eq!(
+                calls[3],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "--unset-all",
+                    "grove.publishRemote"
+                ]
+            );
+            assert_eq!(
+                calls[4],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "grove.publishState",
+                    "unpublished"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_complete_creating_receipt_is_never_healed() {
+        let metadata = creating_metadata(
+            Some("github"),
+            Some("acme"),
+            Some("widgets"),
+            Some("origin"),
+        );
+        let fake = RecordingFake::new();
+
+        let healed = heal_incomplete_creating_receipt(&fake, &grove(), &metadata).unwrap();
+
+        assert_eq!(healed, metadata);
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn a_non_creating_state_is_never_healed_even_with_stray_creating_keys() {
+        let fake = RecordingFake::new();
+        // A state other than `Creating` is not this repair's concern at all —
+        // `receipt()`/`creating_receipt()` classify whatever shape it carries.
+        let metadata = unpublished();
+
+        let healed = heal_incomplete_creating_receipt(&fake, &grove(), &metadata).unwrap();
+
+        assert_eq!(healed, metadata);
+        assert!(fake.calls().is_empty());
+    }
+
     // ---- exact byte equality, with no canonicalisation whatsoever -------
 
     #[test]
@@ -1460,6 +2245,41 @@ mod tests {
         assert_eq!(error.class, ExitClass::NeedsDecision);
         assert!(error.message.contains("main"));
         assert!(wrote_no_publish_state(&fake));
+    }
+
+    /// `check_publishable_repository` is `preflight`'s URL-independent half —
+    /// `--create` calls it with no URL involved at all, and it must give the
+    /// exact same refusals `preflight` already gives for "no commit"/"no
+    /// default branch".
+    #[test]
+    fn check_publishable_repository_gives_the_same_refusals_as_preflight_with_no_url_at_all() {
+        let fake = RecordingFake::new();
+        fake.push_response(out(0, b"")); // has_any_commit: nothing
+
+        let error = check_publishable_repository(&fake, &grove(), &unpublished()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.detail.unwrap().contains("commit"));
+
+        let fake = RecordingFake::new();
+        fake.push_response(out(0, b"refs/heads/main\n"));
+        fake.push_response(out(1, b"")); // show-ref --verify: no refs/heads/main
+
+        let error = check_publishable_repository(&fake, &grove(), &unpublished()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.message.contains("main"));
+    }
+
+    #[test]
+    fn check_publishable_repository_succeeds_on_a_grove_ready_to_publish() {
+        let fake = RecordingFake::new();
+        fake.push_response(out(0, b"refs/heads/main\n"));
+        fake.push_response(out(0, b"")); // show-ref --verify refs/heads/main
+
+        let flight = check_publishable_repository(&fake, &grove(), &unpublished()).unwrap();
+
+        assert_eq!(flight.default_branch, BString::from("main"));
     }
 
     // ---- the probe decision, specification steps 2 and 3 ---------------
@@ -2090,14 +2910,14 @@ mod tests {
         fake.push_response(out(0, b""));
         fake.push_response(values(&[b"origin"]));
         fake.push_response(values(&[b"refs/heads/main"]));
-        fake.push_response(out(0, b""));
-        fake.push_response(out(0, b""));
-        fake.push_response(out(0, b"refs/remotes/origin/main\n"));
-        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        fake.push_response(out(0, format!("{OID}\n").as_bytes()));
-        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)]));
+        fake.push_response(out(0, b"")); // verify_tracking_ref: ref_exists
+        fake.push_response(advert_of("refs/heads/main", &[("refs/heads/main", OID)])); // server_head_matches
+        fake.push_response(out(0, b"")); // remote set-head --auto
+        fake.push_response(out(0, b"refs/remotes/origin/main\n")); // remote_head_branch: symbolic-ref
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // remote_head_branch: show-ref --hash
+        fake.push_response(out(0, format!("{OID}\n").as_bytes())); // remote_head_branch: rev-parse
         for _ in 0..3 {
-            fake.push_response(out(0, b""));
+            fake.push_response(out(0, b"")); // the published receipt
         }
         let request = Request {
             url: OsString::from(URL),
@@ -2105,7 +2925,8 @@ mod tests {
             all_branches: true,
         };
 
-        run(&fake, &grove(), &unpublished(), &request).unwrap();
+        let report = run(&fake, &grove(), &unpublished(), &request).unwrap();
+        assert_eq!(report.class, ExitClass::Ok);
 
         let pushes: Vec<Vec<String>> = calls_of(&fake)
             .into_iter()
@@ -2534,6 +3355,670 @@ mod tests {
             receipts.last().unwrap().last().unwrap(),
             URL,
             "the receipt itself is untouched, so the matrix still resumes"
+        );
+    }
+
+    // ==== `publish --create` ==============================================
+
+    const OWNER: &str = "acme";
+    const NAME: &str = "widgets";
+    const HTTPS_URL: &str = "https://github.com/acme/widgets.git";
+    const SSH_URL: &str = "git@github.com:acme/widgets.git";
+
+    fn create_request() -> CreateRequest {
+        CreateRequest {
+            owner: OsString::from(OWNER),
+            name: OsString::from(NAME),
+            provider: Provider::GitHub,
+            public: false,
+            remote: OsString::from("origin"),
+            all_branches: false,
+        }
+    }
+
+    fn po(status: i32, stdout: &[u8]) -> PO {
+        PO {
+            status,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn po_err(status: i32, stderr: &[u8]) -> PO {
+        PO {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    fn gh_view_json(name_with_owner: &str, is_empty: bool) -> Vec<u8> {
+        format!(
+            r#"{{"url":"{HTTPS_URL}","sshUrl":"{SSH_URL}","isEmpty":{is_empty},"nameWithOwner":"{name_with_owner}"}}"#
+        )
+        .into_bytes()
+    }
+
+    // ---- reconcile_create -------------------------------------------------
+
+    #[test]
+    fn reconcile_create_is_fresh_when_nothing_is_recorded_at_all() {
+        let metadata = unpublished();
+
+        assert_eq!(
+            reconcile_create(&metadata, None, &create_request()).unwrap(),
+            CreateResume::Fresh
+        );
+    }
+
+    #[test]
+    fn reconcile_create_refuses_a_stray_remote_on_an_unpublished_grove() {
+        let metadata = unpublished();
+
+        let error = reconcile_create(
+            &metadata,
+            Some(&BString::from("https://other.invalid/r.git")),
+            &create_request(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+    }
+
+    #[test]
+    fn reconcile_create_refuses_a_grove_already_publishing_or_published_with_no_creating_receipt() {
+        for state in [PublishState::Publishing, PublishState::Published] {
+            let metadata = metadata_of(state, Some("origin"), Some(URL));
+
+            let error = reconcile_create(&metadata, Some(&BString::from(URL)), &create_request())
+                .unwrap_err();
+
+            assert_eq!(error.class, ExitClass::NeedsDecision);
+            assert!(error.detail.unwrap().contains("--create"));
+        }
+    }
+
+    fn creating_receipt_metadata(
+        owner: &str,
+        name: &str,
+        remote: &str,
+        provider: &str,
+    ) -> Metadata {
+        creating_metadata(Some(provider), Some(owner), Some(name), Some(remote))
+    }
+
+    #[test]
+    fn reconcile_create_continues_a_matching_creating_grove() {
+        let metadata = creating_receipt_metadata(OWNER, NAME, "origin", "github");
+
+        assert_eq!(
+            reconcile_create(&metadata, None, &create_request()).unwrap(),
+            CreateResume::Continue
+        );
+    }
+
+    #[test]
+    fn reconcile_create_resumes_existing_for_a_matching_publishing_grove() {
+        let mut metadata = creating_receipt_metadata(OWNER, NAME, "origin", "github");
+        metadata.publish_state = PublishState::Publishing;
+        metadata.publish_remote = Some(BString::from("origin"));
+        metadata.publish_url = Some(BString::from(URL));
+
+        let resume = reconcile_create(&metadata, None, &create_request()).unwrap();
+
+        assert_eq!(
+            resume,
+            CreateResume::ResumeExisting(Request {
+                url: OsString::from(URL),
+                remote: OsString::from("origin"),
+                all_branches: false,
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_create_refuses_a_mismatched_owner_or_name() {
+        let metadata = creating_receipt_metadata("other-owner", NAME, "origin", "github");
+
+        let error = reconcile_create(&metadata, None, &create_request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.detail.unwrap().contains("other-owner"));
+    }
+
+    /// Regression test for the round-6 finding: a naive comparison must not
+    /// silently discard a disagreeing `--remote`.
+    #[test]
+    fn reconcile_create_refuses_a_mismatched_remote_specifically() {
+        let metadata = creating_receipt_metadata(OWNER, NAME, "upstream", "github");
+
+        let error = reconcile_create(&metadata, None, &create_request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        let detail = error.detail.unwrap();
+        assert!(detail.contains("upstream"));
+        assert!(detail.contains("origin"));
+    }
+
+    // ---- run_sequencing -----------------------------------------------
+
+    #[test]
+    fn fresh_sequencing_succeeds_when_create_returns_zero() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"")); // create
+        provider.push_response(po(0, &gh_view_json("acme/widgets", true))); // repo view
+
+        let view = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &Preflight {
+                default_branch: BString::from("main"),
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(view.https_url, BString::from(HTTPS_URL));
+        assert!(view.is_empty);
+        assert!(
+            git.calls().is_empty(),
+            "no git call happens during sequencing itself"
+        );
+    }
+
+    #[test]
+    fn fresh_sequencing_rolls_back_and_surfaces_the_original_failure_when_repo_view_confirms_missing(
+    ) {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po_err(1, b"some generic failure")); // create
+        provider.push_response(po(1, b"")); // repo view: missing
+
+        let error = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.detail.unwrap().contains("some generic failure"));
+        assert_eq!(
+            calls_of(&git)[0],
+            vec![
+                "config",
+                "--file",
+                CONFIG,
+                "--unset-all",
+                "grove.publishProvider"
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_sequencing_maps_ghs_exit_4_to_a_decision() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(4, b"authentication required")); // create
+        provider.push_response(po(1, b"")); // repo view: missing
+
+        let error = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+    }
+
+    #[test]
+    fn fresh_sequencing_treats_create_failure_as_success_when_repo_view_confirms_it_exists_and_matches(
+    ) {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"rate limited")); // create fails
+        provider.push_response(po(0, &gh_view_json("acme/widgets", false))); // exists, matches, non-empty
+
+        let view = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            false,
+        )
+        .unwrap();
+
+        assert!(!view.is_empty);
+        assert!(
+            git.calls().is_empty(),
+            "the original failure is not surfaced"
+        );
+    }
+
+    #[test]
+    fn fresh_sequencing_refuses_an_unrelated_existing_repository_and_rolls_back() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"name already exists"));
+        provider.push_response(po(0, &gh_view_json("someone-else/widgets", true)));
+
+        let error = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.message.contains("unrelated"));
+        assert_eq!(
+            calls_of(&git)[0],
+            vec![
+                "config",
+                "--file",
+                CONFIG,
+                "--unset-all",
+                "grove.publishProvider"
+            ]
+        );
+    }
+
+    #[test]
+    fn continuation_sequencing_never_calls_create_when_repo_view_already_confirms_it() {
+        for is_empty in [true, false] {
+            let git = RecordingFake::new();
+            let provider = ProviderFake::new();
+            provider.push_response(po(0, &gh_view_json("acme/widgets", is_empty)));
+
+            run_sequencing(
+                &git,
+                &provider,
+                &grove(),
+                &create_request(),
+                &flight(),
+                true,
+            )
+            .unwrap();
+
+            assert_eq!(
+                provider.calls().len(),
+                1,
+                "create must never be called on this path"
+            );
+            assert!(!provider.calls()[0].1.contains(&OsString::from("create")));
+        }
+    }
+
+    #[test]
+    fn continuation_sequencing_falls_through_to_create_when_repo_view_finds_nothing() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"")); // step 5 probe: missing
+        provider.push_response(po(0, b"")); // create
+        provider.push_response(po(0, &gh_view_json("acme/widgets", true))); // step 6 follow-up
+
+        let view = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            true,
+        )
+        .unwrap();
+
+        assert!(view.is_empty);
+        assert_eq!(provider.calls().len(), 3);
+    }
+
+    #[test]
+    fn continuation_sequencing_refuses_an_unrelated_repo_view_result_without_ever_calling_create() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, &gh_view_json("someone-else/widgets", true)));
+
+        let error = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert_eq!(provider.calls().len(), 1, "create must never be called");
+    }
+
+    #[test]
+    fn repo_view_erroring_stays_creating_and_names_the_four_keys() {
+        struct AlwaysFails;
+        impl ProviderRunner for AlwaysFails {
+            fn run(&self, _: Provider, _: &[&OsStr]) -> Result<ProviderOutput> {
+                Err(GroveError::failure(
+                    "cannot run gh: No such file or directory",
+                ))
+            }
+        }
+        let git = RecordingFake::new();
+
+        let error = run_sequencing(
+            &git,
+            &AlwaysFails,
+            &grove(),
+            &create_request(),
+            &flight(),
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.detail.unwrap().contains("grove.publishProvider"));
+        assert!(
+            git.calls().is_empty(),
+            "the receipt is never rolled back here"
+        );
+    }
+
+    fn flight() -> Preflight {
+        Preflight {
+            default_branch: BString::from("main"),
+        }
+    }
+
+    // ---- derive_and_publish -------------------------------------------
+
+    fn view_of(is_empty: bool) -> RepoView {
+        RepoView {
+            https_url: BString::from(HTTPS_URL),
+            ssh_url: BString::from(SSH_URL),
+            is_empty,
+            matches_target: true,
+        }
+    }
+
+    #[test]
+    fn derive_and_publish_uses_https_by_default() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"")); // git_protocol lookup fails -> default https
+
+        let request =
+            derive_and_publish(&git, &provider, &grove(), &create_request(), view_of(true))
+                .unwrap();
+
+        assert_eq!(request.url, OsString::from(HTTPS_URL));
+        let calls = calls_of(&git);
+        assert_eq!(
+            calls[0],
+            vec![
+                "config",
+                "--file",
+                CONFIG,
+                "grove.publishState",
+                "publishing"
+            ]
+        );
+        assert!(calls
+            .iter()
+            .any(|call| call.last() == Some(&HTTPS_URL.to_string())));
+    }
+
+    #[test]
+    fn derive_and_publish_uses_ssh_when_git_protocol_is_scoped_to_ssh() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"ssh\n"));
+
+        let request =
+            derive_and_publish(&git, &provider, &grove(), &create_request(), view_of(true))
+                .unwrap();
+
+        assert_eq!(request.url, OsString::from(SSH_URL));
+        assert_eq!(
+            provider.calls()[0].1,
+            vec![
+                OsString::from("config"),
+                OsString::from("get"),
+                OsString::from("git_protocol"),
+                OsString::from("--host"),
+                OsString::from("github.com"),
+            ],
+            "the git_protocol lookup must be host-scoped, never the unscoped form"
+        );
+    }
+
+    #[test]
+    fn derive_and_publish_leaves_the_creating_keys_untouched() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"https\n"));
+
+        derive_and_publish(&git, &provider, &grove(), &create_request(), view_of(true)).unwrap();
+
+        let calls = calls_of(&git);
+        assert!(!calls.iter().any(|call| call
+            .iter()
+            .any(|arg| arg.starts_with("grove.publishProvider")
+                || arg.starts_with("grove.publishOwner")
+                || arg.starts_with("grove.publishName"))));
+    }
+
+    // ---- check_provider_auth / version gate call sites -----------------
+
+    #[test]
+    fn check_provider_auth_accepts_a_zero_exit() {
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b""));
+
+        check_provider_auth(&provider, Provider::GitHub).unwrap();
+    }
+
+    #[test]
+    fn check_provider_auth_refuses_a_nonzero_exit_as_a_decision() {
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"not logged in"));
+
+        let error = check_provider_auth(&provider, Provider::GitHub).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.message.contains("github.com"));
+    }
+
+    // ---- the gh-default-branch repair -----------------------------------
+
+    #[test]
+    fn gh_default_branch_repair_is_a_noop_without_a_provider_runner() {
+        let metadata = creating_receipt_metadata(OWNER, NAME, "origin", "github");
+        attempt_gh_default_branch_repair(None, &metadata, &request(), &flight()).unwrap();
+    }
+
+    #[test]
+    fn gh_default_branch_repair_is_a_noop_for_a_bare_published_grove() {
+        let provider = ProviderFake::new();
+        let metadata = unpublished();
+
+        attempt_gh_default_branch_repair(Some(&provider), &metadata, &request(), &flight())
+            .unwrap();
+
+        assert!(provider.calls().is_empty());
+    }
+
+    #[test]
+    fn gh_default_branch_repair_never_applies_to_gitlab() {
+        let provider = ProviderFake::new();
+        let metadata = creating_receipt_metadata(OWNER, NAME, "origin", "gitlab");
+
+        attempt_gh_default_branch_repair(Some(&provider), &metadata, &request(), &flight())
+            .unwrap();
+
+        assert!(provider.calls().is_empty());
+    }
+
+    #[test]
+    fn gh_default_branch_repair_runs_gh_repo_edit_for_a_matching_creating_grove() {
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b""));
+        let metadata = creating_receipt_metadata(OWNER, NAME, "origin", "github");
+
+        attempt_gh_default_branch_repair(Some(&provider), &metadata, &request(), &flight())
+            .unwrap();
+
+        assert_eq!(
+            provider.calls()[0],
+            (
+                Provider::GitHub,
+                vec![
+                    OsString::from("repo"),
+                    OsString::from("edit"),
+                    OsString::from("acme/widgets"),
+                    OsString::from("--default-branch"),
+                    OsString::from("main"),
+                ]
+            )
+        );
+    }
+
+    // ---- run_create end to end (unit level, both runners faked) --------
+
+    /// The fresh path writes the creating receipt, runs sequencing, derives
+    /// the URL, writes the classic receipt, and hands off into `run()`'s own
+    /// machinery — proven here by a deterministic second preflight failure
+    /// downstream, which only `run_with_provider`'s own re-entry into
+    /// `preflight` could produce.
+    #[test]
+    fn run_create_fresh_writes_the_creating_receipt_then_hands_off_to_run() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"gh version 2.97.0 (2026-07-31)\n")); // version gate
+        provider.push_response(po(0, b"")); // auth status
+        provider.push_response(po(0, b"")); // create
+        provider.push_response(po(0, &gh_view_json("acme/widgets", true))); // repo view
+        provider.push_response(po(1, b"")); // git_protocol -> default https
+
+        git.push_response(out(0, b"")); // validate_remote_name: check-ref-format
+                                        // check_publishable_repository
+        git.push_response(out(0, b"refs/heads/main\n")); // has_any_commit
+        git.push_response(out(0, b"")); // show-ref --verify refs/heads/main
+                                        // live_remote_url (none configured yet)
+        git.push_response(absent());
+        // write_creating_receipt: state, provider, owner, name, remote.
+        for _ in 0..5 {
+            git.push_response(out(0, b""));
+        }
+        // derive_and_publish's classic write_receipt: state, remote, url.
+        for _ in 0..3 {
+            git.push_response(out(0, b""));
+        }
+        // metadata::read, re-reading after derive_and_publish's classic write.
+        git.push_response(absent()); // grove.version
+        git.push_response(out(0, b"main\n")); // grove.defaultBranch
+        git.push_response(absent()); // grove.remote
+        git.push_response(out(0, b"publishing\n")); // grove.publishState
+        git.push_response(out(0, b"origin\n")); // grove.publishRemote
+        git.push_response(out(0, format!("{HTTPS_URL}\n").as_bytes())); // grove.publishUrl
+        git.push_response(out(0, b"github\n")); // grove.publishProvider
+        git.push_response(out(0, format!("{OWNER}\n").as_bytes())); // grove.publishOwner
+        git.push_response(out(0, format!("{NAME}\n").as_bytes())); // grove.publishName
+                                                                   // run_with_provider: live_remote_url, then a second, deterministic
+                                                                   // preflight failure stands in for the rest of the existing,
+                                                                   // already-tested `run()` pipeline.
+        git.push_response(absent());
+        git.push_response(out(0, b"")); // check-ref-format
+        git.push_response(out(0, b"")); // has_any_commit: nothing this time
+
+        let metadata = unpublished();
+        let error =
+            run_create(&git, &provider, &grove(), &metadata, &create_request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.detail.unwrap().contains("commit"));
+        let calls = calls_of(&git);
+        assert!(calls.iter().any(
+            |call| call == &vec!["config", "--file", CONFIG, "grove.publishState", "creating"]
+        ));
+        assert!(calls.iter().any(|call| call
+            == &vec![
+                "config",
+                "--file",
+                CONFIG,
+                "grove.publishState",
+                "publishing"
+            ]));
+    }
+
+    #[test]
+    fn run_create_refuses_below_the_version_floor_before_touching_the_grove() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"gh version 2.90.0 (2026-01-01)\n"));
+
+        let metadata = unpublished();
+        let error =
+            run_create(&git, &provider, &grove(), &metadata, &create_request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Usage);
+        assert!(git.calls().is_empty());
+    }
+
+    #[test]
+    fn run_create_refuses_an_unauthenticated_provider_after_the_local_preflight() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"gh version 2.97.0 (2026-07-31)\n"));
+        provider.push_response(po(1, b"not logged in"));
+        git.push_response(out(0, b"")); // check-ref-format
+        git.push_response(out(0, b"refs/heads/main\n"));
+        git.push_response(out(0, b""));
+
+        let metadata = unpublished();
+        let error =
+            run_create(&git, &provider, &grove(), &metadata, &create_request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+    }
+
+    #[test]
+    fn run_create_against_an_already_published_creating_grove_never_touches_the_provider() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"gh version 2.97.0 (2026-07-31)\n")); // version gate
+        provider.push_response(po(0, b"")); // auth status
+        git.push_response(out(0, b"")); // check-ref-format
+        git.push_response(out(0, b"refs/heads/main\n"));
+        git.push_response(out(0, b""));
+        git.push_response(values(&[URL.as_bytes()])); // live_remote_url
+
+        let mut metadata = creating_receipt_metadata(OWNER, NAME, "origin", "github");
+        metadata.publish_state = PublishState::Published;
+        metadata.publish_remote = Some(BString::from("origin"));
+        metadata.publish_url = Some(BString::from(URL));
+
+        run_create(&git, &provider, &grove(), &metadata, &create_request()).unwrap_err();
+        // A `Published` grove with a matching creating receipt hands off to
+        // `run()`, which itself probes the remote before repairing — but the
+        // fixture above supplies no further responses for that, so this
+        // assertion only needs the provider side: `create`/`repo view` are
+        // never invoked once `reconcile_create` resolves to `ResumeExisting`.
+        assert_eq!(
+            provider.calls().len(),
+            2,
+            "only the version gate and auth check ran"
         );
     }
 }
