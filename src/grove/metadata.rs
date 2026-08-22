@@ -125,6 +125,14 @@ pub fn receipt(metadata: &Metadata) -> Result<Option<Receipt>> {
         // through `creating_receipt`, not this one. This is a legitimate
         // absence, not the "incomplete receipt" `Failure` below.
         (PublishState::Creating, Some(_), None) => Ok(None),
+        // `creating` forbids `publishUrl` outright (Decision 1): a `creating`
+        // grove that already carries one — with or without `publishRemote` —
+        // is torn, not a classic receipt to reinterpret. Checked ahead of the
+        // wildcard arm below, which would otherwise read it as one.
+        (PublishState::Creating, _, Some(_)) => Err(GroveError::failure(
+            "this grove's publish state is creating but it already carries a completed publication URL",
+        )
+        .with_detail("grove.publishUrl must never be set while grove.publishState is creating")),
         (_, Some(remote), Some(url)) => Ok(Some(Receipt {
             remote: remote.clone(),
             url: url.clone(),
@@ -979,6 +987,31 @@ mod tests {
         );
 
         assert_eq!(receipt(&metadata).unwrap(), None);
+    }
+
+    /// Regression test for a real, reachable panic (found by Copilot review
+    /// against PR #5, verified independently): `creating` forbids
+    /// `publishUrl` outright, but before this fix `receipt()`'s wildcard arm
+    /// silently read a `creating` grove that also carried one as an ordinary
+    /// classic receipt, which then drove `accept_rerun` into an
+    /// `unreachable!()`. This must be a `Failure`, never `Ok(Some(_))`,
+    /// regardless of whether `publishRemote` is also present.
+    #[test]
+    fn a_creating_grove_carrying_a_classic_url_is_a_failure_not_a_silent_classic_receipt() {
+        for remote in [Some(b"origin".as_slice()), None] {
+            let metadata = creating_metadata_with(
+                PublishState::Creating,
+                Some(b"github"),
+                Some(b"acme"),
+                Some(b"widgets"),
+                remote,
+                Some(b"https://example.invalid/r.git"),
+            );
+
+            let error = receipt(&metadata).unwrap_err();
+
+            assert_eq!(error.class, ExitClass::Failure, "remote={remote:?}");
+        }
     }
 
     #[test]

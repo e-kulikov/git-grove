@@ -178,9 +178,19 @@ pub fn accept_rerun(
                 (PublishState::Unpublished, _) => {
                     unreachable!("an unpublished state carrying a receipt is rejected by receipt()")
                 }
-                (PublishState::Creating, None) => unreachable!(
-                    "a creating grove's classic receipt is always None; see metadata::receipt"
-                ),
+                // `metadata::receipt` rejects a `creating` grove that also
+                // carries a classic URL as torn (`Err`, never `Ok(Some(_))`),
+                // so this arm should not be reachable from a well-formed
+                // grove — but it is not `unreachable!()`: a malformed
+                // `.bare/config` edited by hand can still reach it, and a
+                // decision this file already treats as unconditionally exit
+                // `2` deserves the same treatment here rather than a panic.
+                (PublishState::Creating, None) => Err(GroveError::failure(
+                    "this grove's publish state is creating but its metadata is inconsistent",
+                )
+                .with_detail(
+                    "a creating grove must never carry a classic publication receipt; this should be rejected by metadata::receipt",
+                )),
             }
         }
 
@@ -1923,6 +1933,32 @@ mod tests {
         assert!(detail.contains("acme"));
         assert!(detail.contains("widgets"));
         assert!(detail.contains("--create"));
+    }
+
+    /// Regression test for a real, reachable panic (found by Copilot review
+    /// against PR #5, verified independently before fixing): a `creating`
+    /// grove whose metadata is corrupted to also carry a classic receipt
+    /// (forbidden outright by Decision 1) used to drive this function into
+    /// the `PublishState::Creating` inner-match arm's `unreachable!()`
+    /// instead of failing cleanly. `metadata::receipt` itself now rejects
+    /// that shape (see its own regression test), so this call fails at the
+    /// `?` before ever reaching the match here — but the arm itself is also
+    /// hardened into a real `Failure`, so this stays a structured error
+    /// rather than a panic even if that upstream guard is ever weakened
+    /// again.
+    #[test]
+    fn a_creating_grove_with_a_corrupted_classic_receipt_fails_cleanly_instead_of_panicking() {
+        let mut metadata = unpublished();
+        metadata.publish_state = PublishState::Creating;
+        metadata.publish_provider = Some(BString::from("github"));
+        metadata.publish_owner = Some(BString::from("acme"));
+        metadata.publish_name = Some(BString::from("widgets"));
+        metadata.publish_remote = Some(BString::from("origin"));
+        metadata.publish_url = Some(BString::from(URL));
+
+        let error = accept_rerun(&metadata, None, &request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
     }
 
     // ---- self-healing an incomplete `creating` receipt ------------------
