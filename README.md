@@ -1,10 +1,11 @@
 # git-grove
 
 `git-grove` manages a repository as a bare clone surrounded by Git worktrees.
-Version 0.4 has a small, explicit lifecycle of seven commands: clone or
-initialize a grove, adopt an ordinary repository, add worktrees, inspect their
-state, fetch and fast-forward eligible worktrees, and publish an unpublished
-grove to an existing remote URL.
+It has a small, explicit lifecycle of commands: clone or initialize a grove,
+adopt an ordinary repository, add worktrees, inspect their state, fetch and
+fast-forward eligible worktrees, and publish an unpublished grove — either to
+an existing remote URL, or by creating the hosting-side repository first
+through `gh`/`glab`.
 
 ## Requirements
 
@@ -106,9 +107,10 @@ project/
 ```
 
 Grove metadata is stored in the real Git configuration at `.bare/config`, not
-in a separate metadata file. Version 0.4 uses `grove.version`,
-`grove.defaultBranch`, `grove.remote`, `grove.publishState`,
-`grove.publishRemote`, and `grove.publishUrl`.
+in a separate metadata file: `grove.version`, `grove.defaultBranch`,
+`grove.remote`, `grove.publishState`, `grove.publishRemote`,
+`grove.publishUrl`, and, for a grove published through `publish --create`,
+`grove.publishProvider`, `grove.publishOwner`, and `grove.publishName`.
 
 All managed worktree paths must remain strictly below the grove root. Existing
 files, symlinks, nonempty destinations, ambiguous remote branches, and
@@ -209,8 +211,44 @@ git grove publish --all-branches https://github.com/example/project.git
 `--all-branches` publishes every local branch instead of the default branch
 alone.
 
-Publishing is a transaction with three states — `unpublished`, `publishing`,
-and `published` — recorded in `grove.publishState`. Its receipt,
+`publish --create` creates the hosting-side repository first, then publishes
+to it:
+
+```sh
+git grove publish --create my-org/my-project --host github
+git grove publish --create my-org/my-project --host gitlab --public
+```
+
+It shells out to `gh repo create` or `glab repo create` — never a provider
+API — then hands off to the same push/verification machinery a bare
+`publish <url>` uses, from the point the URL exists. `<owner>/<name>` must
+parse as exactly two non-empty, slash-separated components. `--host` is
+required with `--create` and selects the provider: `github` always targets
+`github.com`, `gitlab` always targets `gitlab.com` — self-hosted and
+enterprise instances of either are out of scope, and neither is ever inferred
+from a locally configured host. The created repository is private unless
+`--public` is given, which requires `--create`.
+
+Before creating anything, `--create` checks the installed `gh`/`glab` version
+against a declared minimum (refused at exit `64` if older), the same local
+preflight a bare `publish` performs, and authentication with `gh auth
+status`/`glab auth status` (refused at exit `2`, phrased as "could not
+confirm authentication" rather than "not authenticated," since both commands
+validate a stored token over the network). While the repository is being
+created, the grove records the requested provider, owner, name, and remote
+under a transient `creating` state; rerunning `publish --create` against a
+grove already `creating` resumes the same request rather than creating
+anything twice, and a bare `publish <url>` against such a grove refuses at
+exit `2`, naming the recorded owner/name, rather than silently reinterpreting
+it. If the hosting side already has a matching, empty repository under that
+name — typically an earlier attempt that created it but did not finish
+publishing — publication proceeds using it instead of failing with "already
+exists"; a repository under that name that does not match is refused at exit
+`2` as an unrelated existing repository. `--create` never asks a provider to
+delete, rename, or transfer a repository, including one it created itself.
+
+Publishing is a transaction with four states — `unpublished`, `creating`,
+`publishing`, and `published` — recorded in `grove.publishState`. Its receipt,
 `grove.publishRemote` and `grove.publishUrl`, is written **before the first
 step that mutates the remote or the local remote configuration**, and never
 rolled back. The read-only inspection of the target therefore runs first, and
@@ -225,8 +263,9 @@ Publish is explicit and narrow, by design:
   a probe ref this transaction owns, under `refs/grove/publish-probe/`, which
   is deleted after the decision.
 - It **never force-pushes**, never rewrites history, never merges a
-  host-created commit, never deletes a remote ref, never creates a repository
-  on a hosting provider, and never calls a provider API.
+  host-created commit, and never deletes a remote ref. Only `--create` ever
+  calls a hosting provider, and it shells out to `gh`/`glab` — never a
+  provider API — and never to delete, rename, or transfer anything.
 - A target whose default branch has diverged from this grove's, or whose
   history is unrelated to it, is refused with exit status `2` and nothing is
   pushed.
@@ -265,13 +304,14 @@ Git child process. It does not bypass the platform check, minimum Git version,
 or refused clone options.
 
 Exit status `0` means success, `1` means an unexpected Git/filesystem/I/O
-failure (including a failed `sync` fetch), `2` means repository state needs a
-human decision (including a worktree `sync` left behind or blocked), and `64`
-means a usage error or refused unsupported context. `list --porcelain` emits
-the versioned, NUL-delimited `git-grove-list-v1` protocol for automation;
-`sync`, `adopt`, and `publish` have no porcelain output in 0.4. Publish still
-requires an existing repository URL; version 0.4 does not create hosting-side
-repositories and does not implement `publish --create`.
+failure (including a failed `sync` fetch, or a provider CLI that is absent or
+whose output cannot be parsed), `2` means repository state needs a human
+decision (including a worktree `sync` left behind or blocked, unconfirmed
+provider authentication, or a `--create` receipt conflict), and `64` means a
+usage error, refused unsupported context, or a provider CLI older than the
+declared minimum. `list --porcelain` emits the versioned, NUL-delimited
+`git-grove-list-v1` protocol for automation; `sync`, `adopt`, and `publish`
+have no porcelain output.
 
 ## Completions and manual
 

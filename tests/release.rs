@@ -208,9 +208,8 @@ fn release_docs_describe_adopt_and_its_recovery_contract() {
             "{relative} must document the single-worktree precondition"
         );
         assert!(
-            rendered.to_lowercase().contains("publish still requires")
-                && document.contains("--create"),
-            "{relative} must keep publish --create out of scope"
+            document.contains("--create") && document.contains("--host"),
+            "{relative} must document publish --create's --host requirement"
         );
     }
 }
