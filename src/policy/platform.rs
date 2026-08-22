@@ -63,7 +63,10 @@ impl ProviderVersion {
         let mut words = text.split_whitespace();
         let rest = match (words.next(), words.next(), words.next()) {
             (Some("gh"), Some("version"), Some(rest)) => rest,
-            _ => return Err(GroveError::failure("cannot parse `gh --version` output")),
+            _ => {
+                return Err(GroveError::failure("cannot parse `gh --version` output")
+                    .with_detail(text.trim().to_string()))
+            }
         };
         Self::parse_dotted(rest, "gh")
     }
@@ -74,7 +77,10 @@ impl ProviderVersion {
         let mut words = text.split_whitespace();
         let rest = match (words.next(), words.next()) {
             (Some("glab"), Some(rest)) => rest,
-            _ => return Err(GroveError::failure("cannot parse `glab --version` output")),
+            _ => {
+                return Err(GroveError::failure("cannot parse `glab --version` output")
+                    .with_detail(text.trim().to_string()))
+            }
         };
         Self::parse_dotted(rest, "glab")
     }
@@ -167,12 +173,14 @@ mod tests {
     fn rejects_unparsable_gh_output() {
         let err = ProviderVersion::parse_gh(b"not a version").unwrap_err();
         assert_eq!(err.class, crate::error::ExitClass::Failure);
+        assert_eq!(err.detail.as_deref(), Some("not a version"));
     }
 
     #[test]
     fn rejects_unparsable_glab_output() {
         let err = ProviderVersion::parse_glab(b"not a version").unwrap_err();
         assert_eq!(err.class, crate::error::ExitClass::Failure);
+        assert_eq!(err.detail.as_deref(), Some("not a version"));
     }
 
     #[test]
