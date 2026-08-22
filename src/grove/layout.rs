@@ -101,6 +101,33 @@ impl ValidatedWorktreePath {
     }
 }
 
+/// Refuse a candidate path that is inside, or equal to, `root` — the inverse
+/// of [`contained_worktree_path`], which validates the *opposite* direction.
+/// Both paths are canonicalised first, so a relative or symlinked candidate
+/// cannot slip past a lexical comparison.
+pub fn assert_outside_grove(root: &Path, candidate: &Path) -> Result<()> {
+    let root = root.canonicalize().map_err(|error| {
+        GroveError::failure(format!(
+            "cannot canonicalise grove root {}: {error}",
+            escaped_path(root)
+        ))
+    })?;
+    let candidate_canonical = candidate.canonicalize().map_err(|error| {
+        GroveError::failure(format!(
+            "cannot canonicalise {}: {error}",
+            escaped_path(candidate)
+        ))
+    })?;
+    if candidate_canonical == root || candidate_canonical.starts_with(&root) {
+        return Err(GroveError::failure(format!(
+            "{} must be outside the grove root {}",
+            escaped_path(candidate),
+            escaped_path(&root)
+        )));
+    }
+    Ok(())
+}
+
 pub fn contained_worktree_path(root: &Path, requested: &Path) -> Result<PathBuf> {
     Ok(validate_worktree_path(root, requested)?.path())
 }
@@ -274,6 +301,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".bare")).unwrap();
         dir
+    }
+
+    #[test]
+    fn assert_outside_grove_accepts_a_sibling_directory() {
+        let dir = root();
+        let sibling = tempfile::tempdir().unwrap();
+
+        assert_outside_grove(dir.path(), sibling.path()).unwrap();
+    }
+
+    #[test]
+    fn assert_outside_grove_rejects_the_root_itself_and_a_descendant() {
+        let dir = root();
+
+        assert_eq!(
+            assert_outside_grove(dir.path(), dir.path())
+                .unwrap_err()
+                .class,
+            crate::error::ExitClass::Failure
+        );
+        assert_eq!(
+            assert_outside_grove(dir.path(), &dir.path().join(".bare"))
+                .unwrap_err()
+                .class,
+            crate::error::ExitClass::Failure
+        );
     }
 
     #[test]
