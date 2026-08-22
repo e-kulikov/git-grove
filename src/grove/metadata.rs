@@ -192,6 +192,16 @@ pub fn creating_receipt(metadata: &Metadata) -> Result<Option<CreatingReceipt>> 
             "grove.publishProvider, grove.publishOwner, grove.publishName, and grove.publishRemote must all be present, or all absent",
         ))
     };
+    // Distinct from `incomplete()`: all four creating keys are present, but
+    // the grove also carries a forbidden `publishUrl` (Decision 1). Naming
+    // this separately keeps the message honest — the creating receipt itself
+    // is not short of anything.
+    let torn_by_url = || {
+        Err(GroveError::failure(
+            "this grove's publish state is creating but it already carries a completed publication URL",
+        )
+        .with_detail("grove.publishUrl must never be set while grove.publishState is creating"))
+    };
 
     let all_absent = metadata.publish_provider.is_none()
         && metadata.publish_owner.is_none()
@@ -225,7 +235,7 @@ pub fn creating_receipt(metadata: &Metadata) -> Result<Option<CreatingReceipt>> 
             }
         }
         PublishState::Creating => match complete {
-            Some(_) if metadata.publish_url.is_some() => incomplete(),
+            Some(_) if metadata.publish_url.is_some() => torn_by_url(),
             Some(receipt) => Ok(Some(receipt)),
             None => incomplete(),
         },
@@ -1137,6 +1147,17 @@ mod tests {
         let error = creating_receipt(&metadata).unwrap_err();
 
         assert_eq!(error.class, ExitClass::Failure);
+        // Regression test for a Copilot review finding on PR #5: this exact
+        // shape (all four creating keys present, `publishUrl` also set) is
+        // not an *incomplete* receipt — the message must say so, not the
+        // generic "incomplete" wording, which would be actively misleading
+        // here since nothing is actually missing.
+        assert!(
+            !error.message.contains("incomplete"),
+            "message must not call this shape incomplete: {}",
+            error.message
+        );
+        assert!(error.message.contains("completed publication URL"));
     }
 
     #[test]
