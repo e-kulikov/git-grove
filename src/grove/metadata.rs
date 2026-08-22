@@ -173,13 +173,15 @@ pub fn write_receipt(
 /// [`CreatingReceipt`] for what it carries.
 ///
 /// `Ok(None)` means "this grove's remote, if any, was not created through
-/// `--create`" — an `unpublished` grove with none of the three keys, or a
-/// `publishing`/`published` grove published by a bare `publish <url>`. Every
-/// other shape either fully describes a `--create` origin or is a `Failure`:
-/// no version this tool has ever shipped writes a partial three-key set
-/// (`publishRemote` is shared with the classic receipt and is checked
-/// alongside them, since `creating` has no other use for it and
-/// `publishing`/`published` already require it for the classic receipt).
+/// `--create`" — an `unpublished` grove with none of the three creating keys
+/// **and** none of the classic receipt keys (mirroring `receipt`'s own
+/// invariant that `unpublished` forbids both), or a `publishing`/`published`
+/// grove published by a bare `publish <url>`. Every other shape either fully
+/// describes a `--create` origin or is a `Failure`: no version this tool has
+/// ever shipped writes a partial three-key set (`publishRemote` is shared
+/// with the classic receipt and is checked alongside them, since `creating`
+/// has no other use for it and `publishing`/`published` already require it
+/// for the classic receipt).
 pub fn creating_receipt(metadata: &Metadata) -> Result<Option<CreatingReceipt>> {
     let incomplete = || {
         Err(GroveError::failure(format!(
@@ -194,6 +196,11 @@ pub fn creating_receipt(metadata: &Metadata) -> Result<Option<CreatingReceipt>> 
     let all_absent = metadata.publish_provider.is_none()
         && metadata.publish_owner.is_none()
         && metadata.publish_name.is_none();
+    // `Unpublished` forbids the classic receipt keys too (`receipt`'s own
+    // invariant): a grove carrying `publishRemote`/`publishUrl` while
+    // `unpublished` is torn regardless of whether the three creating keys
+    // are present, and must not be misread here as "no creating receipt".
+    let classic_absent = metadata.publish_remote.is_none() && metadata.publish_url.is_none();
     let complete = match (
         &metadata.publish_provider,
         &metadata.publish_owner,
@@ -211,7 +218,7 @@ pub fn creating_receipt(metadata: &Metadata) -> Result<Option<CreatingReceipt>> 
 
     match metadata.publish_state {
         PublishState::Unpublished => {
-            if all_absent {
+            if all_absent && classic_absent {
                 Ok(None)
             } else {
                 incomplete()
@@ -1061,6 +1068,36 @@ mod tests {
             let error = creating_receipt(&metadata).unwrap_err();
 
             assert_eq!(error.class, ExitClass::Failure);
+        }
+    }
+
+    /// Regression test for a Copilot review finding on PR #5, verified
+    /// independently: an `unpublished` grove carrying a classic receipt
+    /// (`grove.publishRemote`/`publishUrl`) but none of the three creating
+    /// keys used to read as `Ok(None)` here — "no creating receipt" — even
+    /// though `receipt()` itself already treats that exact shape as torn.
+    /// `creating_receipt` must not silently mask that corruption for a
+    /// caller that reads it without also calling `receipt`.
+    #[test]
+    fn an_unpublished_grove_carrying_a_classic_receipt_is_a_failure_even_with_no_creating_keys() {
+        for (remote, url) in [
+            (
+                Some(b"origin".as_slice()),
+                Some(b"https://example.invalid/r.git".as_slice()),
+            ),
+            (Some(b"origin".as_slice()), None),
+            (None, Some(b"https://example.invalid/r.git".as_slice())),
+        ] {
+            let metadata =
+                creating_metadata_with(PublishState::Unpublished, None, None, None, remote, url);
+
+            let error = creating_receipt(&metadata).unwrap_err();
+
+            assert_eq!(
+                error.class,
+                ExitClass::Failure,
+                "remote={remote:?} url={url:?}"
+            );
         }
     }
 

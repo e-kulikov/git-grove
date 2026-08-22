@@ -3450,6 +3450,29 @@ mod tests {
         );
     }
 
+    /// A Copilot review finding on PR #5 raised this exact shape as a
+    /// possible bug: a `published` grove with **no** receipt at all (every
+    /// `git grove clone`-created grove, including every shipped v0.2.0) whose
+    /// remote was later removed by hand. Verified against the spec
+    /// (`.superpowers/specs/2026-08-21-git-grove-publish-create.md`,
+    /// "`--create` against every other state"), which explicitly lists this
+    /// exact case among "no creating receipt is recorded at all" and
+    /// documents `Ok(Resume::Fresh)` as the correct outcome — precisely
+    /// because a bare `publish <url>` rerun already treats it identically
+    /// (`a_cloned_grove_whose_remote_was_removed_can_be_published_afresh`
+    /// above), and `reconcile_create` exists specifically to inherit that
+    /// precedent unmodified rather than re-deriving it. This is not a bug;
+    /// this test pins it so it is never "fixed" into a regression later.
+    #[test]
+    fn reconcile_create_is_fresh_for_a_published_grove_with_no_receipt_and_no_live_remote() {
+        let metadata = metadata_of(PublishState::Published, None, None);
+
+        assert_eq!(
+            reconcile_create(&metadata, None, &create_request()).unwrap(),
+            CreateResume::Fresh
+        );
+    }
+
     #[test]
     fn reconcile_create_refuses_a_stray_remote_on_an_unpublished_grove() {
         let metadata = unpublished();
