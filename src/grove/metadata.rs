@@ -13,6 +13,11 @@ pub const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublishState {
     Unpublished,
+    /// Strictly before a remote exists at all: the hosting-side repository
+    /// creation `publish --create` requested has been requested, but this
+    /// grove has not yet been handed off to the classic `publishing`
+    /// transaction that `publish <url>` also uses.
+    Creating,
     Publishing,
     Published,
 }
@@ -21,6 +26,7 @@ impl PublishState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unpublished => "unpublished",
+            Self::Creating => "creating",
             Self::Publishing => "publishing",
             Self::Published => "published",
         }
@@ -29,10 +35,11 @@ impl PublishState {
     pub fn parse(value: impl AsRef<[u8]>) -> Result<Self> {
         match value.as_ref() {
             b"unpublished" => Ok(Self::Unpublished),
+            b"creating" => Ok(Self::Creating),
             b"publishing" => Ok(Self::Publishing),
             b"published" => Ok(Self::Published),
             _ => Err(GroveError::failure(
-                "grove publish state must be unpublished, publishing, or published",
+                "grove publish state must be unpublished, creating, publishing, or published",
             )),
         }
     }
@@ -46,6 +53,27 @@ pub struct Metadata {
     pub publish_state: PublishState,
     pub publish_remote: Option<BString>,
     pub publish_url: Option<BString>,
+    /// The `--create` provider/owner/name a grove's remote was created
+    /// through. Present for `creating`, and, once written, never cleared
+    /// again for `publishing`/`published` — that persistence is what lets a
+    /// later `--create` rerun recognise its own prior success without a
+    /// provider round trip. Absent for a grove published by a bare
+    /// `publish <url>`.
+    pub publish_provider: Option<BString>,
+    pub publish_owner: Option<BString>,
+    pub publish_name: Option<BString>,
+}
+
+/// The durable record of a `--create` request in flight: which provider,
+/// owner, name, and remote name it targets. A separate, narrower accessor
+/// from [`receipt`] — a `creating` grove has no classic URL yet, which is a
+/// legitimate absence, not an incomplete classic receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatingReceipt {
+    pub provider: BString,
+    pub owner: BString,
+    pub name: BString,
+    pub remote: BString,
 }
 
 /// The durable record of a publication: which remote name and which URL the
@@ -93,6 +121,10 @@ pub fn receipt(metadata: &Metadata) -> Result<Option<Receipt>> {
         .with_detail(
             "grove.publishRemote or grove.publishUrl is set while grove.publishState is unpublished",
         )),
+        // A `creating` grove has no classic URL yet — its own receipt is read
+        // through `creating_receipt`, not this one. This is a legitimate
+        // absence, not the "incomplete receipt" `Failure` below.
+        (PublishState::Creating, Some(_), None) => Ok(None),
         (_, Some(remote), Some(url)) => Ok(Some(Receipt {
             remote: remote.clone(),
             url: url.clone(),
@@ -127,6 +159,135 @@ pub fn write_receipt(
         receipt.remote.as_ref(),
     )?;
     set(runner, grove, "grove.publishUrl", receipt.url.as_ref())
+}
+
+/// Read the `--create` creation receipt out of already-read metadata. See
+/// [`CreatingReceipt`] for what it carries.
+///
+/// `Ok(None)` means "this grove's remote, if any, was not created through
+/// `--create`" — an `unpublished` grove with none of the three keys, or a
+/// `publishing`/`published` grove published by a bare `publish <url>`. Every
+/// other shape either fully describes a `--create` origin or is a `Failure`:
+/// no version this tool has ever shipped writes a partial three-key set
+/// (`publishRemote` is shared with the classic receipt and is checked
+/// alongside them, since `creating` has no other use for it and
+/// `publishing`/`published` already require it for the classic receipt).
+pub fn creating_receipt(metadata: &Metadata) -> Result<Option<CreatingReceipt>> {
+    let incomplete = || {
+        Err(GroveError::failure(format!(
+            "this grove records publish state {} but its creation receipt is incomplete",
+            metadata.publish_state.as_str()
+        ))
+        .with_detail(
+            "grove.publishProvider, grove.publishOwner, grove.publishName, and grove.publishRemote must all be present, or all absent",
+        ))
+    };
+
+    let all_absent = metadata.publish_provider.is_none()
+        && metadata.publish_owner.is_none()
+        && metadata.publish_name.is_none();
+    let complete = match (
+        &metadata.publish_provider,
+        &metadata.publish_owner,
+        &metadata.publish_name,
+        &metadata.publish_remote,
+    ) {
+        (Some(provider), Some(owner), Some(name), Some(remote)) => Some(CreatingReceipt {
+            provider: provider.clone(),
+            owner: owner.clone(),
+            name: name.clone(),
+            remote: remote.clone(),
+        }),
+        _ => None,
+    };
+
+    match metadata.publish_state {
+        PublishState::Unpublished => {
+            if all_absent {
+                Ok(None)
+            } else {
+                incomplete()
+            }
+        }
+        PublishState::Creating => match complete {
+            Some(_) if metadata.publish_url.is_some() => incomplete(),
+            Some(receipt) => Ok(Some(receipt)),
+            None => incomplete(),
+        },
+        PublishState::Publishing | PublishState::Published => {
+            if all_absent {
+                Ok(None)
+            } else if let Some(receipt) = complete {
+                Ok(Some(receipt))
+            } else {
+                incomplete()
+            }
+        }
+    }
+}
+
+/// Write a fresh creation receipt in the order Decision 2 requires: state
+/// first (`grove.publishState=creating`), then the four keys — mirroring
+/// [`write_receipt`]'s own documented state-first order.
+pub fn write_creating_receipt(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    provider: &BString,
+    owner: &BString,
+    name: &BString,
+    remote: &BString,
+) -> Result<()> {
+    set(
+        runner,
+        grove,
+        "grove.publishState",
+        PublishState::Creating.as_str().as_bytes(),
+    )?;
+    set(runner, grove, "grove.publishProvider", provider.as_ref())?;
+    set(runner, grove, "grove.publishOwner", owner.as_ref())?;
+    set(runner, grove, "grove.publishName", name.as_ref())?;
+    set(runner, grove, "grove.publishRemote", remote.as_ref())
+}
+
+/// Roll a creation receipt back to `unpublished`, in the order Decision 2
+/// requires: the four keys cleared first, `grove.publishState=unpublished`
+/// written last — inverted from [`write_creating_receipt`] on purpose, so
+/// `publishRemote` (shared with the classic receipt) never sits next to
+/// `publishState=unpublished`, which is exactly the existing "records no
+/// publication but carries a receipt" hard failure. Idempotent: clearing an
+/// already-absent key is not an error, so this is safe to call on a grove
+/// whose creation receipt is already partial or absent.
+pub fn rollback_creating_receipt(runner: &dyn GitRunner, grove: &Grove) -> Result<()> {
+    unset(runner, grove, "grove.publishProvider")?;
+    unset(runner, grove, "grove.publishOwner")?;
+    unset(runner, grove, "grove.publishName")?;
+    unset(runner, grove, "grove.publishRemote")?;
+    set(
+        runner,
+        grove,
+        "grove.publishState",
+        PublishState::Unpublished.as_str().as_bytes(),
+    )
+}
+
+fn unset(runner: &dyn GitRunner, grove: &Grove, key: &str) -> Result<()> {
+    let config_path = config_path(grove);
+    let output = runner.run(Invocation::new().args([
+        OsStr::new("config"),
+        OsStr::new("--file"),
+        config_path.as_os_str(),
+        OsStr::new("--unset-all"),
+        OsStr::new(key),
+    ]))?;
+    // Exit 5 is "the key does not exist", which is the state this asks for.
+    if output.ok() || output.status == 5 {
+        Ok(())
+    } else {
+        Err(
+            GroveError::failure(format!("cannot clear {key} in the grove configuration"))
+                .with_detail(output.stderr.as_slice().escape_bytes().to_string()),
+        )
+    }
 }
 
 fn config_path(grove: &Grove) -> PathBuf {
@@ -245,6 +406,30 @@ pub fn write_to_config(
             publish_url.as_ref(),
         )?;
     }
+    if let Some(publish_provider) = &metadata.publish_provider {
+        set_at(
+            runner,
+            config_path,
+            "grove.publishProvider",
+            publish_provider.as_ref(),
+        )?;
+    }
+    if let Some(publish_owner) = &metadata.publish_owner {
+        set_at(
+            runner,
+            config_path,
+            "grove.publishOwner",
+            publish_owner.as_ref(),
+        )?;
+    }
+    if let Some(publish_name) = &metadata.publish_name {
+        set_at(
+            runner,
+            config_path,
+            "grove.publishName",
+            publish_name.as_ref(),
+        )?;
+    }
     Ok(())
 }
 
@@ -261,6 +446,9 @@ pub fn read(runner: &dyn GitRunner, grove: &Grove) -> Result<Metadata> {
     };
     let publish_remote = get(runner, grove, "grove.publishRemote")?;
     let publish_url = get(runner, grove, "grove.publishUrl")?;
+    let publish_provider = get(runner, grove, "grove.publishProvider")?;
+    let publish_owner = get(runner, grove, "grove.publishOwner")?;
+    let publish_name = get(runner, grove, "grove.publishName")?;
 
     Ok(Metadata {
         version,
@@ -269,6 +457,9 @@ pub fn read(runner: &dyn GitRunner, grove: &Grove) -> Result<Metadata> {
         publish_state,
         publish_remote,
         publish_url,
+        publish_provider,
+        publish_owner,
+        publish_name,
     })
 }
 
@@ -308,6 +499,9 @@ mod tests {
             publish_state: PublishState::Published,
             publish_remote: None,
             publish_url: None,
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         };
 
         write(&fake, &grove(), &metadata).unwrap();
@@ -359,6 +553,9 @@ mod tests {
             publish_state: PublishState::Unpublished,
             publish_remote: None,
             publish_url: None,
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         };
 
         write(&fake, &grove(), &metadata).unwrap();
@@ -384,6 +581,9 @@ mod tests {
             publish_state: PublishState::Unpublished,
             publish_remote: None,
             publish_url: None,
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         };
 
         let error = write(&fake, &grove(), &metadata).unwrap_err();
@@ -401,6 +601,9 @@ mod tests {
             publish_state: PublishState::Unpublished,
             publish_remote: None,
             publish_url: None,
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         };
 
         assert!(ensure_supported(&metadata).is_ok());
@@ -556,6 +759,9 @@ mod tests {
             publish_state: PublishState::Published,
             publish_remote: Some(BString::from("origin")),
             publish_url: Some(BString::from("https://example.invalid/r.git")),
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         };
 
         write(&fake, &grove(), &metadata).unwrap();
@@ -643,6 +849,28 @@ mod tests {
             publish_state,
             publish_remote: publish_remote.map(BString::from),
             publish_url: publish_url.map(BString::from),
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
+        }
+    }
+
+    /// Like [`metadata_with`], with the three `--create` keys also settable,
+    /// for the `creating_receipt` matrix below.
+    #[allow(clippy::too_many_arguments)]
+    fn creating_metadata_with(
+        publish_state: PublishState,
+        publish_provider: Option<&[u8]>,
+        publish_owner: Option<&[u8]>,
+        publish_name: Option<&[u8]>,
+        publish_remote: Option<&[u8]>,
+        publish_url: Option<&[u8]>,
+    ) -> Metadata {
+        Metadata {
+            publish_provider: publish_provider.map(BString::from),
+            publish_owner: publish_owner.map(BString::from),
+            publish_name: publish_name.map(BString::from),
+            ..metadata_with(publish_state, publish_remote, publish_url)
         }
     }
 
@@ -726,5 +954,337 @@ mod tests {
         let metadata = metadata_with(PublishState::Published, None, None);
 
         assert_eq!(receipt(&metadata).unwrap(), None);
+    }
+
+    // ---- the `creating` state --------------------------------------------
+
+    #[test]
+    fn creating_state_round_trips_through_as_str_and_parse() {
+        assert_eq!(PublishState::Creating.as_str(), "creating");
+        assert_eq!(
+            PublishState::parse(b"creating").unwrap(),
+            PublishState::Creating
+        );
+    }
+
+    #[test]
+    fn classic_receipt_returns_none_for_a_creating_grove_with_no_classic_url() {
+        let metadata = creating_metadata_with(
+            PublishState::Creating,
+            Some(b"github"),
+            Some(b"acme"),
+            Some(b"widgets"),
+            Some(b"origin"),
+            None,
+        );
+
+        assert_eq!(receipt(&metadata).unwrap(), None);
+    }
+
+    #[test]
+    fn every_other_classic_receipt_case_is_unchanged_by_the_creating_arm() {
+        // The existing test module above this one exercises `receipt()`
+        // exhaustively for every state other than `Creating` and is run
+        // unmodified as part of this same suite; this test only pins the one
+        // case that could plausibly have been disturbed by an insertion
+        // ahead of the wildcard receipt arm: a fully-populated classic
+        // receipt on a non-`Creating` state still resolves as before.
+        let metadata = metadata_with(PublishState::Published, Some(b"origin"), Some(b"u"));
+
+        assert_eq!(
+            receipt(&metadata).unwrap(),
+            Some(Receipt {
+                remote: BString::from("origin"),
+                url: BString::from("u"),
+            })
+        );
+    }
+
+    // ---- `creating_receipt` ----------------------------------------------
+
+    #[test]
+    fn an_unpublished_grove_without_any_creating_key_has_no_creating_receipt() {
+        let metadata = metadata_with(PublishState::Unpublished, None, None);
+
+        assert_eq!(creating_receipt(&metadata).unwrap(), None);
+    }
+
+    #[test]
+    fn an_unpublished_grove_carrying_any_creating_key_is_a_failure() {
+        for (provider, owner, name) in [
+            (Some(b"github".as_slice()), None, None),
+            (None, Some(b"acme".as_slice()), None),
+            (None, None, Some(b"widgets".as_slice())),
+        ] {
+            let metadata = creating_metadata_with(
+                PublishState::Unpublished,
+                provider,
+                owner,
+                name,
+                None,
+                None,
+            );
+
+            let error = creating_receipt(&metadata).unwrap_err();
+
+            assert_eq!(error.class, ExitClass::Failure);
+        }
+    }
+
+    #[test]
+    fn a_creating_grove_with_all_four_keys_and_no_url_yields_the_creating_receipt() {
+        let metadata = creating_metadata_with(
+            PublishState::Creating,
+            Some(b"github"),
+            Some(b"acme"),
+            Some(b"widgets"),
+            Some(b"origin"),
+            None,
+        );
+
+        assert_eq!(
+            creating_receipt(&metadata).unwrap(),
+            Some(CreatingReceipt {
+                provider: BString::from("github"),
+                owner: BString::from("acme"),
+                name: BString::from("widgets"),
+                remote: BString::from("origin"),
+            })
+        );
+    }
+
+    #[test]
+    fn a_creating_grove_with_a_classic_url_is_a_failure() {
+        let metadata = creating_metadata_with(
+            PublishState::Creating,
+            Some(b"github"),
+            Some(b"acme"),
+            Some(b"widgets"),
+            Some(b"origin"),
+            Some(b"https://example.invalid/r.git"),
+        );
+
+        let error = creating_receipt(&metadata).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+    }
+
+    #[test]
+    fn a_creating_grove_with_an_incomplete_four_key_set_is_a_failure_in_every_position() {
+        let full = (
+            Some(b"github".as_slice()),
+            Some(b"acme".as_slice()),
+            Some(b"widgets".as_slice()),
+            Some(b"origin".as_slice()),
+        );
+        for missing in 0..4 {
+            let mut fields = full;
+            match missing {
+                0 => fields.0 = None,
+                1 => fields.1 = None,
+                2 => fields.2 = None,
+                _ => fields.3 = None,
+            }
+            let metadata = creating_metadata_with(
+                PublishState::Creating,
+                fields.0,
+                fields.1,
+                fields.2,
+                fields.3,
+                None,
+            );
+
+            let error = creating_receipt(&metadata).unwrap_err();
+
+            assert_eq!(
+                error.class,
+                ExitClass::Failure,
+                "missing position {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn publishing_and_published_groves_created_through_create_carry_the_creating_receipt() {
+        for state in [PublishState::Publishing, PublishState::Published] {
+            let metadata = creating_metadata_with(
+                state,
+                Some(b"github"),
+                Some(b"acme"),
+                Some(b"widgets"),
+                Some(b"origin"),
+                Some(b"https://example.invalid/r.git"),
+            );
+
+            assert_eq!(
+                creating_receipt(&metadata).unwrap(),
+                Some(CreatingReceipt {
+                    provider: BString::from("github"),
+                    owner: BString::from("acme"),
+                    name: BString::from("widgets"),
+                    remote: BString::from("origin"),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn publishing_and_published_groves_created_by_a_bare_publish_have_no_creating_receipt() {
+        for state in [PublishState::Publishing, PublishState::Published] {
+            let metadata = metadata_with(
+                state,
+                Some(b"origin"),
+                Some(b"https://example.invalid/r.git"),
+            );
+
+            assert_eq!(creating_receipt(&metadata).unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn publishing_and_published_groves_with_a_partial_creating_key_set_are_a_failure() {
+        for state in [PublishState::Publishing, PublishState::Published] {
+            let metadata = creating_metadata_with(
+                state,
+                Some(b"github"),
+                None,
+                Some(b"widgets"),
+                Some(b"origin"),
+                Some(b"https://example.invalid/r.git"),
+            );
+
+            let error = creating_receipt(&metadata).unwrap_err();
+
+            assert_eq!(error.class, ExitClass::Failure);
+        }
+    }
+
+    // ---- writing and rolling back the creating receipt --------------------
+
+    #[test]
+    fn write_creating_receipt_writes_state_first_then_the_four_keys_in_order() {
+        let fake = RecordingFake::new();
+
+        write_creating_receipt(
+            &fake,
+            &grove(),
+            &BString::from("github"),
+            &BString::from("acme"),
+            &BString::from("widgets"),
+            &BString::from("origin"),
+        )
+        .unwrap();
+
+        let calls: Vec<Vec<String>> = fake
+            .calls()
+            .iter()
+            .map(|call| call.argv_for_test())
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                vec!["config", "--file", CONFIG, "grove.publishState", "creating"],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "grove.publishProvider",
+                    "github"
+                ],
+                vec!["config", "--file", CONFIG, "grove.publishOwner", "acme"],
+                vec!["config", "--file", CONFIG, "grove.publishName", "widgets"],
+                vec!["config", "--file", CONFIG, "grove.publishRemote", "origin"],
+            ]
+        );
+    }
+
+    #[test]
+    fn rollback_creating_receipt_clears_the_four_keys_before_writing_unpublished_last() {
+        let fake = RecordingFake::new();
+
+        rollback_creating_receipt(&fake, &grove()).unwrap();
+
+        let calls: Vec<Vec<String>> = fake
+            .calls()
+            .iter()
+            .map(|call| call.argv_for_test())
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "--unset-all",
+                    "grove.publishProvider",
+                ],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "--unset-all",
+                    "grove.publishOwner",
+                ],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "--unset-all",
+                    "grove.publishName",
+                ],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "--unset-all",
+                    "grove.publishRemote",
+                ],
+                vec![
+                    "config",
+                    "--file",
+                    CONFIG,
+                    "grove.publishState",
+                    "unpublished",
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn rollback_creating_receipt_is_idempotent_on_an_absent_or_partial_receipt() {
+        let fake = RecordingFake::new();
+        // Exit 5 from `--unset-all` is "the key does not exist".
+        for _ in 0..4 {
+            fake.push_response(GitOutput {
+                status: 5,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
+        }
+
+        rollback_creating_receipt(&fake, &grove()).unwrap();
+    }
+
+    #[test]
+    fn write_receipt_on_a_creating_grove_leaves_the_three_new_keys_untouched() {
+        let fake = RecordingFake::new();
+        let receipt = Receipt {
+            remote: BString::from("origin"),
+            url: BString::from("https://example.invalid/r.git"),
+        };
+
+        write_receipt(&fake, &grove(), PublishState::Publishing, &receipt).unwrap();
+
+        let calls: Vec<Vec<String>> = fake
+            .calls()
+            .iter()
+            .map(|call| call.argv_for_test())
+            .collect();
+        assert!(!calls.iter().any(|call| call
+            .iter()
+            .any(|arg| arg.starts_with("grove.publishProvider")
+                || arg.starts_with("grove.publishOwner")
+                || arg.starts_with("grove.publishName"))));
     }
 }

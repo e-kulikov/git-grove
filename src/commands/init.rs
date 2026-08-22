@@ -379,6 +379,9 @@ fn run_transaction(
             publish_state: PublishState::Unpublished,
             publish_remote: None,
             publish_url: None,
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         },
     )?;
 
