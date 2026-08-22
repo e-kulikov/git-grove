@@ -203,20 +203,37 @@ fn run(cli: cli::Cli) -> Result<()> {
             )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
-            if let Some(create) = create {
-                // Wired up in full once `commands::publish::run_create` lands.
-                let _ = cli::parse_create_target(&create)?;
-                let _ = host;
-                return Err(GroveError::failure(
-                    "`publish --create` is not wired up yet",
-                ));
-            }
-            let request = commands::publish::Request {
-                url: url.expect("clap requires a URL when --create is absent"),
-                remote,
-                all_branches,
+            let report = if let Some(create) = create {
+                let target = cli::parse_create_target(&create)?;
+                let provider =
+                    match host.expect("validate_create_flags requires --host with --create") {
+                        cli::ProviderHost::Github => git::provider::Provider::GitHub,
+                        cli::ProviderHost::Gitlab => git::provider::Provider::GitLab,
+                    };
+                let provider_runner = git::provider::RealProvider::new(&grove.root);
+                let create_request = commands::publish::CreateRequest {
+                    owner: target.owner,
+                    name: target.name,
+                    provider,
+                    public,
+                    remote,
+                    all_branches,
+                };
+                commands::publish::run_create(
+                    &runner,
+                    &provider_runner,
+                    &grove,
+                    &metadata,
+                    &create_request,
+                )?
+            } else {
+                let request = commands::publish::Request {
+                    url: url.expect("clap requires a URL when --create is absent"),
+                    remote,
+                    all_branches,
+                };
+                commands::publish::run(&runner, &grove, &metadata, &request)?
             };
-            let report = commands::publish::run(&runner, &grove, &metadata, &request)?;
             output::write_lines(&mut std::io::stdout().lock(), &report.lines)?;
             match report.class {
                 ExitClass::Ok => Ok(()),
