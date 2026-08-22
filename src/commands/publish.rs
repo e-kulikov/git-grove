@@ -167,11 +167,40 @@ pub fn accept_rerun(
                 (PublishState::Unpublished, _) => {
                     unreachable!("an unpublished state carrying a receipt is rejected by receipt()")
                 }
+                (PublishState::Creating, None) => unreachable!(
+                    "a creating grove's classic receipt is always None; see metadata::receipt"
+                ),
             }
         }
 
         (PublishState::Publishing, None) => {
             unreachable!("publishing without a receipt is rejected by receipt()")
+        }
+
+        // `creating` sits strictly before a remote exists. `metadata::receipt`
+        // always returns `None` here (a creating grove has no classic URL
+        // yet), so a bare `publish <url>` never silently resumes or
+        // reinterprets an in-flight `--create`: it refuses and points at the
+        // command that owns this state.
+        (PublishState::Creating, None) => {
+            let creating = metadata::creating_receipt(metadata)?.ok_or_else(|| {
+                GroveError::failure(
+                    "this grove's publish state is creating but its creation receipt is missing",
+                )
+            })?;
+            Err(conflict(
+                format!(
+                    "this grove is already creating a repository on {}",
+                    escaped(&creating.provider)
+                ),
+                format!(
+                    "recorded {}/{}; finish or abandon it with `git grove publish --create {}/{}`, not a bare `publish <url>`",
+                    escaped(&creating.owner),
+                    escaped(&creating.name),
+                    escaped(&creating.owner),
+                    escaped(&creating.name)
+                ),
+            ))
         }
     }
 }
@@ -1018,6 +1047,9 @@ mod tests {
             publish_state: state,
             publish_remote: publish_remote.map(BString::from),
             publish_url: publish_url.map(BString::from),
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         }
     }
 
@@ -1200,6 +1232,28 @@ mod tests {
             accept_rerun(&metadata, None, &request()).unwrap(),
             Resume::Fresh
         );
+    }
+
+    /// The one new `accept_rerun` arm `PublishState::Creating` forces the
+    /// compiler to cover: a bare `publish <url>` against a grove already in
+    /// the middle of `--create` never silently resumes or reinterprets it.
+    #[test]
+    fn a_bare_publish_against_a_creating_grove_with_a_complete_receipt_is_a_decision() {
+        let mut metadata = unpublished();
+        metadata.publish_state = PublishState::Creating;
+        metadata.publish_provider = Some(BString::from("github"));
+        metadata.publish_owner = Some(BString::from("acme"));
+        metadata.publish_name = Some(BString::from("widgets"));
+        metadata.publish_remote = Some(BString::from("origin"));
+
+        let error = accept_rerun(&metadata, None, &request()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::NeedsDecision);
+        assert!(error.message.contains("github"));
+        let detail = error.detail.unwrap();
+        assert!(detail.contains("acme"));
+        assert!(detail.contains("widgets"));
+        assert!(detail.contains("--create"));
     }
 
     // ---- exact byte equality, with no canonicalisation whatsoever -------

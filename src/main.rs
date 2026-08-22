@@ -182,7 +182,11 @@ fn run(cli: cli::Cli) -> Result<()> {
             url,
             remote,
             all_branches,
+            create,
+            host,
+            public,
         } => {
+            cli::validate_create_flags(create.as_deref(), host, public)?;
             let runner = git::runner::RealGit::new();
             let findings = policy::env::scan_os(std::env::vars_os());
             let mut interaction = policy::SystemInteraction;
@@ -199,8 +203,16 @@ fn run(cli: cli::Cli) -> Result<()> {
             )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
+            if let Some(create) = create {
+                // Wired up in full once `commands::publish::run_create` lands.
+                let _ = cli::parse_create_target(&create)?;
+                let _ = host;
+                return Err(GroveError::failure(
+                    "`publish --create` is not wired up yet",
+                ));
+            }
             let request = commands::publish::Request {
-                url,
+                url: url.expect("clap requires a URL when --create is absent"),
                 remote,
                 all_branches,
             };

@@ -40,6 +40,65 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// The two hosting providers `publish --create` supports. Self-hosted or
+/// enterprise instances of either are out of scope: `Github` always targets
+/// `github.com`, `Gitlab` always targets `gitlab.com` — never inferred from
+/// which host a locally installed `glab` happens to be authenticated
+/// against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ProviderHost {
+    Github,
+    Gitlab,
+}
+
+/// The two non-empty, `/`-separated components `--create <owner>/<name>`
+/// requires. Decided before anything is read from disk or the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTarget {
+    pub owner: OsString,
+    pub name: OsString,
+}
+
+/// Validate the relationship between `--create`, `--host`, and `--public`,
+/// before any grove discovery or lock acquisition.
+///
+/// Not expressed as clap `requires` attributes: clap exempts a `requires`
+/// target from being demanded once that target `conflicts_with` an argument
+/// that is already present — measured against clap 4.6, `create`'s own
+/// `conflicts_with = "url"` silently disables a `requires = "create"` on
+/// `host`/`public` whenever a URL was given, which is exactly the case this
+/// validation exists to catch. Checked by hand instead.
+pub fn validate_create_flags(
+    create: Option<&OsStr>,
+    host: Option<ProviderHost>,
+    public: bool,
+) -> Result<()> {
+    match (create, host) {
+        (Some(_), None) => Err(GroveError::usage("`--create` requires `--host`")),
+        (None, Some(_)) => Err(GroveError::usage("`--host` requires `--create`")),
+        (None, None) if public => Err(GroveError::usage("`--public` requires `--create`")),
+        _ => Ok(()),
+    }
+}
+
+pub fn parse_create_target(value: &OsStr) -> Result<CreateTarget> {
+    use bstr::ByteSlice;
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = value.as_bytes();
+    let parts: Vec<&[u8]> = bytes.split(|byte| *byte == b'/').collect();
+    match parts.as_slice() {
+        [owner, name] if !owner.is_empty() && !name.is_empty() => Ok(CreateTarget {
+            owner: OsStr::from_bytes(owner).to_os_string(),
+            name: OsStr::from_bytes(name).to_os_string(),
+        }),
+        _ => Err(GroveError::usage(format!(
+            "`--create` expects exactly OWNER/NAME, got {}",
+            bytes.escape_bytes()
+        ))),
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum CompletionShell {
     Zsh,
@@ -115,13 +174,23 @@ pub enum Command {
     /// Give an unpublished grove a remote and push it
     #[command(visible_alias = "propagate")]
     Publish {
-        url: OsString,
+        #[arg(required_unless_present = "create")]
+        url: Option<OsString>,
         /// Name for the remote to create
         #[arg(long, default_value = "origin")]
         remote: OsString,
         /// Publish every local branch in one atomic push
         #[arg(long)]
         all_branches: bool,
+        /// Create the hosting-side repository first, then publish to it
+        #[arg(long, value_name = "OWNER/NAME", conflicts_with = "url")]
+        create: Option<OsString>,
+        /// Required with --create: which hosting provider to use
+        #[arg(long, value_enum)]
+        host: Option<ProviderHost>,
+        /// With --create, make the new repository public (default: private)
+        #[arg(long)]
+        public: bool,
     },
     /// Generate shell completion code
     Completion { shell: CompletionShell },
@@ -804,5 +873,210 @@ mod tests {
             }
             other => panic!("parsed the wrong command: {other:?}"),
         }
+    }
+
+    // ---- `publish --create`'s CLI surface --------------------------------
+
+    #[test]
+    fn publish_accepts_a_bare_url_with_no_create_flags() {
+        let parsed =
+            Cli::try_parse_from(["git-grove", "publish", "https://example.invalid/r.git"]).unwrap();
+        match parsed.command {
+            Command::Publish {
+                url,
+                create,
+                host,
+                public,
+                ..
+            } => {
+                assert_eq!(url, Some(OsString::from("https://example.invalid/r.git")));
+                assert_eq!(create, None);
+                assert_eq!(host, None);
+                assert!(!public);
+            }
+            other => panic!("parsed the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_accepts_create_with_host_and_no_url() {
+        let parsed = Cli::try_parse_from([
+            "git-grove",
+            "publish",
+            "--create",
+            "acme/widgets",
+            "--host",
+            "github",
+        ])
+        .unwrap();
+        match parsed.command {
+            Command::Publish {
+                url,
+                create,
+                host,
+                public,
+                ..
+            } => {
+                assert_eq!(url, None);
+                assert_eq!(create, Some(OsString::from("acme/widgets")));
+                assert_eq!(host, Some(ProviderHost::Github));
+                assert!(!public);
+            }
+            other => panic!("parsed the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_accepts_create_with_public() {
+        let parsed = Cli::try_parse_from([
+            "git-grove",
+            "publish",
+            "--create",
+            "acme/widgets",
+            "--host",
+            "gitlab",
+            "--public",
+        ])
+        .unwrap();
+        match parsed.command {
+            Command::Publish { public, host, .. } => {
+                assert!(public);
+                assert_eq!(host, Some(ProviderHost::Gitlab));
+            }
+            other => panic!("parsed the wrong command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_requires_exactly_one_of_url_or_create() {
+        assert!(Cli::try_parse_from(["git-grove", "publish"]).is_err());
+        assert!(Cli::try_parse_from([
+            "git-grove",
+            "publish",
+            "https://example.invalid/r.git",
+            "--create",
+            "acme/widgets",
+            "--host",
+            "github",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn publish_create_requires_host() {
+        // Clap alone cannot decide this: `--create` conflicts with the `url`
+        // positional, and clap exempts a `requires` target from being
+        // demanded once it conflicts with something already present. Clap
+        // itself accepts the parse; `validate_create_flags` is what refuses.
+        let parsed =
+            Cli::try_parse_from(["git-grove", "publish", "--create", "acme/widgets"]).unwrap();
+        let Command::Publish { create, host, .. } = parsed.command else {
+            panic!("wrong command");
+        };
+        let error = validate_create_flags(create.as_deref(), host, false).unwrap_err();
+        assert_eq!(error.class, crate::error::ExitClass::Usage);
+        assert!(error.message.contains("--host"));
+    }
+
+    #[test]
+    fn publish_host_without_create_is_rejected() {
+        let parsed = Cli::try_parse_from([
+            "git-grove",
+            "publish",
+            "https://example.invalid/r.git",
+            "--host",
+            "github",
+        ])
+        .unwrap();
+        let Command::Publish { create, host, .. } = parsed.command else {
+            panic!("wrong command");
+        };
+        let error = validate_create_flags(create.as_deref(), host, false).unwrap_err();
+        assert_eq!(error.class, crate::error::ExitClass::Usage);
+        assert!(error.message.contains("--create"));
+    }
+
+    #[test]
+    fn publish_public_without_create_is_rejected() {
+        let parsed = Cli::try_parse_from([
+            "git-grove",
+            "publish",
+            "https://example.invalid/r.git",
+            "--public",
+        ])
+        .unwrap();
+        let Command::Publish {
+            create,
+            host,
+            public,
+            ..
+        } = parsed.command
+        else {
+            panic!("wrong command");
+        };
+        let error = validate_create_flags(create.as_deref(), host, public).unwrap_err();
+        assert_eq!(error.class, crate::error::ExitClass::Usage);
+        assert!(error.message.contains("--create"));
+    }
+
+    #[test]
+    fn validate_create_flags_accepts_every_well_formed_combination() {
+        validate_create_flags(None, None, false).unwrap();
+        validate_create_flags(
+            Some(OsStr::new("acme/widgets")),
+            Some(ProviderHost::Github),
+            false,
+        )
+        .unwrap();
+        validate_create_flags(
+            Some(OsStr::new("acme/widgets")),
+            Some(ProviderHost::Gitlab),
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parse_create_target_accepts_exactly_owner_slash_name() {
+        let target = parse_create_target(OsStr::new("acme/widgets")).unwrap();
+        assert_eq!(target.owner, OsString::from("acme"));
+        assert_eq!(target.name, OsString::from("widgets"));
+    }
+
+    #[test]
+    fn parse_create_target_rejects_every_malformed_shape() {
+        for bad in [
+            "widgets",
+            "acme/widgets/extra",
+            "/widgets",
+            "acme/",
+            "",
+            "/",
+        ] {
+            let error = parse_create_target(OsStr::new(bad)).unwrap_err();
+            assert_eq!(
+                error.class,
+                crate::error::ExitClass::Usage,
+                "accepted {bad:?}"
+            );
+            assert!(error.message.contains("--create"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_create_target_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let owner = OsString::from_vec(vec![b'a', 0xff]);
+        let mut raw = owner.clone().into_vec();
+        raw.push(b'/');
+        raw.extend_from_slice(b"widgets");
+        let value = OsString::from_vec(raw);
+
+        let target = parse_create_target(&value).unwrap();
+
+        assert_eq!(target.owner, owner);
+        assert_eq!(target.name, OsString::from("widgets"));
     }
 }
