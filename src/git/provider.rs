@@ -114,9 +114,8 @@ impl RealProvider {
 
 impl ProviderRunner for RealProvider {
     fn run(&self, provider: Provider, args: &[&OsStr]) -> Result<ProviderOutput> {
-        let scratch = create_scratch_dir(&self.grove_root)?;
-        let result = (|| -> Result<ProviderOutput> {
-            let mut cmd = build_command(provider, args, &scratch);
+        with_scratch_dir(&self.grove_root, |scratch| {
+            let mut cmd = build_command(provider, args, scratch);
             let mut child = cmd
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -139,10 +138,20 @@ impl ProviderRunner for RealProvider {
                 stdout: out.stdout,
                 stderr: out.stderr,
             })
-        })();
-        let _ = std::fs::remove_dir_all(&scratch);
-        result
+        })
     }
+}
+
+/// Create the scratch directory, run `body` in it, and remove it
+/// unconditionally afterward — success or failure — before this returns.
+/// Factored out from [`RealProvider::run`] so the "always cleaned up" contract
+/// is unit-testable against a fake `body` closure, without ever spawning a
+/// real `gh`/`glab` child.
+fn with_scratch_dir<T>(grove_root: &Path, body: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
+    let scratch = create_scratch_dir(grove_root)?;
+    let result = body(&scratch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
 }
 
 /// Check `<provider> --version` against the declared floor
@@ -224,7 +233,6 @@ impl ProviderRunner for RecordingFake {
 mod tests {
     use super::*;
     use crate::error::ExitClass;
-    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn github_pins_gh_host_and_removes_gh_repo() {
@@ -327,38 +335,41 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    /// Proves the "always cleaned up" contract of [`with_scratch_dir`] — the
+    /// same helper `RealProvider::run` uses — against a fake `body` closure
+    /// that fails, never a real `gh`/`glab` spawn.
     #[test]
-    fn real_provider_removes_the_scratch_directory_even_when_the_child_fails() {
+    fn with_scratch_dir_removes_the_scratch_directory_even_when_the_body_fails() {
         let grove_parent = tempfile::tempdir().unwrap();
         let grove_root = grove_parent.path().join("grove");
         std::fs::create_dir(&grove_root).unwrap();
-        let provider = RealProvider::new(&grove_root);
+        let mut seen_scratch = None;
 
-        let output = provider
-            .run(
-                Provider::GitHub,
-                &[OsStr::new("--this-flag-does-not-exist")],
-            )
-            .unwrap();
+        let error = with_scratch_dir(&grove_root, |scratch| {
+            seen_scratch = Some(scratch.to_path_buf());
+            Err::<(), _>(GroveError::failure("body failed"))
+        })
+        .unwrap_err();
 
-        // The real `gh` binary need not be installed for this assertion: a
-        // spawn failure (ENOENT) is itself proof enough that no scratch
-        // directory survives, since cleanup runs on both branches.
-        let leftovers: Vec<_> = std::fs::read_dir(&grove_parent)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .as_bytes()
-                    .starts_with(b".git-grove-provider-")
-            })
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "leftover scratch directories: {leftovers:?}"
-        );
-        let _ = output;
+        assert_eq!(error.message, "body failed");
+        assert!(!seen_scratch.unwrap().exists());
+    }
+
+    #[test]
+    fn with_scratch_dir_removes_the_scratch_directory_after_a_successful_body() {
+        let grove_parent = tempfile::tempdir().unwrap();
+        let grove_root = grove_parent.path().join("grove");
+        std::fs::create_dir(&grove_root).unwrap();
+        let mut seen_scratch = None;
+
+        let value = with_scratch_dir(&grove_root, |scratch| {
+            seen_scratch = Some(scratch.to_path_buf());
+            Ok(42)
+        })
+        .unwrap();
+
+        assert_eq!(value, 42);
+        assert!(!seen_scratch.unwrap().exists());
     }
 
     #[test]
