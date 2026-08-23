@@ -440,3 +440,50 @@ impl Sandbox {
             .to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a Copilot review finding on PR #5:
+    /// `effective_path` used to append `:` unconditionally before the
+    /// inherited `PATH`, so an empty inherited `PATH` produced a trailing
+    /// empty component — which on Unix means "the current directory" — and
+    /// could make a test child pick up a binary depending on where the test
+    /// happened to be run from.
+    #[test]
+    fn effective_path_never_leaves_a_trailing_empty_component_when_path_is_empty() {
+        let sandbox = Sandbox {
+            home: TempDir::new().unwrap(),
+            work: TempDir::new().unwrap(),
+            path: OsString::new(),
+            fake_bin: RefCell::new(None),
+        };
+        sandbox.fake_provider("gh", "#!/bin/sh\nexit 0\n");
+
+        let path = sandbox.effective_path();
+
+        assert!(
+            !path.as_bytes().ends_with(b":"),
+            "PATH must not end with a separator when the inherited PATH is empty: {path:?}"
+        );
+    }
+
+    #[test]
+    fn effective_path_joins_the_fake_bin_dir_ahead_of_a_nonempty_inherited_path() {
+        let sandbox = Sandbox {
+            home: TempDir::new().unwrap(),
+            work: TempDir::new().unwrap(),
+            path: OsString::from("/usr/bin:/bin"),
+            fake_bin: RefCell::new(None),
+        };
+        let fake_dir = sandbox.fake_provider("gh", "#!/bin/sh\nexit 0\n");
+        let fake_dir = fake_dir.parent().unwrap();
+
+        let path = sandbox.effective_path();
+
+        let mut expected = OsString::from(fake_dir);
+        expected.push(":/usr/bin:/bin");
+        assert_eq!(path, expected);
+    }
+}
