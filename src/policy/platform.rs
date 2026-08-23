@@ -90,6 +90,7 @@ impl ProviderVersion {
         let mut number = |name: &str| -> Result<u32> {
             parts.next().and_then(|p| p.parse().ok()).ok_or_else(|| {
                 GroveError::failure(format!("cannot parse the {name} of `{program} --version`"))
+                    .with_detail(rest.to_string())
             })
         };
         let major = number("major")?;
@@ -97,6 +98,7 @@ impl ProviderVersion {
         let patch = match parts.next() {
             Some(patch) => patch.parse().map_err(|_| {
                 GroveError::failure(format!("cannot parse the patch of `{program} --version`"))
+                    .with_detail(rest.to_string())
             })?,
             None => 0,
         };
@@ -181,6 +183,29 @@ mod tests {
         let err = ProviderVersion::parse_glab(b"not a version").unwrap_err();
         assert_eq!(err.class, crate::error::ExitClass::Failure);
         assert_eq!(err.detail.as_deref(), Some("not a version"));
+    }
+
+    /// Regression test for a Copilot review finding on PR #5: a well-formed
+    /// `gh version <token> (...)` prefix whose dotted `<token>` itself fails
+    /// to parse (major/minor/patch) used to report a message with no detail
+    /// at all, unlike the sibling prefix-mismatch case. The offending token
+    /// must be attached as `detail` here too.
+    #[test]
+    fn rejects_an_unparsable_dotted_version_token_with_the_token_attached() {
+        let err =
+            ProviderVersion::parse_gh(b"gh version 2.not-a-number.0 (2026-07-31)\n").unwrap_err();
+
+        assert_eq!(err.class, crate::error::ExitClass::Failure);
+        assert_eq!(err.detail.as_deref(), Some("2.not-a-number.0"));
+    }
+
+    #[test]
+    fn rejects_an_unparsable_patch_with_the_token_attached() {
+        let err =
+            ProviderVersion::parse_glab(b"glab 1.114.not-a-number (4d7c6cda7)\n").unwrap_err();
+
+        assert_eq!(err.class, crate::error::ExitClass::Failure);
+        assert_eq!(err.detail.as_deref(), Some("1.114.not-a-number"));
     }
 
     #[test]

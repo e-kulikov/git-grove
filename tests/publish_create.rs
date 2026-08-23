@@ -49,6 +49,13 @@ fn shell_quote(path: &Path) -> String {
 /// The logging preamble every fake provider script starts with: the full
 /// argv, the `PWD`-relative working directory, and the presence/value of
 /// every environment variable Decision 5 pins or forbids, appended to `log`.
+///
+/// `GH_TOKEN`/`GITLAB_TOKEN` are logged as `set`/`unset` only, never their
+/// raw value: if a developer or CI happened to have a real token in the
+/// ambient environment, this must never end up written to a log file (or a
+/// test's own assertion-failure output) verbatim, regardless of whether
+/// today's `Sandbox::env_clear()` discipline already keeps it from reaching
+/// this script in practice.
 fn logging_preamble(log: &Path) -> String {
     format!(
         r#"#!/bin/sh
@@ -58,8 +65,8 @@ fn logging_preamble(log: &Path) -> String {
   printf 'GH_HOST=%s\n' "${{GH_HOST-<unset>}}"
   printf 'GITLAB_HOST=%s\n' "${{GITLAB_HOST-<unset>}}"
   printf 'GH_REPO=%s\n' "${{GH_REPO-<unset>}}"
-  printf 'GH_TOKEN=%s\n' "${{GH_TOKEN-<unset>}}"
-  printf 'GITLAB_TOKEN=%s\n' "${{GITLAB_TOKEN-<unset>}}"
+  if [ -n "${{GH_TOKEN+x}}" ]; then printf 'GH_TOKEN=set\n'; else printf 'GH_TOKEN=unset\n'; fi
+  if [ -n "${{GITLAB_TOKEN+x}}" ]; then printf 'GITLAB_TOKEN=set\n'; else printf 'GITLAB_TOKEN=unset\n'; fi
   printf -- '---\n'
 }} >> {log}
 "#,
