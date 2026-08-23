@@ -140,8 +140,15 @@ impl Sandbox {
         match &*self.fake_bin.borrow() {
             Some(dir) => {
                 let mut combined = OsString::from(dir.path());
-                combined.push(":");
-                combined.push(&self.path);
+                // Only append a separator + the inherited PATH when it is
+                // non-empty: an empty PATH followed by `:` would leave a
+                // trailing empty component, which on Unix means "the
+                // current directory" and could change which binaries a
+                // test child finds.
+                if !self.path.is_empty() {
+                    combined.push(":");
+                    combined.push(&self.path);
+                }
                 combined
             }
             None => self.path.clone(),
