@@ -1078,6 +1078,18 @@ fn heal_incomplete_creating_receipt(
     if metadata.publish_state != PublishState::Creating {
         return Ok(metadata.clone());
     }
+    if metadata.publish_url.is_some() {
+        // Decision 1 forbids `publishUrl` outright while `creating`; this is
+        // never the "some but not all of the four keys present" crash shape
+        // this repair exists for, and `rollback_creating_receipt` does not
+        // clear `publishUrl` (by design — it is the classic receipt's own
+        // key, untouched by a creating-receipt rollback). Rolling back here
+        // would only trade one torn shape (`creating` + a forbidden URL) for
+        // another (`unpublished` + a stray URL) instead of actually healing
+        // anything. Leave it for `creating_receipt`/`receipt` to report as
+        // the `Failure` it is.
+        return Ok(metadata.clone());
+    }
     if metadata::creating_receipt(metadata).is_ok() {
         return Ok(metadata.clone());
     }
@@ -2065,6 +2077,39 @@ mod tests {
 
         assert_eq!(healed, metadata);
         assert!(fake.calls().is_empty());
+    }
+
+    /// Regression test for a Copilot review finding on PR #5: a `creating`
+    /// grove that also carries the forbidden `publishUrl` (Decision 1) used
+    /// to trigger `rollback_creating_receipt` here, which clears only the
+    /// four creating keys and never touches `publishUrl` — trading one torn
+    /// shape (`creating` + a URL) for another (`unpublished` + a stray URL)
+    /// instead of actually healing anything. This shape is never this
+    /// repair's concern, regardless of whether the four creating keys are
+    /// themselves complete: `creating_receipt`/`receipt` report it as the
+    /// `Failure` it is.
+    #[test]
+    fn a_creating_grove_with_a_forbidden_url_is_never_auto_healed() {
+        for keys in [
+            // All four creating keys complete, but url also present.
+            creating_metadata(
+                Some("github"),
+                Some("acme"),
+                Some("widgets"),
+                Some("origin"),
+            ),
+            // Doubly corrupted: a missing creating key *and* url present.
+            creating_metadata(Some("github"), None, Some("widgets"), Some("origin")),
+        ] {
+            let mut metadata = keys;
+            metadata.publish_url = Some(BString::from(URL));
+            let fake = RecordingFake::new();
+
+            let healed = heal_incomplete_creating_receipt(&fake, &grove(), &metadata).unwrap();
+
+            assert_eq!(healed, metadata);
+            assert!(fake.calls().is_empty(), "no rollback may be attempted here");
+        }
     }
 
     #[test]
