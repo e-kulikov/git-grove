@@ -1441,7 +1441,7 @@ fn call_create(
 /// `gh`'s own documented "requires authentication" exit (`4`) maps to exit
 /// `2`; everything else maps to `1` with the provider's raw stderr attached.
 fn create_failure_error(create_request: &CreateRequest, output: &ProviderOutput) -> GroveError {
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = output.diagnostic_detail();
     if create_request.provider == Provider::GitHub && output.status == 4 {
         conflict(
             format!(
@@ -3686,6 +3686,32 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.class, ExitClass::NeedsDecision);
+    }
+
+    /// Regression test for a Copilot review finding on PR #5:
+    /// `create_failure_error` reported only `stderr`, so a provider CLI (or
+    /// a wrapper in front of one) that puts its diagnostic on `stdout`
+    /// instead produced an empty, unenlightening detail even though useful
+    /// output existed.
+    #[test]
+    fn fresh_sequencing_surfaces_a_create_failures_stdout_when_stderr_is_empty() {
+        let git = RecordingFake::new();
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"rate limit exceeded")); // create: stdout only
+        provider.push_response(po(1, b"")); // repo view: missing
+
+        let error = run_sequencing(
+            &git,
+            &provider,
+            &grove(),
+            &create_request(),
+            &flight(),
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert_eq!(error.detail.as_deref(), Some("rate limit exceeded"));
     }
 
     #[test]

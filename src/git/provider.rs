@@ -51,6 +51,24 @@ impl ProviderOutput {
     pub fn ok(&self) -> bool {
         self.status == 0
     }
+
+    /// The most useful diagnostic text this output has to offer, for a
+    /// caller reporting why a call failed: `stderr`, the conventional place
+    /// for a CLI's own diagnostics; falling back to `stdout` rather than
+    /// discarding it, since some CLIs (and wrapper scripts in front of one)
+    /// report an error there instead; falling back to the bare exit status
+    /// when both are empty, rather than an empty, unenlightening detail.
+    pub fn diagnostic_detail(&self) -> String {
+        let stderr = String::from_utf8_lossy(&self.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            return stderr;
+        }
+        let stdout = String::from_utf8_lossy(&self.stdout).trim().to_string();
+        if !stdout.is_empty() {
+            return stdout;
+        }
+        format!("exit status {}", self.status)
+    }
 }
 
 pub trait ProviderRunner {
@@ -167,7 +185,7 @@ pub fn check_provider_version(runner: &dyn ProviderRunner, provider: Provider) -
     if !output.ok() {
         return Err(
             GroveError::failure(format!("cannot run {} --version", provider.program()))
-                .with_detail(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                .with_detail(output.diagnostic_detail()),
         );
     }
     let version = match provider {
@@ -440,5 +458,44 @@ mod tests {
         let error = check_provider_version(&fake, Provider::GitHub).unwrap_err();
 
         assert_eq!(error.class, ExitClass::Failure);
+    }
+
+    #[test]
+    fn version_gate_attaches_stderr_when_the_version_command_itself_fails() {
+        let fake = RecordingFake::new();
+        fake.push_response(ProviderOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"gh: command not found in PATH shim\n".to_vec(),
+        });
+
+        let error = check_provider_version(&fake, Provider::GitHub).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("gh: command not found in PATH shim")
+        );
+    }
+
+    /// Regression test for a Copilot review finding on PR #5: some CLIs (and
+    /// wrapper scripts in front of one) report a failure on stdout rather
+    /// than stderr. Discarding it there made such a failure undiagnosable.
+    #[test]
+    fn version_gate_falls_back_to_stdout_when_stderr_is_empty() {
+        let fake = RecordingFake::new();
+        fake.push_response(ProviderOutput {
+            status: 1,
+            stdout: b"error: authentication required\n".to_vec(),
+            stderr: Vec::new(),
+        });
+
+        let error = check_provider_version(&fake, Provider::GitHub).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("error: authentication required")
+        );
     }
 }
