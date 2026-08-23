@@ -1611,7 +1611,7 @@ fn check_provider_auth(provider_runner: &dyn ProviderRunner, provider: Provider)
                 "could not confirm authentication for {}",
                 provider.host_env().1
             ),
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            output.diagnostic_detail(),
         ))
     }
 }
@@ -3976,6 +3976,21 @@ mod tests {
 
         assert_eq!(error.class, ExitClass::NeedsDecision);
         assert!(error.message.contains("github.com"));
+    }
+
+    /// Regression test for a Copilot review finding on PR #5:
+    /// `check_provider_auth` used raw `stderr` instead of
+    /// `ProviderOutput::diagnostic_detail()`'s stderr→stdout→status
+    /// fallback, so a provider reporting its diagnostic on `stdout` produced
+    /// an empty, unhelpful decision detail.
+    #[test]
+    fn check_provider_auth_falls_back_to_stdout_when_stderr_is_empty() {
+        let provider = ProviderFake::new();
+        provider.push_response(po(1, b"401 Unauthorized"));
+
+        let error = check_provider_auth(&provider, Provider::GitHub).unwrap_err();
+
+        assert_eq!(error.detail.as_deref(), Some("401 Unauthorized"));
     }
 
     // ---- the gh-default-branch repair -----------------------------------

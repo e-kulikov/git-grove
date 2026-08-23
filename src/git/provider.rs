@@ -165,11 +165,24 @@ impl ProviderRunner for RealProvider {
 /// Factored out from [`RealProvider::run`] so the "always cleaned up" contract
 /// is unit-testable against a fake `body` closure, without ever spawning a
 /// real `gh`/`glab` child.
+///
+/// A cleanup failure is surfaced, not silently dropped — leftover scratch
+/// directories would otherwise accumulate under the grove root's parent
+/// indefinitely — but only when `body` itself succeeded: if `body` already
+/// failed, its own, more specific error is what a caller needs to see, and
+/// a `remove_dir_all` failure on top of that is accepted silently rather
+/// than masking it.
 fn with_scratch_dir<T>(grove_root: &Path, body: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
     let scratch = create_scratch_dir(grove_root)?;
     let result = body(&scratch);
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
+    match (result, std::fs::remove_dir_all(&scratch)) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(error)) => Err(GroveError::failure(format!(
+            "cannot remove the provider scratch directory {}: {error}",
+            scratch.display()
+        ))),
+        (Err(body_error), _) => Err(body_error),
+    }
 }
 
 /// Check `<provider> --version` against the declared floor
@@ -388,6 +401,45 @@ mod tests {
 
         assert_eq!(value, 42);
         assert!(!seen_scratch.unwrap().exists());
+    }
+
+    /// Regression test for a Copilot review finding on PR #5: a cleanup
+    /// failure was silently dropped via `let _ = remove_dir_all(...)`, which
+    /// could leave scratch directories accumulating under the grove root's
+    /// parent indefinitely with nothing to show for it.
+    #[test]
+    fn with_scratch_dir_surfaces_a_cleanup_failure_when_the_body_succeeded() {
+        let grove_parent = tempfile::tempdir().unwrap();
+        let grove_root = grove_parent.path().join("grove");
+        std::fs::create_dir(&grove_root).unwrap();
+
+        let error = with_scratch_dir(&grove_root, |scratch| {
+            // Simulate the scratch directory vanishing out from under this
+            // call, so the real cleanup at the end genuinely fails.
+            std::fs::remove_dir_all(scratch).unwrap();
+            Ok::<(), GroveError>(())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Failure);
+        assert!(error.message.contains("cannot remove"));
+    }
+
+    /// A cleanup failure must never bury a real failure from `body` itself —
+    /// that diagnostic is the more actionable one.
+    #[test]
+    fn with_scratch_dir_keeps_the_bodys_own_error_even_when_cleanup_also_fails() {
+        let grove_parent = tempfile::tempdir().unwrap();
+        let grove_root = grove_parent.path().join("grove");
+        std::fs::create_dir(&grove_root).unwrap();
+
+        let error = with_scratch_dir(&grove_root, |scratch| {
+            std::fs::remove_dir_all(scratch).unwrap();
+            Err::<(), _>(GroveError::failure("body failed"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.message, "body failed");
     }
 
     #[test]
