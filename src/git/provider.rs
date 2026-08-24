@@ -477,7 +477,7 @@ mod tests {
         let fake = RecordingFake::new();
         fake.push_response(ProviderOutput {
             status: 0,
-            stdout: b"glab 1.114.0 (4d7c6cda7)\n".to_vec(),
+            stdout: b"glab version 1.114.0-26-g4d7c6cda7\n".to_vec(),
             stderr: Vec::new(),
         });
 

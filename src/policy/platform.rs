@@ -71,11 +71,15 @@ impl ProviderVersion {
         Self::parse_dotted(rest, "gh")
     }
 
-    /// `"glab X.Y.Z (...)"`.
+    /// `"glab X.Y.Z (...)"` or `"glab version X.Y.Z (...)"`.
     pub fn parse_glab(output: &[u8]) -> Result<Self> {
         let text = String::from_utf8_lossy(output);
         let mut words = text.split_whitespace();
         let rest = match (words.next(), words.next()) {
+            (Some("glab"), Some("version")) => words.next().ok_or_else(|| {
+                GroveError::failure("cannot parse `glab --version` output")
+                    .with_detail(text.trim().to_string())
+            })?,
             (Some("glab"), Some(rest)) => rest,
             _ => {
                 return Err(GroveError::failure("cannot parse `glab --version` output")
@@ -96,10 +100,19 @@ impl ProviderVersion {
         let major = number("major")?;
         let minor = number("minor")?;
         let patch = match parts.next() {
-            Some(patch) => patch.parse().map_err(|_| {
-                GroveError::failure(format!("cannot parse the patch of `{program} --version`"))
-                    .with_detail(rest.to_string())
-            })?,
+            Some(patch) => {
+                let numeric_len = patch.bytes().take_while(u8::is_ascii_digit).count();
+                if numeric_len == 0 {
+                    return Err(GroveError::failure(format!(
+                        "cannot parse the patch of `{program} --version`"
+                    ))
+                    .with_detail(rest.to_string()));
+                }
+                patch[..numeric_len].parse().map_err(|_| {
+                    GroveError::failure(format!("cannot parse the patch of `{program} --version`"))
+                        .with_detail(rest.to_string())
+                })?
+            }
             None => 0,
         };
         Ok(ProviderVersion {
@@ -168,6 +181,24 @@ mod tests {
     #[test]
     fn parses_measured_glab_version_output() {
         let v = ProviderVersion::parse_glab(b"glab 1.114.0 (4d7c6cda7)\n").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 114, 0));
+    }
+
+    /// Regression test for Copilot round 11 on PR #5: released `glab`
+    /// versions also print a literal `version` between the program and the
+    /// dotted token.
+    #[test]
+    fn parses_glab_version_keyword_output() {
+        let v = ProviderVersion::parse_glab(b"glab version 1.114.0 (4d7c6cda7)\n").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 114, 0));
+    }
+
+    /// Regression test for Copilot round 11 on PR #5: development builds can
+    /// append build metadata to the patch component, while the numeric
+    /// major/minor/patch prefix remains authoritative for the version gate.
+    #[test]
+    fn parses_provider_version_with_a_suffixed_patch() {
+        let v = ProviderVersion::parse_glab(b"glab version 1.114.0-26-gabc123\n").unwrap();
         assert_eq!((v.major, v.minor, v.patch), (1, 114, 0));
     }
 

@@ -1552,12 +1552,9 @@ fn configured_git_protocol(provider_runner: &dyn ProviderRunner, provider: Provi
     if !output.ok() {
         return BString::from("https");
     }
-    let trimmed = output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout);
-    if trimmed.is_empty() {
-        BString::from("https")
-    } else {
-        BString::from(trimmed.to_vec())
-    }
+    trim_one_line(output.stdout, "provider git protocol")
+        .map(BString::from)
+        .unwrap_or_else(|_| BString::from("https"))
 }
 
 /// Deriving the URL (never parsed from `create`'s stdout): the field chosen
@@ -3921,7 +3918,7 @@ mod tests {
     fn derive_and_publish_uses_ssh_when_git_protocol_is_scoped_to_ssh() {
         let git = RecordingFake::new();
         let provider = ProviderFake::new();
-        provider.push_response(po(0, b"ssh\n"));
+        provider.push_response(po(0, b"ssh\r\n"));
 
         let request =
             derive_and_publish(&git, &provider, &grove(), &create_request(), view_of(true))
@@ -3938,6 +3935,20 @@ mod tests {
                 OsString::from("github.com"),
             ],
             "the git_protocol lookup must be host-scoped, never the unscoped form"
+        );
+    }
+
+    /// Regression test for Copilot round 11 on PR #5: a config lookup that
+    /// emits more than one logical line is invalid and must take the spec's
+    /// HTTPS fallback instead of being retained as an opaque protocol value.
+    #[test]
+    fn configured_git_protocol_rejects_multiple_lines() {
+        let provider = ProviderFake::new();
+        provider.push_response(po(0, b"ssh\nhttps\n"));
+
+        assert_eq!(
+            configured_git_protocol(&provider, Provider::GitHub),
+            BString::from("https")
         );
     }
 
