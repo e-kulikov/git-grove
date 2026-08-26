@@ -1309,6 +1309,9 @@ fn install_metadata(
             },
             publish_remote: None,
             publish_url: None,
+            publish_provider: None,
+            publish_owner: None,
+            publish_name: None,
         },
     )?;
     if crate::fsx::write_atomic_if_absent(&root.join("AGENTS.md"), guide)? {

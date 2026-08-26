@@ -182,7 +182,11 @@ fn run(cli: cli::Cli) -> Result<()> {
             url,
             remote,
             all_branches,
+            create,
+            host,
+            public,
         } => {
+            cli::validate_create_flags(create.as_deref(), host, public)?;
             let runner = git::runner::RealGit::new();
             let findings = policy::env::scan_os(std::env::vars_os());
             let mut interaction = policy::SystemInteraction;
@@ -199,12 +203,37 @@ fn run(cli: cli::Cli) -> Result<()> {
             )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
-            let request = commands::publish::Request {
-                url,
-                remote,
-                all_branches,
+            let report = if let Some(create) = create {
+                let target = cli::parse_create_target(&create)?;
+                let provider =
+                    match host.expect("validate_create_flags requires --host with --create") {
+                        cli::ProviderHost::Github => git::provider::Provider::GitHub,
+                        cli::ProviderHost::Gitlab => git::provider::Provider::GitLab,
+                    };
+                let provider_runner = git::provider::RealProvider::new(&grove.root);
+                let create_request = commands::publish::CreateRequest {
+                    owner: target.owner,
+                    name: target.name,
+                    provider,
+                    public,
+                    remote,
+                    all_branches,
+                };
+                commands::publish::run_create(
+                    &runner,
+                    &provider_runner,
+                    &grove,
+                    &metadata,
+                    &create_request,
+                )?
+            } else {
+                let request = commands::publish::Request {
+                    url: url.expect("clap requires a URL when --create is absent"),
+                    remote,
+                    all_branches,
+                };
+                commands::publish::run(&runner, &grove, &metadata, &request)?
             };
-            let report = commands::publish::run(&runner, &grove, &metadata, &request)?;
             output::write_lines(&mut std::io::stdout().lock(), &report.lines)?;
             match report.class {
                 ExitClass::Ok => Ok(()),

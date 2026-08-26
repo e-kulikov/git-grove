@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
@@ -13,6 +14,9 @@ pub struct Sandbox {
     home: TempDir,
     work: TempDir,
     path: OsString,
+    /// Lazily created directory prepended to `path` once a fake provider CLI
+    /// is installed; `None` until [`Sandbox::fake_provider`] is first called.
+    fake_bin: RefCell<Option<TempDir>>,
 }
 
 #[cfg(unix)]
@@ -92,6 +96,7 @@ impl Sandbox {
             home: TempDir::new().unwrap(),
             work: TempDir::new().unwrap(),
             path: std::env::var_os("PATH").expect("PATH must be set"),
+            fake_bin: RefCell::new(None),
         }
     }
 
@@ -99,9 +104,60 @@ impl Sandbox {
         self.work.path()
     }
 
+    /// Install a fake `gh`/`glab` on `PATH`, ahead of anything else, for
+    /// every child this `Sandbox` spawns from here on. `program` is `"gh"`
+    /// or `"glab"`; `script` is the executable's full text (a `#!/bin/sh`
+    /// script is expected) — a small, explicit case statement over `"$@"`
+    /// returning canned exit codes/stdout/stderr per scenario, never a real
+    /// network call. Calling this more than once reuses the same directory,
+    /// so a second call for the other program (or to replace the first
+    /// program's script) does not shadow the first.
+    #[cfg(unix)]
+    pub fn fake_provider(&self, program: &str, script: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script_path = self.fake_provider_dir().join(program);
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script_path
+    }
+
+    /// The directory [`Sandbox::fake_provider`] installs scripts into,
+    /// created (once) on first use. Exposed so a test can compute a fixed
+    /// sibling path — a log file, say — and bake it into a script's own text
+    /// before the script is written.
+    pub fn fake_provider_dir(&self) -> PathBuf {
+        let mut fake_bin = self.fake_bin.borrow_mut();
+        if fake_bin.is_none() {
+            *fake_bin = Some(TempDir::new().unwrap());
+        }
+        fake_bin.as_ref().unwrap().path().to_path_buf()
+    }
+
+    /// The `PATH` every spawned child sees: the fake-provider directory
+    /// (if any) ahead of the sandbox's own inherited `PATH`.
+    fn effective_path(&self) -> OsString {
+        match &*self.fake_bin.borrow() {
+            Some(dir) => {
+                let mut combined = OsString::from(dir.path());
+                // Only append a separator + the inherited PATH when it is
+                // non-empty: an empty PATH followed by `:` would leave a
+                // trailing empty component, which on Unix means "the
+                // current directory" and could change which binaries a
+                // test child finds.
+                if !self.path.is_empty() {
+                    combined.push(":");
+                    combined.push(&self.path);
+                }
+                combined
+            }
+            None => self.path.clone(),
+        }
+    }
+
     fn apply_env(&self, cmd: &mut Command) {
         cmd.env_clear()
-            .env("PATH", &self.path)
+            .env("PATH", self.effective_path())
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -169,7 +225,7 @@ impl Sandbox {
         let mut cmd = assert_cmd::Command::cargo_bin("git-grove").unwrap();
         cmd.current_dir(cwd).args(args);
         cmd.env_clear()
-            .env("PATH", &self.path)
+            .env("PATH", self.effective_path())
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -200,7 +256,7 @@ impl Sandbox {
         let mut cmd = assert_cmd::Command::cargo_bin("git-grove").unwrap();
         cmd.current_dir(self.root()).args(args);
         cmd.env_clear()
-            .env("PATH", &self.path)
+            .env("PATH", self.effective_path())
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -382,5 +438,52 @@ impl Sandbox {
             .unwrap()
             .trim_end()
             .to_string()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// Regression test for a Copilot review finding on PR #5:
+    /// `effective_path` used to append `:` unconditionally before the
+    /// inherited `PATH`, so an empty inherited `PATH` produced a trailing
+    /// empty component — which on Unix means "the current directory" — and
+    /// could make a test child pick up a binary depending on where the test
+    /// happened to be run from.
+    #[test]
+    fn effective_path_never_leaves_a_trailing_empty_component_when_path_is_empty() {
+        let sandbox = Sandbox {
+            home: TempDir::new().unwrap(),
+            work: TempDir::new().unwrap(),
+            path: OsString::new(),
+            fake_bin: RefCell::new(None),
+        };
+        sandbox.fake_provider("gh", "#!/bin/sh\nexit 0\n");
+
+        let path = sandbox.effective_path();
+
+        assert!(
+            !path.as_bytes().ends_with(b":"),
+            "PATH must not end with a separator when the inherited PATH is empty: {path:?}"
+        );
+    }
+
+    #[test]
+    fn effective_path_joins_the_fake_bin_dir_ahead_of_a_nonempty_inherited_path() {
+        let sandbox = Sandbox {
+            home: TempDir::new().unwrap(),
+            work: TempDir::new().unwrap(),
+            path: OsString::from("/usr/bin:/bin"),
+            fake_bin: RefCell::new(None),
+        };
+        let fake_dir = sandbox.fake_provider("gh", "#!/bin/sh\nexit 0\n");
+        let fake_dir = fake_dir.parent().unwrap();
+
+        let path = sandbox.effective_path();
+
+        let mut expected = OsString::from(fake_dir);
+        expected.push(":/usr/bin:/bin");
+        assert_eq!(path, expected);
     }
 }

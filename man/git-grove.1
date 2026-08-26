@@ -1,4 +1,4 @@
-.TH GIT-GROVE 1 "2026-08-21" "git-grove 0.4.0" "Git Extensions"
+.TH GIT-GROVE 1 "2026-08-21" "git-grove 0.5.0" "Git Extensions"
 .SH NAME
 git-grove \- manage repositories as a bare clone surrounded by Git worktrees
 .SH SYNOPSIS
@@ -92,9 +92,7 @@ edits.  The hidden compatibility alias is
 .BR transplant .
 The test-only
 .B GIT_GROVE_FAILPOINT
-environment variable is inert in release builds.  Publish still requires an
-existing repository URL; this release does not implement
-.BR "publish --create" .
+environment variable is inert in release builds.
 .RE
 .TP
 .B add \fIbranch\fR [\fIdir\fR]
@@ -150,9 +148,12 @@ The alias is
 .BR tend .
 .TP
 .B publish \fR[\fB--remote \fIname\fR] [\fB--all-branches\fR] \fIurl\fR
-Give an unpublished grove a remote and push it, as a transaction with three
+.TQ
+.B publish --create \fIowner\fB/\fIname\fR --host \fR{\fBgithub\fR|\fBgitlab\fR} [\fB--public\fR] [\fB--remote \fIname\fR] [\fB--all-branches\fR]
+Give an unpublished grove a remote and push it, as a transaction with four
 states \(em
 .BR unpublished ,
+.BR creating ,
 .BR publishing ,
 and
 .BR published \(em
@@ -174,6 +175,76 @@ names the remote to create and defaults to
 .B --all-branches
 publishes every local branch rather than the default branch alone.
 .PP
+.B --create
+first creates the hosting-side repository through
+.B "gh repo create"
+or
+.BR "glab repo create" ,
+never a provider API, then publishes to it exactly as a bare
+.B "publish \fIurl\fR"
+would once the URL exists.
+.I owner\fB/\fIname
+must parse as exactly two non-empty, slash-separated components, checked
+before anything is read from disk or the network.
+.B --host
+selects the provider and is required with
+.BR --create ;
+.B github
+always targets
+.BR github.com ", " gitlab " always targets " gitlab.com \(em
+self-hosted and enterprise instances of either are out of scope, and neither
+is inferred from a locally configured host.  The created repository is
+private unless
+.B --public
+is given, which requires
+.BR --create .
+.PP
+Before creating: the installed
+.B gh
+or
+.B glab
+version is checked against a declared minimum, refused at exit status
+.B 64
+if older; the same local checks a bare
+.B publish
+performs (a commit to publish, an existing default branch, a valid remote
+name); and authentication, checked read-only with
+.B "gh auth status"
+or
+.BR "glab auth status" ,
+refused at exit status
+.B 2
+as "could not confirm authentication" rather than "not authenticated," since
+both commands validate a stored token over the network.  While the hosting
+side is being created, the grove records the requested provider, owner, name,
+and remote in
+.BR grove.publishProvider ,
+.BR grove.publishOwner ,
+.BR grove.publishName ,
+and
+.B grove.publishRemote
+under the transient
+.B creating
+state; a rerun of
+.B "publish --create"
+against a grove already in
+.B creating
+resumes the same request without creating anything twice, and a bare
+.B "publish \fIurl\fR"
+against such a grove refuses at exit status
+.BR 2 ,
+naming the recorded owner/name, rather than silently reinterpreting it.  If
+the hosting side already has a same-named, empty repository matching what
+this grove recorded creating \(em typically an earlier attempt that created
+it but did not finish publishing \(em publication proceeds using it, rather
+than failing with "already exists."  A repository found under that name but
+not matching what this grove recorded is refused at exit status
+.B 2
+as an unrelated existing repository.
+.B --create
+never asks a provider to delete, rename, or transfer a repository, including
+one it created itself.
+.PP
 The target is inspected with
 .B "git ls-remote --symref"
 before anything is configured, and a branch already present there is compared
@@ -182,8 +253,10 @@ through a probe ref this transaction owns under
 deleted after the decision.
 .B publish
 never force-pushes, never rewrites history, never merges a host-created
-commit, never deletes a remote reference, and never calls a hosting provider.
-A target whose default branch has diverged from this grove's, or whose history
+commit, and never deletes a remote reference; only
+.B --create
+ever calls a hosting provider, and never to delete, rename, or transfer
+anything.  A target whose default branch has diverged from this grove's, or whose history
 is unrelated to it, and a target whose
 .B HEAD
 names another branch, are each refused with exit status
@@ -256,11 +329,19 @@ The real Git configuration also stores metadata under
 .BR grove.remote ,
 .BR grove.publishState ,
 .BR grove.publishRemote ,
+.BR grove.publishUrl ,
+.BR grove.publishProvider ,
+.BR grove.publishOwner ,
 and
-.BR grove.publishUrl .
+.BR grove.publishName .
+The last three are present only for a grove published through
+.BR "publish --create" ,
+and are never cleared once written, even after publication completes.
 Version 0.4 refuses a newer
 .B grove.version
-before writing.
+before writing;
+.B "publish --create"
+adds new configuration keys, not a new layout revision.
 .TP
 .BR AGENTS.md " and " CLAUDE.md
 Generated repository facts and command guidance.  The latter is a relative
@@ -292,6 +373,24 @@ overlays.  Regardless of an override, all of them are removed from every Git
 process started by git-grove.  Transport variables such as
 .B GIT_SSH_COMMAND
 are preserved.
+.PP
+.B "publish --create"
+pins
+.B GH_HOST
+or
+.B GITLAB_HOST
+to the selected provider's fixed host on the
+.B gh
+or
+.B glab
+child's own environment only, regardless of any value already set for either
+variable, and explicitly clears
+.B GH_REPO
+on that child.  Credentials such as
+.B GH_TOKEN
+and
+.B GITLAB_TOKEN
+are left untouched and inherited normally.
 .SH PORCELAIN OUTPUT
 .B list --porcelain
 starts with the NUL-terminated identifier
@@ -333,7 +432,7 @@ or
 .BR --abort .
 .SH FILES
 .TP
-.I git-grove_0.4.0_linux_x86_64.tar.gz
+.I git-grove_0.5.0_linux_x86_64.tar.gz
 Static Linux x86_64 release archive containing the executable, license,
 README, this manual, and generated Bash, Zsh, and Fish completions.
 .TP
