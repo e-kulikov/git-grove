@@ -116,7 +116,8 @@ Add a detached worktree.  The default directory is
 .B list \fR[\fB--porcelain\fR]
 Show each non-bare worktree, branch, upstream, ahead/behind state, dirtiness,
 and lock or in-progress state.  A pending adoption transaction blocks the
-command entirely, before any row is produced, and exits with status 2.
+command entirely, before any row is produced, and exits with status
+.BR 2 .
 Human output escapes non-printing bytes reversibly.  Missing, invalid, or
 prunable worktrees are reported and cause exit status 2.
 .TP
@@ -289,7 +290,7 @@ the receipt records is refused with exit status
 naming both values.  Comparison is exact and byte for byte.
 .PP
 There is no
-.B publish --abort .
+.BR "publish --abort" .
 A grove stuck in the
 .B publishing
 state, whose target can never accept an atomic push, is recovered by

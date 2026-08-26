@@ -326,7 +326,7 @@ git-grove completion fish > git-grove.fish
 The manual source is `man/git-grove.1` and can be viewed from a checkout with
 `man ./man/git-grove.1`.
 
-For walkthroughs and recovery procedures the manual only references in
+For walkthroughs and recovery procedures that the manual only references in
 passing, see the [wiki](https://github.com/e-kulikov/git-grove/wiki).
 
 ## Development and release verification
