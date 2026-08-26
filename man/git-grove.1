@@ -119,7 +119,8 @@ and lock or in-progress state.  A pending adoption transaction blocks the
 command entirely, before any row is produced, and exits with status
 .BR 2 .
 Human output escapes non-printing bytes reversibly.  Missing, invalid, or
-prunable worktrees are reported and cause exit status 2.
+prunable worktrees are reported and cause exit status
+.BR 2 .
 .TP
 .B sync
 Fetch every remote a registered branch worktree's upstream requires, one
