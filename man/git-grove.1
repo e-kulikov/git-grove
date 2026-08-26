@@ -115,9 +115,10 @@ Add a detached worktree.  The default directory is
 .TP
 .B list \fR[\fB--porcelain\fR]
 Show each non-bare worktree, branch, upstream, ahead/behind state, dirtiness,
-and lock or recovery state.  Human output escapes non-printing bytes
-reversibly.  Missing, invalid, or prunable worktrees are reported and cause
-exit status 2.
+and lock or in-progress state.  A pending adoption transaction blocks the
+command entirely, before any row is produced, and exits with status 2.
+Human output escapes non-printing bytes reversibly.  Missing, invalid, or
+prunable worktrees are reported and cause exit status 2.
 .TP
 .B sync
 Fetch every remote a registered branch worktree's upstream requires, one
@@ -286,6 +287,21 @@ completes the transaction.  A rerun naming a different URL or remote name than
 the receipt records is refused with exit status
 .BR 2 ,
 naming both values.  Comparison is exact and byte for byte.
+.PP
+There is no
+.B publish --abort .
+A grove stuck in the
+.B publishing
+state, whose target can never accept an atomic push, is recovered by
+unsetting
+.BR grove.publishState ,
+.BR grove.publishRemote ,
+and
+.B grove.publishUrl
+by hand; see
+.UR https://github.com/e-kulikov/git-grove/wiki/Getting-Out-Of-The-Publishing-State
+.UE
+for the walkthrough.
 .B publish
 does not rewrite
 .BR AGENTS.md .
@@ -372,7 +388,13 @@ and
 overlays.  Regardless of an override, all of them are removed from every Git
 process started by git-grove.  Transport variables such as
 .B GIT_SSH_COMMAND
-are preserved.
+are preserved.  Any Git child whose stderr git-grove parses to decide what to
+do next is additionally spawned with
+.B LC_ALL=C
+and an empty
+.BR LANGUAGE ,
+so that stderr is untranslated regardless of the caller's own locale; other
+Git children keep the caller's locale.
 .PP
 .B "publish --create"
 pins
