@@ -100,8 +100,6 @@ named `detached-<short-oid>`.
 project/
 ├── .bare/       bare Git repository and shared administration
 ├── .git         pointer containing: gitdir: ./.bare
-├── AGENTS.md    generated repository facts and 0.4 command guide
-├── CLAUDE.md    relative link to AGENTS.md
 ├── main/        worktree
 └── feature/     another worktree
 ```
@@ -124,8 +122,6 @@ default, the resulting tree is:
 ordinary-project/
 ├── .bare/
 ├── .git
-├── AGENTS.md
-├── CLAUDE.md
 ├── main/         generated default worktree
 └── topic/        adopted payload, including staged and untracked state
 ```
@@ -289,9 +285,6 @@ Publish is explicit and narrow, by design:
   or a different remote name than the receipt records is refused with exit
   status `2`, naming both values. Comparison is exact and byte for byte:
   `https://host/r.git` and `https://host/r` are different URLs.
-- Publishing does not rewrite `AGENTS.md`. When the generated guide still says
-  the grove is not published, the run says so and names the file, leaving the
-  edit to you.
 
 ## Safety and exit status
 
@@ -312,6 +305,44 @@ usage error, refused unsupported context, or a provider CLI older than the
 declared minimum. `list --porcelain` emits the versioned, NUL-delimited
 `git-grove-list-v1` protocol for automation; `sync`, `adopt`, and `publish`
 have no porcelain output.
+
+## Agent integration
+
+Through 0.4, `clone`/`init`/`adopt` generated `AGENTS.md` and a `CLAUDE.md` symlink once, at
+creation time, and never touched them again. That guide could not track the tool it described:
+this grove's own root guide, generated at 0.1.0, still documented only two of the current eight
+commands. **As of this release, git-grove no longer generates either file, with no deprecation
+window.** It never reads, writes, rewrites, or deletes an existing `AGENTS.md`/`CLAUDE.md` —
+a hand-maintained or already-generated copy is left exactly as it is, indefinitely.
+
+Two replacements:
+
+- `git grove --skill` prints one generic, version-free document describing the grove layout,
+  invariants, and command surface to stdout, before any policy or Git work. It reflects the
+  installed binary's own command surface, so it cannot drift out of date the way a
+  once-generated file did.
+- `git grove setup --agent <claude|codex|copilot>` writes a project-local hook into the current
+  worktree that denies any Edit/Write/Bash/`apply_patch` tool call whose target resolves under
+  `.bare` or the root `.git` pointer file — replacing the old guide's one advisory sentence
+  ("never edit `.bare`") with real enforcement.
+
+  `claude` and `copilot` converge on `<worktree>/.claude/settings.local.json`; run either once,
+  not both. `codex` writes `<worktree>/.codex/hooks.json`. Both files are per-worktree and kept
+  out of `git status` through the grove's own `.bare/info/exclude` — never tracked or committed.
+  `setup` writes no wrapper, alias, launcher flag, or global setting, and never bypasses an
+  agent's own trust model:
+
+  - Claude Code and an interactive Copilot CLI session enforce the shared file directly.
+    Measured: Copilot CLI 1.0.80 does not fire this local hook source under non-interactive
+    `copilot -p` — re-verify against your installed version before relying on this in
+    automation.
+  - Codex requires an interactive trust review before its hook is enforced: start a bare
+    interactive `codex` session in the worktree, trust the project if prompted, open `/hooks`,
+    review the exact command and its hash, and trust it. `codex exec` is not protected until
+    that review is complete.
+
+  `setup`'s own output names the exact next step for the agent you configured; it never runs or
+  approves those steps itself.
 
 ## Completions and manual
 

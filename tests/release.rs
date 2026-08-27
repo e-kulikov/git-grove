@@ -215,6 +215,43 @@ fn release_docs_describe_adopt_and_its_recovery_contract() {
 }
 
 #[test]
+fn release_docs_loudly_state_the_generation_removal_and_its_replacements() {
+    for relative in ["README.md", "man/git-grove.1"] {
+        let document = fs::read_to_string(repo_root().join(relative)).unwrap();
+        let rendered = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !document.contains("generated repository facts")
+                && !document.contains("Generated repository facts"),
+            "{relative} must not describe AGENTS.md/CLAUDE.md as still generated"
+        );
+        assert!(
+            rendered.contains("no longer generate") || rendered.contains("no longer generates"),
+            "{relative} must explicitly say generation is gone"
+        );
+        assert!(
+            document.contains("--skill"),
+            "{relative} omits the --skill replacement"
+        );
+        assert!(
+            document.contains("setup --agent") || document.contains("setup \\-\\-agent"),
+            "{relative} omits the setup --agent replacement"
+        );
+        assert!(
+            document.contains(".claude/settings.local.json"),
+            "{relative} omits the shared Claude/Copilot hook file location"
+        );
+        assert!(
+            document.contains(".codex/hooks.json"),
+            "{relative} omits the Codex hook file location"
+        );
+        assert!(
+            document.contains("1.0.80"),
+            "{relative} omits the measured Copilot non-interactive version boundary"
+        );
+    }
+}
+
+#[test]
 fn grove_format_version_is_unchanged_by_the_0_5_0_package_version() {
     let source = fs::read_to_string(repo_root().join("src/grove/metadata.rs")).unwrap();
     assert!(
