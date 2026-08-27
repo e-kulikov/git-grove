@@ -5,4 +5,5 @@ pub mod hook_guard;
 pub mod init;
 pub mod list;
 pub mod publish;
+pub mod setup;
 pub mod sync;

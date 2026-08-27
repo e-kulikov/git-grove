@@ -1,3 +1,4 @@
+pub mod config;
 pub mod decision;
 pub mod payload;
 pub mod response;
