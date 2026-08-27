@@ -21,28 +21,28 @@ With [mise](https://mise.jdx.dev/dev-tools/backends/github.html) and GitHub as
 the backend:
 
 ```sh
-mise use -g 'github:e-kulikov/git-grove@0.5.0'
+mise use -g 'github:e-kulikov/git-grove@0.6.0'
 ```
 
 For declarative mise configuration:
 
 ```toml
 [tools]
-"github:e-kulikov/git-grove" = { version = "0.5.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
+"github:e-kulikov/git-grove" = { version = "0.6.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
 ```
 
-The GitHub backend can install this only after the `v0.5.0` release and its
+The GitHub backend can install this only after the `v0.6.0` release and its
 assets have been published. The release workflow produces an attestation and
 `SHA256SUMS`; mise can lock the published checksum with `mise lock`.
 
 For a direct installation, download
-`git-grove_0.5.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
+`git-grove_0.6.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
 verify the archive, then install its binary:
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf git-grove_0.5.0_linux_x86_64.tar.gz
-install -m 0755 git-grove_0.5.0_linux_x86_64/git-grove ~/.local/bin/git-grove
+tar -xzf git-grove_0.6.0_linux_x86_64.tar.gz
+install -m 0755 git-grove_0.6.0_linux_x86_64/git-grove ~/.local/bin/git-grove
 ```
 
 The archive also contains the man page and generated Bash, Zsh, and Fish
@@ -371,10 +371,10 @@ mise exec -- cargo fmt --all -- --check
 mise exec -- cargo test --all-targets --locked
 mise exec -- cargo clippy --all-targets --locked -- -D warnings
 mise exec -- cargo build --release --locked --target x86_64-unknown-linux-musl
-scripts/package-release.sh 0.5.0 \
+scripts/package-release.sh 0.6.0 \
   target/x86_64-unknown-linux-musl/release/git-grove dist
 ```
 
 Release tags must be strict `vX.Y.Z` and match the package version exactly.
-For 0.5.0 the uploaded files are
-`git-grove_0.5.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
+For 0.6.0 the uploaded files are
+`git-grove_0.6.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
