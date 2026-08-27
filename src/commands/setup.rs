@@ -1,5 +1,8 @@
 use crate::error::{GroveError, Result};
+use crate::git::query;
+use crate::git::runner::GitRunner;
 use crate::hooks::config;
+use clap::ValueEnum;
 use rustix::fs::{openat, Mode, OFlags, CWD};
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -8,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 /// Which agent `setup --agent <x>` was asked to configure. `Claude` and
 /// `Copilot` converge on the same target — see `Target`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
 pub enum Agent {
     Claude,
     Codex,
@@ -209,6 +213,124 @@ pub fn write_hook_config(worktree_root: &Path, agent: Agent, executable: &str) -
         OsStr::new(target.relative_file),
         &bytes,
     )
+}
+
+/// The measured Copilot CLI version this session found does not fire a
+/// local shared-file hook under non-interactive `-p` — see
+/// `.superpowers/specs/2026-08-21-git-grove-agent-integration.md`, Part 3,
+/// "Copilot compatibility boundary".
+const MEASURED_COPILOT_NONINTERACTIVE_LIMITATION_VERSION: &str = "1.0.80";
+
+/// The full `setup --agent` orchestration: refuse an exact tracked
+/// collision, then validate/merge/write the common exclude entry and the
+/// agent's own hook config in that order (the exclude write is safe to
+/// repeat; a rerun after a crash between the two writes only sees an
+/// already-present exclude line and proceeds straight to the config write —
+/// see the failpoint test below), and return the honest, agent-specific
+/// next-steps message. Grove discovery, the current-worktree refusal, the
+/// mutation lock, and metadata support are the caller's job; this function
+/// assumes all of that already holds.
+pub fn run(
+    runner: &dyn GitRunner,
+    grove_root: &Path,
+    worktree_root: &Path,
+    agent: Agent,
+    executable: &str,
+) -> Result<String> {
+    let target = agent.target();
+
+    if query::is_tracked(runner, worktree_root, &target.relative_path())? {
+        return Err(GroveError::needs_decision(format!(
+            "{} is already tracked in this worktree; untrack it or resolve the policy \
+             conflict, then run setup again",
+            target.relative_path().display()
+        )));
+    }
+
+    let directory = open_target_directory(worktree_root, &target)?;
+    let existing_config = read_existing(&directory, &target)?;
+    let merged = config::merge(
+        &existing_config,
+        target.marker_key,
+        target.marker_value,
+        agent.group(executable),
+    )
+    .map_err(|reason| {
+        GroveError::needs_decision(format!(
+            "{} {reason}; refusing to merge",
+            target.relative_path().display()
+        ))
+    })?;
+    let new_config_bytes = config::render(&merged);
+
+    let exclude_path = grove_root.join(".bare/info/exclude");
+    let existing_exclude = match std::fs::read(&exclude_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(GroveError::failure(format!(
+                "cannot read {}: {error}",
+                exclude_path.display()
+            )))
+        }
+    };
+    let new_exclude_bytes = config::add_exclude_entry(&existing_exclude, &target.exclude_entry());
+
+    crate::fsx::write_atomic(&exclude_path, &new_exclude_bytes)?;
+
+    let mut checkpoints = crate::transaction::failpoint::Checkpoints::from_env()?;
+    checkpoints.checkpoint()?;
+
+    let parent_path = worktree_root.join(target.relative_dir);
+    let full_path = worktree_root.join(target.relative_path());
+    crate::fsx::write_atomic_in(
+        &directory,
+        &parent_path,
+        &full_path,
+        OsStr::new(target.relative_file),
+        &new_config_bytes,
+    )?;
+
+    Ok(next_steps(agent, &target, grove_root))
+}
+
+fn next_steps(agent: Agent, target: &Target, grove_root: &Path) -> String {
+    let probe = grove_root.join(".bare/git-grove-hook-probe");
+    let shared_intro = format!(
+        "Wrote the shared hook config to {} -- this configures both Claude Code and Copilot \
+         CLI.\n",
+        target.relative_path().display()
+    );
+    match agent {
+        Agent::Claude => format!(
+            "{shared_intro}You do not need to run `git grove setup --agent copilot` \
+             separately.\nVerify: ask Claude to create {} and confirm the tool call is \
+             denied with the git-grove invariant message; then delete the probe file if it \
+             was created (the guard failed to fire).\n",
+            probe.display()
+        ),
+        Agent::Copilot => format!(
+            "{shared_intro}You do not need to run `git grove setup --agent claude` \
+             separately.\nMeasured: Copilot CLI {MEASURED_COPILOT_NONINTERACTIVE_LIMITATION_VERSION} \
+             did not fire this local hook source under non-interactive `copilot -p` -- an \
+             interactive session did. Re-verify against your installed version before relying \
+             on this in non-interactive automation.\nVerify interactively: ask Copilot to \
+             create {} and confirm the tool call is denied; then delete the probe file if it \
+             was created (the guard failed to fire).\n",
+            probe.display()
+        ),
+        Agent::Codex => format!(
+            "Wrote {} -- Codex requires an interactive trust review before this hook is \
+             enforced, and `codex exec` is not protected until that review is complete.\nStart \
+             a bare interactive `codex` session in this worktree, trust the project if \
+             prompted, open /hooks, review the exact command and its hash, and trust it.\n\
+             Verify: after trusting it, ask Codex to create {} and confirm the tool call is \
+             denied; then delete the probe file if it was created (the guard failed to \
+             fire).\nsetup never runs or approves any of these steps itself.\n",
+            target.relative_path().display(),
+            probe.display()
+        ),
+    }
 }
 
 #[cfg(test)]

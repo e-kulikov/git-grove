@@ -21,6 +21,7 @@ pub const KNOWN: &[&str] = &[
     "publish",
     "propagate",
     "completion",
+    "setup",
     "hook-guard",
     "help",
 ];
@@ -199,6 +200,12 @@ pub enum Command {
     },
     /// Generate shell completion code
     Completion { shell: CompletionShell },
+    /// Configure a local hook that denies agent tool calls into grove metadata
+    Setup {
+        /// Which agent to configure a local hook for
+        #[arg(long, value_enum)]
+        agent: crate::commands::setup::Agent,
+    },
     /// Internal hook handler invoked by an installed agent hook; not for
     /// direct interactive use
     #[command(hide = true)]
