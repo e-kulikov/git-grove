@@ -21,6 +21,7 @@ pub const KNOWN: &[&str] = &[
     "publish",
     "propagate",
     "completion",
+    "hook-guard",
     "help",
 ];
 
@@ -198,6 +199,14 @@ pub enum Command {
     },
     /// Generate shell completion code
     Completion { shell: CompletionShell },
+    /// Internal hook handler invoked by an installed agent hook; not for
+    /// direct interactive use
+    #[command(hide = true)]
+    HookGuard {
+        #[arg(long, value_enum)]
+        protocol: crate::hooks::Protocol,
+        event: crate::hooks::Event,
+    },
 }
 
 #[derive(Args, Debug)]

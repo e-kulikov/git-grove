@@ -259,6 +259,15 @@ fn run(cli: cli::Cli) -> Result<()> {
                 }
             }
         }
+        cli::Command::HookGuard { protocol, event } => {
+            let git_grove::hooks::Event::PreToolUse = event;
+            commands::hook_guard::run(
+                protocol,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+                std::env::current_dir(),
+            )
+        }
         cli::Command::Completion { shell } => {
             let mut command = cli::Cli::command();
             clap_complete::generate(
