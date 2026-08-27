@@ -6,4 +6,5 @@ pub mod git;
 pub mod grove;
 pub mod output;
 pub mod policy;
+pub mod skill;
 pub mod transaction;

@@ -34,8 +34,16 @@ fn render(result: Result<()>) -> ExitCode {
 fn run(cli: cli::Cli) -> Result<()> {
     let cli::Cli {
         ignore_unsupported,
+        skill,
         command,
     } = cli;
+    let command = match (skill, command) {
+        (true, _) => return git_grove::skill::write(&mut std::io::stdout()),
+        (false, Some(command)) => command,
+        (false, None) => {
+            return Err(GroveError::usage("a subcommand is required"));
+        }
+    };
     match command {
         cli::Command::Clone {
             url,
@@ -261,5 +269,26 @@ fn run(cli: cli::Cli) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real argv never reaches this arm: bare invocation and
+    /// `--ignore-unsupported` alone are both expanded by `normalize` into an
+    /// explicit `list`, and every other flag-only shape is `--skill`, which
+    /// the sibling arm intercepts first. Constructed directly to prove the
+    /// defensive branch is a usage error, not a panic, if that ever changes.
+    #[test]
+    fn no_skill_and_no_command_is_a_usage_error_not_a_panic() {
+        let cli = cli::Cli {
+            ignore_unsupported: false,
+            skill: false,
+            command: None,
+        };
+        let error = run(cli).unwrap_err();
+        assert_eq!(error.class, ExitClass::Usage);
     }
 }
