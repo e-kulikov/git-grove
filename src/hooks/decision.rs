@@ -111,31 +111,41 @@ fn shell_tokens(command: &str) -> Vec<String> {
 
 /// Conservative, best-effort path-candidate extraction for a Bash command:
 /// every token that is not a recognized shell operator, with a glued
-/// leading redirection operator (`>file`, `>>file`, `<file`) stripped.
-/// Shell commands have no single canonical "the path" the way a structured
-/// tool call does — a prior `cd`, a loop, or command substitution can all
-/// reach a protected path without one clean token containing it — so this
-/// deliberately over-collects candidates rather than under-collects: a
-/// false positive costs an annoying rephrase, a false negative is the hole
-/// this feature exists to close.
+/// leading redirection operator (`>file`, `>>file`, `<file`) stripped. A
+/// token that looks like a long or short option with its value glued on
+/// (`--flag=path`, `-o=path`) additionally yields the value half as its own
+/// candidate — otherwise `--output=../.git` resolves as the single
+/// nonexistent path `<base>/--output=../.git`, `..` fused into a directory
+/// name rather than a real parent-directory component, and never matches
+/// containment at all. Shell commands have no single canonical "the path"
+/// the way a structured tool call does — a prior `cd`, a loop, or command
+/// substitution can all reach a protected path without one clean token
+/// containing it — so this deliberately over-collects candidates rather
+/// than under-collects: a false positive costs an annoying rephrase, a
+/// false negative is the hole this feature exists to close.
 fn bash_candidates(command: &str) -> Vec<String> {
-    shell_tokens(command)
-        .into_iter()
-        .filter_map(|token| {
-            let mut rest = token.as_str();
-            for operator in [">>", "<<", ">", "<"] {
-                if let Some(stripped) = rest.strip_prefix(operator) {
-                    rest = stripped;
-                    break;
+    let mut candidates = Vec::new();
+    for token in shell_tokens(command) {
+        let mut rest = token.as_str();
+        for operator in [">>", "<<", ">", "<"] {
+            if let Some(stripped) = rest.strip_prefix(operator) {
+                rest = stripped;
+                break;
+            }
+        }
+        if rest.is_empty() || SHELL_OPERATORS.contains(&rest) {
+            continue;
+        }
+        candidates.push(rest.to_string());
+        if rest.starts_with('-') {
+            if let Some((_, value)) = rest.split_once('=') {
+                if !value.is_empty() {
+                    candidates.push(value.to_string());
                 }
             }
-            if rest.is_empty() || SHELL_OPERATORS.contains(&rest) {
-                None
-            } else {
-                Some(rest.to_string())
-            }
-        })
-        .collect()
+        }
+    }
+    candidates
 }
 
 /// Extract every path an `apply_patch` payload names, or an error if the
@@ -386,5 +396,27 @@ mod tests {
             bash_candidates("echo hi >.bare/config"),
             vec!["echo", "hi", ".bare/config"]
         );
+    }
+
+    #[test]
+    fn bash_candidates_also_yields_the_value_half_of_a_glued_option() {
+        assert_eq!(
+            bash_candidates("tool --output=../.bare/config"),
+            vec!["tool", "--output=../.bare/config", "../.bare/config"]
+        );
+    }
+
+    #[test]
+    fn decide_denies_a_bash_command_reaching_bare_through_a_glued_option_value() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "tool --output=../.bare/config".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)));
     }
 }
