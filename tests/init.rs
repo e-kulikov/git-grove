@@ -15,14 +15,8 @@ fn creates_the_layout_and_the_first_worktree() {
         std::fs::read_to_string(root.join(".git")).unwrap(),
         "gitdir: ./.bare\n"
     );
-    assert!(root.join("AGENTS.md").is_file());
-    assert_eq!(
-        std::fs::read_link(root.join("CLAUDE.md"))
-            .unwrap()
-            .to_str()
-            .unwrap(),
-        "AGENTS.md"
-    );
+    assert!(!root.join("AGENTS.md").exists());
+    assert!(!root.join("CLAUDE.md").exists());
     assert!(root.join("main").is_dir(), "first worktree missing");
 
     let head = sandbox.git(&root.join("main"), &["symbolic-ref", "--short", "HEAD"]);
@@ -366,7 +360,7 @@ fn replacing_the_named_bare_path_cannot_redirect_git_into_foreign_state() {
 fn concurrent_layout_entries_are_preserved_as_state_conflicts() {
     use std::os::unix::fs::PermissionsExt;
 
-    for entry in [".git", "AGENTS.md", "CLAUDE.md"] {
+    for entry in [".git"] {
         let sandbox = Sandbox::new();
         let root = sandbox.root().join("fresh");
         let bin = sandbox.root().join("conflicting-bin");
@@ -374,8 +368,6 @@ fn concurrent_layout_entries_are_preserved_as_state_conflicts() {
         let git = bin.join("git");
         let trigger = match entry {
             ".git" => "init",
-            "AGENTS.md" => "symbolic-ref --short HEAD",
-            "CLAUDE.md" => "grove.publishState",
             _ => unreachable!(),
         };
         std::fs::write(

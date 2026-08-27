@@ -791,28 +791,6 @@ fn server_head_matches(
         .is_some_and(|symref| symref.as_slice() == flight.default_ref().as_slice()))
 }
 
-/// The sentence a guide generated for an unpublished grove carries, which
-/// publishing makes false.
-const UNPUBLISHED_GUIDE_SENTENCE: &str =
-    "This grove is **not published**: it has no upstream branch.";
-
-/// `publish` never rewrites `AGENTS.md`: the guide is written once with
-/// `write_atomic_if_absent` and is the user's file thereafter. When it still
-/// says the grove is unpublished, say so and let the user decide.
-fn stale_guide_line(grove: &Grove) -> Option<String> {
-    let guide = grove.root.join("AGENTS.md");
-    let contents = std::fs::read(&guide).ok()?;
-    let stale = contents
-        .windows(UNPUBLISHED_GUIDE_SENTENCE.len())
-        .any(|window| window == UNPUBLISHED_GUIDE_SENTENCE.as_bytes());
-    stale.then(|| {
-        format!(
-            "{} still says `{UNPUBLISHED_GUIDE_SENTENCE}`; publish does not rewrite it",
-            guide.display()
-        )
-    })
-}
-
 fn published_receipt(request: &Request) -> Receipt {
     Receipt {
         remote: BString::from(request.remote.as_bytes().to_vec()),
@@ -891,8 +869,6 @@ fn publish_and_verify(
         }
     }
     point_remote_head(runner, grove, request, flight)?;
-
-    lines.extend(stale_guide_line(grove));
 
     metadata::write_receipt(
         runner,
