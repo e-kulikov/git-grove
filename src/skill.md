@@ -34,7 +34,7 @@ A branch can be checked out in only one worktree at a time. `.bare/`, `.git`, an
 - `sync` (tend) — fetch and fast-forward every eligible worktree.
 - `publish <url>`, or `publish --create OWNER/NAME --host <github|gitlab>` (propagate) — give an unpublished grove a remote and push it, optionally creating the hosting-side repository first.
 - `completion <shell>` — generate shell completion code for `bash`, `zsh`, or `fish`.
-- `setup --agent <claude|codex|copilot>` — write a project-local hook, scoped to the current worktree, that denies any Edit/Write/Bash/`apply_patch` tool call whose target resolves under `.bare` or the root `.git` file. `claude` and `copilot` share one file; run either once, not both. Each agent's own trust and discovery rules still apply — `setup`'s own output names the exact next step.
+- `setup --agent <claude|codex|copilot>` — write a project-local hook, scoped to the current worktree, that denies any Edit/Write/Bash tool call (and, for `codex` specifically, its `apply_patch` tool) whose target resolves under `.bare` or the root `.git` file. `claude` and `copilot` share one file; run either once, not both. Each agent's own trust and discovery rules still apply — `setup`'s own output names the exact next step.
 - `--skill` — print this document and exit, before any other work.
 
 ## Reconstruction escape hatch

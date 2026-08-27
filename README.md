@@ -322,9 +322,9 @@ Two replacements:
   installed binary's own command surface, so it cannot drift out of date the way a
   once-generated file did.
 - `git grove setup --agent <claude|codex|copilot>` writes a project-local hook into the current
-  worktree that denies any Edit/Write/Bash/`apply_patch` tool call whose target resolves under
-  `.bare` or the root `.git` pointer file — replacing the old guide's one advisory sentence
-  ("never edit `.bare`") with real enforcement.
+  worktree that denies any Edit/Write/Bash tool call (and, for `codex` specifically, its
+  `apply_patch` tool) whose target resolves under `.bare` or the root `.git` pointer file —
+  replacing the old guide's one advisory sentence ("never edit `.bare`") with real enforcement.
 
   `claude` and `copilot` converge on `<worktree>/.claude/settings.local.json`; run either once,
   not both. `codex` writes `<worktree>/.codex/hooks.json`. Both files are per-worktree and kept

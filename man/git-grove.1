@@ -331,9 +331,11 @@ Write completion source for the selected shell to standard output.
 .TP
 .B setup --agent \fR{\fBclaude\fR|\fBcodex\fR|\fBcopilot\fR}
 Write a project-local hook, scoped to the current worktree, that denies any
-Edit/Write/Bash/
+Edit/Write/Bash tool call \(em and, for
+.B codex
+specifically, its
 .B apply_patch
-tool call whose target resolves under
+tool \(em whose target resolves under
 .B .bare
 or the root
 .B .git

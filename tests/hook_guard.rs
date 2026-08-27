@@ -88,6 +88,16 @@ fn denies_a_bash_command_reaching_into_bare_through_a_glued_option_value() {
 }
 
 #[test]
+fn denies_a_bash_command_reaching_into_bare_through_an_fd_redirection() {
+    let sandbox = Sandbox::new();
+    let (_root, worktree) = grove(&sandbox);
+    let payload = r#"{"tool_name":"Bash","tool_input":{"command":"tool 1>../.bare/config"}}"#;
+    run_hook_guard(&sandbox, &worktree, "claude-compatible", payload)
+        .success()
+        .stdout(predicates::str::contains("\"permissionDecision\":\"deny\""));
+}
+
+#[test]
 fn allows_an_unrelated_bash_command() {
     let sandbox = Sandbox::new();
     let (_root, worktree) = grove(&sandbox);

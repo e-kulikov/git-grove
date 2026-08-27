@@ -111,8 +111,11 @@ fn shell_tokens(command: &str) -> Vec<String> {
 
 /// Conservative, best-effort path-candidate extraction for a Bash command:
 /// every token that is not a recognized shell operator, with a glued
-/// leading redirection operator (`>file`, `>>file`, `<file`) stripped. A
-/// token that looks like a long or short option with its value glued on
+/// leading redirection operator stripped — `>file`, `>>file`, `<file`, and
+/// the same three with a leading file-descriptor number glued on
+/// (`1>file`, `2>>file`, `0<file`; exec-reviewer caught `1>../.bare/config`
+/// surviving as one untouched candidate token in an earlier round). A token
+/// that looks like a long or short option with its value glued on
 /// (`--flag=path`, `-o=path`) additionally yields the value half as its own
 /// candidate — otherwise `--output=../.git` resolves as the single
 /// nonexistent path `<base>/--output=../.git`, `..` fused into a directory
@@ -126,14 +129,21 @@ fn shell_tokens(command: &str) -> Vec<String> {
 fn bash_candidates(command: &str) -> Vec<String> {
     let mut candidates = Vec::new();
     for token in shell_tokens(command) {
+        if SHELL_OPERATORS.contains(&token.as_str()) {
+            continue;
+        }
         let mut rest = token.as_str();
+        let digit_end = rest
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let after_digits = &rest[digit_end..];
         for operator in [">>", "<<", ">", "<"] {
-            if let Some(stripped) = rest.strip_prefix(operator) {
+            if let Some(stripped) = after_digits.strip_prefix(operator) {
                 rest = stripped;
                 break;
             }
         }
-        if rest.is_empty() || SHELL_OPERATORS.contains(&rest) {
+        if rest.is_empty() {
             continue;
         }
         candidates.push(rest.to_string());
@@ -396,6 +406,36 @@ mod tests {
             bash_candidates("echo hi >.bare/config"),
             vec!["echo", "hi", ".bare/config"]
         );
+    }
+
+    #[test]
+    fn bash_candidates_strips_a_glued_file_descriptor_redirection() {
+        assert_eq!(
+            bash_candidates("tool 1>../.bare/config"),
+            vec!["tool", "../.bare/config"]
+        );
+        assert_eq!(
+            bash_candidates("tool 2>>../.bare/config"),
+            vec!["tool", "../.bare/config"]
+        );
+        assert_eq!(
+            bash_candidates("tool 0<../.bare/config"),
+            vec!["tool", "../.bare/config"]
+        );
+    }
+
+    #[test]
+    fn decide_denies_a_bash_command_reaching_bare_through_an_fd_redirection() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "tool 1>../.bare/config".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)));
     }
 
     #[test]
