@@ -360,39 +360,35 @@ fn replacing_the_named_bare_path_cannot_redirect_git_into_foreign_state() {
 fn concurrent_layout_entries_are_preserved_as_state_conflicts() {
     use std::os::unix::fs::PermissionsExt;
 
-    for entry in [".git"] {
-        let sandbox = Sandbox::new();
-        let root = sandbox.root().join("fresh");
-        let bin = sandbox.root().join("conflicting-bin");
-        std::fs::create_dir(&bin).unwrap();
-        let git = bin.join("git");
-        let trigger = match entry {
-            ".git" => "init",
-            _ => unreachable!(),
-        };
-        std::fs::write(
-            &git,
-            format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *'{trigger}'*) /usr/bin/git \"$@\" || exit $?; printf foreign > \"$GROVE_CONFLICT/{entry}\"; exit 0;;\nesac\nexec /usr/bin/git \"$@\"\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!(
-            "{}:{}",
-            bin.display(),
-            std::env::var("PATH").expect("PATH must be set")
-        );
+    let entry = ".git";
+    let sandbox = Sandbox::new();
+    let root = sandbox.root().join("fresh");
+    let bin = sandbox.root().join("conflicting-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    let trigger = "init";
+    std::fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *'{trigger}'*) /usr/bin/git \"$@\" || exit $?; printf foreign > \"$GROVE_CONFLICT/{entry}\"; exit 0;;\nesac\nexec /usr/bin/git \"$@\"\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH must be set")
+    );
 
-        sandbox
-            .grove(&["init", "fresh", "--branch", "main"])
-            .env("PATH", path)
-            .env("GROVE_CONFLICT", &root)
-            .assert()
-            .code(2);
+    sandbox
+        .grove(&["init", "fresh", "--branch", "main"])
+        .env("PATH", path)
+        .env("GROVE_CONFLICT", &root)
+        .assert()
+        .code(2);
 
-        assert_eq!(std::fs::read(root.join(entry)).unwrap(), b"foreign");
-    }
+    assert_eq!(std::fs::read(root.join(entry)).unwrap(), b"foreign");
 }
 
 #[cfg(unix)]
