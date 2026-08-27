@@ -4,6 +4,8 @@ use git_grove::commands::adopt::preflight;
 use git_grove::commands::adopt::AdoptArgs;
 use git_grove::error::ExitClass;
 use git_grove::git::runner::RealGit;
+#[cfg(feature = "failpoints")]
+use git_grove::transaction::journal::{Journal, Primitive};
 #[cfg(unix)]
 use harness::tree_snapshot;
 use harness::Sandbox;
@@ -451,6 +453,43 @@ fn fresh_adopt_preserves_the_payload_and_builds_a_grove() {
 }
 
 #[test]
+fn adopt_preserves_user_owned_agent_files() {
+    let sandbox = Sandbox::new();
+
+    let regular = flat_repository(&sandbox, "user-agent-files");
+    std::fs::write(regular.join("AGENTS.md"), b"owner instructions\n").unwrap();
+    std::fs::write(regular.join("CLAUDE.md"), b"owner claude instructions\n").unwrap();
+    sandbox
+        .grove_in(sandbox.root(), &["adopt", regular.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(regular.join("main/AGENTS.md")).unwrap(),
+        b"owner instructions\n"
+    );
+    assert_eq!(
+        std::fs::read(regular.join("main/CLAUDE.md")).unwrap(),
+        b"owner claude instructions\n"
+    );
+
+    let linked = flat_repository(&sandbox, "historical-agent-link");
+    std::fs::write(linked.join("AGENTS.md"), b"historical owner edit\n").unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", linked.join("CLAUDE.md")).unwrap();
+    sandbox
+        .grove_in(sandbox.root(), &["adopt", linked.to_str().unwrap()])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(linked.join("main/AGENTS.md")).unwrap(),
+        b"historical owner edit\n"
+    );
+    assert_eq!(
+        std::fs::read_link(linked.join("main/CLAUDE.md")).unwrap(),
+        Path::new("AGENTS.md")
+    );
+}
+
+#[test]
 fn branch_matrix_keeps_a_non_default_payload_and_creates_the_default_checkout() {
     let sandbox = Sandbox::new();
     let root = flat_repository(&sandbox, "matrix");
@@ -728,7 +767,7 @@ fn fresh_adopt_preserves_raw_names_modes_links_and_shared_fallthrough() {
 #[test]
 fn continue_replays_durable_phase_boundaries_and_torn_replacements() {
     let sandbox = Sandbox::new();
-    for checkpoint in [1, 2, 5, 6, 10, 25, 50] {
+    for checkpoint in [1, 2, 5, 6, 10, 25, 44] {
         let root = flat_repository(&sandbox, &format!("continue-{checkpoint}"));
         std::fs::write(root.join("tracked"), format!("checkpoint {checkpoint}\n")).unwrap();
         sandbox
@@ -765,7 +804,7 @@ fn continue_replays_durable_phase_boundaries_and_torn_replacements() {
 #[test]
 fn abort_reverses_each_completed_or_physically_completed_phase() {
     let sandbox = Sandbox::new();
-    for checkpoint in [1, 5, 10, 15, 20, 25, 30, 35, 40, 45] {
+    for checkpoint in [1, 5, 10, 15, 20, 25, 30, 35, 40, 44] {
         let root = flat_repository(&sandbox, &format!("abort-{checkpoint}"));
         std::fs::write(root.join("tracked"), format!("abort {checkpoint}\n")).unwrap();
         std::fs::write(root.join("untracked"), b"untracked\n").unwrap();
@@ -824,5 +863,78 @@ fn abort_reverses_each_completed_or_physically_completed_phase() {
             .file_name()
             .to_string_lossy()
             .starts_with(".grove-adopt-")));
+    }
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn journal_has_eight_phases_and_no_guide_evidence() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "eight-phases");
+    sandbox
+        .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+        .env("GIT_GROVE_FAILPOINT", "error:5")
+        .assert()
+        .failure();
+
+    let transaction = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".grove-adopt-")
+        })
+        .unwrap();
+    let bytes = std::fs::read(transaction.join("journal.json")).unwrap();
+    let journal = Journal::parse_strict(&bytes).unwrap();
+    assert_eq!(journal.operations.len(), 8);
+    let Primitive::Git { invocation, .. } = &journal.operations[7].primitive else {
+        panic!("phase 8 is not the unlock/verification phase marker");
+    };
+    assert_eq!(invocation.args[0].decode(), b"adopt-phase-8");
+    assert!(!bytes.windows(b"guide".len()).any(|bytes| bytes == b"guide"));
+
+    let mut old: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    old["plan"]["generated"]["guide"] = serde_json::json!({
+        "bytes": {"encoding": "hex", "value": ""},
+        "sha256": vec![0; 32],
+        "mode": 420
+    });
+    assert!(Journal::parse_strict(&serde_json::to_vec(&old).unwrap()).is_err());
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn continue_and_abort_preserve_user_owned_agent_files() {
+    let sandbox = Sandbox::new();
+    for action in ["--continue", "--abort"] {
+        let root = flat_repository(&sandbox, &format!("agent-files-{action}"));
+        std::fs::write(root.join("AGENTS.md"), b"owner instructions\n").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).unwrap();
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+            .env("GIT_GROVE_FAILPOINT", "error:25")
+            .assert()
+            .failure();
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", action, root.to_str().unwrap()])
+            .assert()
+            .success();
+
+        let payload_root = if action == "--continue" {
+            root.join("main")
+        } else {
+            root.clone()
+        };
+        assert_eq!(
+            std::fs::read(payload_root.join("AGENTS.md")).unwrap(),
+            b"owner instructions\n"
+        );
+        assert_eq!(
+            std::fs::read_link(payload_root.join("CLAUDE.md")).unwrap(),
+            Path::new("AGENTS.md")
+        );
     }
 }

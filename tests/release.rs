@@ -13,7 +13,7 @@ fn release_version_requires_a_strict_matching_tag() {
     let manifest = repo_root().join("Cargo.toml");
 
     let valid = Command::new(&script)
-        .args(["v0.5.0", manifest.to_str().unwrap()])
+        .args(["v0.6.0", manifest.to_str().unwrap()])
         .output()
         .expect("run version validator");
     assert!(
@@ -21,9 +21,9 @@ fn release_version_requires_a_strict_matching_tag() {
         "{}",
         String::from_utf8_lossy(&valid.stderr)
     );
-    assert_eq!(valid.stdout, b"0.5.0\n");
+    assert_eq!(valid.stdout, b"0.6.0\n");
 
-    for tag in ["0.5.0", "v01.5.0", "v0.5", "v0.5.0-rc.1", "v0.6.0"] {
+    for tag in ["0.6.0", "v01.6.0", "v0.6", "v0.6.0-rc.1", "v0.5.0"] {
         let invalid = Command::new(&script)
             .args([tag, manifest.to_str().unwrap()])
             .output()
@@ -215,11 +215,48 @@ fn release_docs_describe_adopt_and_its_recovery_contract() {
 }
 
 #[test]
-fn grove_format_version_is_unchanged_by_the_0_5_0_package_version() {
+fn release_docs_loudly_state_the_generation_removal_and_its_replacements() {
+    for relative in ["README.md", "man/git-grove.1"] {
+        let document = fs::read_to_string(repo_root().join(relative)).unwrap();
+        let rendered = document.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !document.contains("generated repository facts")
+                && !document.contains("Generated repository facts"),
+            "{relative} must not describe AGENTS.md/CLAUDE.md as still generated"
+        );
+        assert!(
+            rendered.contains("no longer generate") || rendered.contains("no longer generates"),
+            "{relative} must explicitly say generation is gone"
+        );
+        assert!(
+            document.contains("--skill"),
+            "{relative} omits the --skill replacement"
+        );
+        assert!(
+            document.contains("setup --agent") || document.contains("setup \\-\\-agent"),
+            "{relative} omits the setup --agent replacement"
+        );
+        assert!(
+            document.contains(".claude/settings.local.json"),
+            "{relative} omits the shared Claude/Copilot hook file location"
+        );
+        assert!(
+            document.contains(".codex/hooks.json"),
+            "{relative} omits the Codex hook file location"
+        );
+        assert!(
+            document.contains("1.0.80"),
+            "{relative} omits the measured Copilot non-interactive version boundary"
+        );
+    }
+}
+
+#[test]
+fn grove_format_version_is_unchanged_by_the_0_6_0_package_version() {
     let source = fs::read_to_string(repo_root().join("src/grove/metadata.rs")).unwrap();
     assert!(
         source.contains("pub const FORMAT_VERSION: u32 = 1;"),
-        "grove layout format must remain version 1 across the 0.5.0 package bump"
+        "grove layout format must remain version 1 across the 0.6.0 package bump"
     );
 }
 
@@ -263,7 +300,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
     run_packager(&binary, &first);
     run_packager(&binary, &second);
 
-    let archive_name = "git-grove_0.5.0_linux_x86_64.tar.gz";
+    let archive_name = "git-grove_0.6.0_linux_x86_64.tar.gz";
     assert_eq!(
         fs::read(first.join(archive_name)).unwrap(),
         fs::read(second.join(archive_name)).unwrap(),
@@ -287,7 +324,7 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
         .output()
         .unwrap();
     assert!(listing.status.success());
-    let prefix = "git-grove_0.5.0_linux_x86_64";
+    let prefix = "git-grove_0.6.0_linux_x86_64";
     let expected = [
         format!("{prefix}/"),
         format!("{prefix}/LICENSE"),
@@ -339,7 +376,7 @@ fn run_packager(binary: &Path, destination: &Path) {
     let output = Command::new(repo_root().join("scripts/package-release.sh"))
         .env("SOURCE_DATE_EPOCH", "946684800")
         .args([
-            "0.5.0",
+            "0.6.0",
             binary.to_str().unwrap(),
             destination.to_str().unwrap(),
         ])

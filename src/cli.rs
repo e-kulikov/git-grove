@@ -21,6 +21,8 @@ pub const KNOWN: &[&str] = &[
     "publish",
     "propagate",
     "completion",
+    "setup",
+    "hook-guard",
     "help",
 ];
 
@@ -36,8 +38,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub ignore_unsupported: bool,
 
+    /// Print the generic agent skill document and exit
+    #[arg(long, global = true)]
+    pub skill: bool,
+
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// The two hosting providers `publish --create` supports. Self-hosted or
@@ -194,6 +200,20 @@ pub enum Command {
     },
     /// Generate shell completion code
     Completion { shell: CompletionShell },
+    /// Configure a local hook that denies agent tool calls into grove metadata
+    Setup {
+        /// Which agent to configure a local hook for
+        #[arg(long, value_enum)]
+        agent: crate::commands::setup::Agent,
+    },
+    /// Internal hook handler invoked by an installed agent hook; not for
+    /// direct interactive use
+    #[command(hide = true)]
+    HookGuard {
+        #[arg(long, value_enum)]
+        protocol: crate::hooks::Protocol,
+        event: crate::hooks::Event,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -786,7 +806,7 @@ mod tests {
     fn parsed_add(args: &[&str]) -> AddArgs {
         let parsed =
             Cli::try_parse_from(std::iter::once("git-grove").chain(args.iter().copied())).unwrap();
-        match parsed.command {
+        match parsed.command.unwrap() {
             Command::Add(args) => args,
             other => panic!("parsed the wrong command: {other:?}"),
         }
@@ -862,7 +882,7 @@ mod tests {
         ])
         .unwrap();
 
-        match parsed.command {
+        match parsed.command.unwrap() {
             Command::Clone {
                 url,
                 branch: parsed_branch,
@@ -881,7 +901,7 @@ mod tests {
     fn publish_accepts_a_bare_url_with_no_create_flags() {
         let parsed =
             Cli::try_parse_from(["git-grove", "publish", "https://example.invalid/r.git"]).unwrap();
-        match parsed.command {
+        match parsed.command.unwrap() {
             Command::Publish {
                 url,
                 create,
@@ -909,7 +929,7 @@ mod tests {
             "github",
         ])
         .unwrap();
-        match parsed.command {
+        match parsed.command.unwrap() {
             Command::Publish {
                 url,
                 create,
@@ -938,7 +958,7 @@ mod tests {
             "--public",
         ])
         .unwrap();
-        match parsed.command {
+        match parsed.command.unwrap() {
             Command::Publish { public, host, .. } => {
                 assert!(public);
                 assert_eq!(host, Some(ProviderHost::Gitlab));
@@ -970,7 +990,7 @@ mod tests {
         // itself accepts the parse; `validate_create_flags` is what refuses.
         let parsed =
             Cli::try_parse_from(["git-grove", "publish", "--create", "acme/widgets"]).unwrap();
-        let Command::Publish { create, host, .. } = parsed.command else {
+        let Command::Publish { create, host, .. } = parsed.command.unwrap() else {
             panic!("wrong command");
         };
         let error = validate_create_flags(create.as_deref(), host, false).unwrap_err();
@@ -988,7 +1008,7 @@ mod tests {
             "github",
         ])
         .unwrap();
-        let Command::Publish { create, host, .. } = parsed.command else {
+        let Command::Publish { create, host, .. } = parsed.command.unwrap() else {
             panic!("wrong command");
         };
         let error = validate_create_flags(create.as_deref(), host, false).unwrap_err();
@@ -1010,7 +1030,7 @@ mod tests {
             host,
             public,
             ..
-        } = parsed.command
+        } = parsed.command.unwrap()
         else {
             panic!("wrong command");
         };

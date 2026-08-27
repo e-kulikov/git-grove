@@ -1,4 +1,4 @@
-.TH GIT-GROVE 1 "2026-08-21" "git-grove 0.5.0" "Git Extensions"
+.TH GIT-GROVE 1 "2026-08-27" "git-grove 0.6.0" "Git Extensions"
 .SH NAME
 git-grove \- manage repositories as a bare clone surrounded by Git worktrees
 .SH SYNOPSIS
@@ -20,11 +20,7 @@ pointer file, format metadata in
 .B grove.*
 keys in
 .BR .bare/config ,
-an
-.B AGENTS.md
-guide with
-.B CLAUDE.md
-beside it, and one directory per Git worktree.
+and one directory per Git worktree.
 .PP
 Inside a grove, invocation without a command runs
 .BR list .
@@ -39,6 +35,27 @@ The command aliases are
 .BR tend = sync ,
 and
 .BR propagate = publish .
+.PP
+Through 0.4,
+.B clone
+,
+.B init
+, and
+.B adopt
+generated
+.B AGENTS.md
+and a
+.B CLAUDE.md
+symbolic link once, at creation time, and never updated them again.  As of
+this release, git-grove no longer generates either file, with no
+deprecation window: it never reads, writes, rewrites, or deletes an
+existing
+.BR AGENTS.md / CLAUDE.md ,
+which is left exactly as it is.  The replacements are the global
+.B --skill
+flag and
+.BR "setup --agent" ,
+documented below.
 .SH COMMANDS
 .TP
 .B clone \fR[\fB-b\fR|\fB--branch \fIbranch\fR] \fIurl\fR [\fIdir\fR] [\fB--\fR \fIgit-options\fR...]
@@ -304,9 +321,6 @@ by hand; see
 .UR https://github.com/e-kulikov/git-grove/wiki/Getting-Out-Of-The-Publishing-State
 .UE
 for the walkthrough.
-.B publish
-does not rewrite
-.BR AGENTS.md .
 .RE
 .PP
 The alias is
@@ -314,7 +328,67 @@ The alias is
 .TP
 .B completion \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR}
 Write completion source for the selected shell to standard output.
+.TP
+.B setup --agent \fR{\fBclaude\fR|\fBcodex\fR|\fBcopilot\fR}
+Write a project-local hook, scoped to the current worktree, that denies any
+Edit/Write/Bash tool call \(em and, for
+.B codex
+specifically, its
+.B apply_patch
+tool \(em whose target resolves under
+.B .bare
+or the root
+.B .git
+pointer file.  Must be run from inside a worktree; invocation at the grove
+root, or outside any Git working tree, is refused at exit status
+.BR 64 .
+.RS
+.PP
+.B claude
+and
+.B copilot
+converge on the same
+.B .claude/settings.local.json
+in the current worktree; run either once, not both.
+.B codex
+writes
+.BR .codex/hooks.json .
+Both files are per-worktree, and each is idempotently added to the grove's
+common
+.B .bare/info/exclude
+so it never appears in
+.BR "git status" ,
+and is never tracked or committed.  An exact tracked collision at the target
+path is refused at exit status
+.B 2
+rather than merged.  Setup writes no wrapper, alias, launcher flag, or global
+setting, and never bypasses an agent's own trust model.
+.PP
+Claude Code and an interactive Copilot CLI session enforce the shared file
+directly.  Measured: Copilot CLI 1.0.80 does not fire this local hook source
+under non-interactive
+.BR "copilot -p" ;
+re-verify against the installed version before relying on this in
+automation.  Codex requires an interactive trust review before its hook is
+enforced: start a bare interactive
+.B codex
+session in the worktree, trust the project if prompted, open
+.BR /hooks ,
+review the exact command and its hash, and trust it \(em
+.B "codex exec"
+is not protected until that review is complete.  Setup's own output names
+the exact next step for the configured agent; it never runs or approves
+those steps itself.
+.RE
 .SH OPTIONS
+.TP
+.B --skill
+Print one generic, version-free document describing the grove layout,
+invariants, and command surface to standard output, then exit \(em before
+any policy, filesystem, or Git work.  Wins over a parsed subcommand;
+.B --help
+wins over
+.BR --skill .
 .TP
 .B --ignore-unsupported
 Report unsafe Git environment findings and consent to continuing with those
@@ -360,10 +434,6 @@ Version 0.4 refuses a newer
 before writing;
 .B "publish --create"
 adds new configuration keys, not a new layout revision.
-.TP
-.BR AGENTS.md " and " CLAUDE.md
-Generated repository facts and command guidance.  The latter is a relative
-symbolic link to the former.
 .TP
 .I worktree directories
 Each managed worktree is a strict descendant of the grove root.  Final path
@@ -456,7 +526,7 @@ or
 .BR --abort .
 .SH FILES
 .TP
-.I git-grove_0.5.0_linux_x86_64.tar.gz
+.I git-grove_0.6.0_linux_x86_64.tar.gz
 Static Linux x86_64 release archive containing the executable, license,
 README, this manual, and generated Bash, Zsh, and Fish completions.
 .TP

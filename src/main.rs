@@ -34,8 +34,16 @@ fn render(result: Result<()>) -> ExitCode {
 fn run(cli: cli::Cli) -> Result<()> {
     let cli::Cli {
         ignore_unsupported,
+        skill,
         command,
     } = cli;
+    let command = match (skill, command) {
+        (true, _) => return git_grove::skill::write(&mut std::io::stdout()),
+        (false, Some(command)) => command,
+        (false, None) => {
+            return Err(GroveError::usage("a subcommand is required"));
+        }
+    };
     match command {
         cli::Command::Clone {
             url,
@@ -251,6 +259,52 @@ fn run(cli: cli::Cli) -> Result<()> {
                 }
             }
         }
+        cli::Command::Setup { agent } => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let worktree_root = git::query::worktree_toplevel(&runner, &cwd)?;
+            let grove = grove::discover::Grove::discover(&cwd)?;
+            if worktree_root == grove.root {
+                return Err(GroveError::usage(
+                    "run `git grove setup` from inside a worktree, not the grove root",
+                )
+                .with_detail(format!("{} is the grove root", worktree_root.display())));
+            }
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove setup",
+            )?;
+            let metadata = grove::metadata::read(&runner, &grove)?;
+            grove::metadata::ensure_supported(&metadata)?;
+            let executable = std::env::current_exe()
+                .and_then(|path| path.canonicalize())
+                .map_err(|error| {
+                    GroveError::failure(format!("cannot resolve the current executable: {error}"))
+                })?;
+            let executable = executable.to_str().ok_or_else(|| {
+                GroveError::failure("the current executable's path is not valid UTF-8")
+            })?;
+            let message =
+                commands::setup::run(&runner, &grove.root, &worktree_root, agent, executable)?;
+            std::io::Write::write_all(&mut std::io::stdout().lock(), message.as_bytes())
+                .map_err(|error| GroveError::failure(format!("cannot write stdout: {error}")))
+        }
+        cli::Command::HookGuard { protocol, event } => {
+            let git_grove::hooks::Event::PreToolUse = event;
+            commands::hook_guard::run(
+                protocol,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+                std::env::current_dir(),
+            )
+        }
         cli::Command::Completion { shell } => {
             let mut command = cli::Cli::command();
             clap_complete::generate(
@@ -261,5 +315,26 @@ fn run(cli: cli::Cli) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real argv never reaches this arm: bare invocation and
+    /// `--ignore-unsupported` alone are both expanded by `normalize` into an
+    /// explicit `list`, and every other flag-only shape is `--skill`, which
+    /// the sibling arm intercepts first. Constructed directly to prove the
+    /// defensive branch is a usage error, not a panic, if that ever changes.
+    #[test]
+    fn no_skill_and_no_command_is_a_usage_error_not_a_panic() {
+        let cli = cli::Cli {
+            ignore_unsupported: false,
+            skill: false,
+            command: None,
+        };
+        let error = run(cli).unwrap_err();
+        assert_eq!(error.class, ExitClass::Usage);
     }
 }

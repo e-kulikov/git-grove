@@ -4,6 +4,8 @@ pub mod error;
 pub mod fsx;
 pub mod git;
 pub mod grove;
+pub mod hooks;
 pub mod output;
 pub mod policy;
+pub mod skill;
 pub mod transaction;
