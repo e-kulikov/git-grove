@@ -269,14 +269,6 @@ pub struct PathProof {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ContentProof {
-    pub bytes: RawBytes,
-    pub sha256: [u8; 32],
-    pub mode: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManifestContent {
     None,
@@ -356,7 +348,6 @@ pub struct FinalEvidence {
     pub refs: Vec<PathProof>,
     pub pointer_files: Vec<PathProof>,
     pub metadata: Vec<ConfigValueProof>,
-    pub guide: ContentProof,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -364,7 +355,6 @@ pub struct FinalEvidence {
 pub struct GeneratedEvidence {
     pub payload_pointer: PathProof,
     pub default_pointer: Option<PathProof>,
-    pub guide: ContentProof,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -708,8 +698,6 @@ fn validate_plan(plan: &ImmutablePlan) -> Result<()> {
     {
         validate_path_proof(path)?;
     }
-    validate_content(&plan.generated.guide)?;
-    validate_content(&plan.expected_final.guide)?;
     for entry in &plan.original.payload_manifest {
         match &entry.content {
             ManifestContent::None => {}
@@ -751,13 +739,6 @@ fn validate_blob(blob: &BlobProof) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn validate_content(content: &ContentProof) -> Result<()> {
-    if sha256(&content.bytes.decode()) != content.sha256 {
-        return Err(invalid("content proof hash does not match"));
-    }
-    validate_mode(content.mode)
 }
 
 fn validate_path_proof(path: &PathProof) -> Result<()> {
@@ -942,14 +923,6 @@ mod tests {
         }
     }
 
-    fn content() -> ContentProof {
-        ContentProof {
-            bytes: RawBytes::from_bytes(b""),
-            sha256: sha256(b""),
-            mode: 0o644,
-        }
-    }
-
     fn journal() -> Journal {
         let path = || ValidatedBytePath::component(b"file").unwrap();
         let original = OriginalEvidence {
@@ -976,7 +949,6 @@ mod tests {
             refs: Vec::new(),
             pointer_files: Vec::new(),
             metadata: Vec::new(),
-            guide: content(),
         };
         Journal {
             schema: JOURNAL_SCHEMA,
@@ -1008,7 +980,6 @@ mod tests {
                         identity: created_file(),
                     },
                     default_pointer: None,
-                    guide: content(),
                 },
                 expected_final: final_evidence,
             },
