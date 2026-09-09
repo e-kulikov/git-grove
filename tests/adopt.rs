@@ -905,6 +905,77 @@ fn journal_has_eight_phases_and_no_guide_evidence() {
     assert!(Journal::parse_strict(&serde_json::to_vec(&old).unwrap()).is_err());
 }
 
+/// A journal written by the one release that shipped the guide-writing
+/// phase (nine operations, a `guide` content proof on both `generated` and
+/// `expected_final`) must not strand an interrupted `adopt`: `--continue`
+/// and `--abort` both have to accept it rather than reject it as corrupt.
+/// Builds a real, journaled interruption via the failpoint harness (so
+/// every proof besides the injected guide data is authentic), then
+/// downgrades the resulting schema-2 journal.json back into that exact
+/// schema-1 shape before resuming -- the mirror image of what
+/// `upgrade_legacy_journal` does on read.
+#[cfg(feature = "failpoints")]
+#[test]
+fn continue_and_abort_accept_a_schema_one_journal_with_guide_evidence() {
+    let sandbox = Sandbox::new();
+    for action in ["--continue", "--abort"] {
+        let root = flat_repository(&sandbox, &format!("schema-one-{}", &action[2..]));
+        std::fs::write(root.join("tracked"), b"schema one compat\n").unwrap();
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+            .env("GIT_GROVE_FAILPOINT", "error:20")
+            .assert()
+            .failure();
+
+        let transaction = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".grove-adopt-")
+            })
+            .unwrap();
+        let journal_path = transaction.join("journal.json");
+        let bytes = std::fs::read(&journal_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        value["schema"] = serde_json::json!(1);
+        let guide_proof = serde_json::json!({
+            "bytes": {"encoding": "Hex", "value": ""},
+            "sha256": vec![0; 32],
+            "mode": 420
+        });
+        value["plan"]["generated"]["guide"] = guide_proof.clone();
+        value["plan"]["expected_final"]["guide"] = guide_proof;
+
+        let operations = value["operations"].as_array_mut().unwrap();
+        assert_eq!(
+            operations.len(),
+            8,
+            "fixture drifted from today's eight-phase journal"
+        );
+        let mut guide_operation = operations[0].clone();
+        guide_operation["id"] = serde_json::json!(90);
+        guide_operation["state"] = serde_json::json!("done");
+        operations.insert(7, guide_operation);
+        assert_eq!(operations.len(), 9);
+
+        std::fs::write(&journal_path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", action, root.to_str().unwrap()])
+            .assert()
+            .success();
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".grove-adopt-")));
+    }
+}
+
 #[cfg(feature = "failpoints")]
 #[test]
 fn continue_and_abort_preserve_user_owned_agent_files() {

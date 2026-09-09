@@ -12,7 +12,17 @@ use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 
-pub const JOURNAL_SCHEMA: u32 = 1;
+/// Bumped from 1 to 2 when the guide-writing phase was removed from the
+/// adoption transaction (`GeneratedEvidence.guide`/`FinalEvidence.guide`
+/// dropped, phase count 9 -> 8): that changed the journal's serialized
+/// shape under `deny_unknown_fields`, so a schema-1 journal would otherwise
+/// be rejected as corrupt by the stricter schema-2 parser, stranding an
+/// `adopt` interrupted before the bump with no working `--continue` or
+/// `--abort`. `Journal::parse_strict` accepts a schema-1 journal too, via
+/// [`LegacyJournal`] and [`upgrade_legacy_journal`], for exactly that
+/// reason -- see there before assuming this is the only schema version a
+/// journal on disk can be in.
+pub const JOURNAL_SCHEMA: u32 = 2;
 pub const JOURNAL_CURRENT: &str = "journal.json";
 pub const JOURNAL_NEW: &str = "journal.json.new";
 
@@ -526,13 +536,46 @@ impl Journal {
         }
     }
 
+    /// Parse one journal generation's exact on-disk bytes, accepting either
+    /// the current schema-2 shape or a schema-1 journal left behind by an
+    /// `adopt` that was interrupted before the guide phase was removed --
+    /// see [`JOURNAL_SCHEMA`]. The schema-1 path never runs for the common
+    /// case: a schema-2 byte stream fails schema-1's `deny_unknown_fields`
+    /// just as reliably as a schema-1 stream fails schema-2's, since the two
+    /// shapes differ in exactly the fields the guide-removal commit touched.
+    /// On a genuine parse failure under both attempts, the schema-2 error is
+    /// reported: it is deny-unknown-fields precise, whereas nearly any
+    /// malformed input parses just far enough into the looser legacy
+    /// attempt to produce a more confusing message.
     pub fn parse_strict(bytes: &[u8]) -> Result<Self> {
+        match Self::parse_strict_current(bytes) {
+            Ok(journal) => Ok(journal),
+            Err(current_error) => match Self::parse_strict_legacy_schema1(bytes) {
+                Ok(journal) => Ok(journal),
+                Err(_) => Err(current_error),
+            },
+        }
+    }
+
+    fn parse_strict_current(bytes: &[u8]) -> Result<Self> {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         let journal = Self::deserialize(&mut deserializer)
             .map_err(|error| invalid(format!("invalid adoption journal JSON: {error}")))?;
         deserializer
             .end()
             .map_err(|error| invalid(format!("trailing adoption journal bytes: {error}")))?;
+        journal.validate()?;
+        Ok(journal)
+    }
+
+    fn parse_strict_legacy_schema1(bytes: &[u8]) -> Result<Self> {
+        let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+        let legacy = LegacyJournal::deserialize(&mut deserializer)
+            .map_err(|error| invalid(format!("invalid legacy adoption journal JSON: {error}")))?;
+        deserializer
+            .end()
+            .map_err(|error| invalid(format!("trailing adoption journal bytes: {error}")))?;
+        let journal = upgrade_legacy_journal(legacy)?;
         journal.validate()?;
         Ok(journal)
     }
@@ -602,6 +645,152 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+/// The one recognized prior journal schema: `adopt`'s shape before the
+/// guide-writing phase was removed (nine operations, with a `guide` content
+/// proof on both [`GeneratedEvidence`] and [`FinalEvidence`]). Every other
+/// field is byte-for-byte what [`Journal`]/[`ImmutablePlan`] still carry, so
+/// this and [`LegacyImmutablePlan`]/[`LegacyGeneratedEvidence`]/
+/// [`LegacyFinalEvidence`] reuse those types directly rather than
+/// duplicating them. Deserialize-only: nothing ever writes this shape back
+/// out, so it carries no `Serialize` impl and no schema constant of its own
+/// beyond the literal `1` [`upgrade_legacy_journal`] checks for.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyJournal {
+    schema: u32,
+    generation: u64,
+    nonce: [u8; 16],
+    root: RootProof,
+    plan: LegacyImmutablePlan,
+    operations: Vec<OperationRecord>,
+    progress: Progress,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyImmutablePlan {
+    arguments: AdoptArgumentsProof,
+    decisions: AdoptDecisionsProof,
+    original: OriginalEvidence,
+    generated: LegacyGeneratedEvidence,
+    expected_final: LegacyFinalEvidence,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyGeneratedEvidence {
+    payload_pointer: PathProof,
+    default_pointer: Option<PathProof>,
+    #[allow(
+        dead_code,
+        reason = "kept only so deny_unknown_fields still matches schema 1 exactly"
+    )]
+    guide: LegacyContentProof,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyFinalEvidence {
+    worktrees: Vec<WorktreeProof>,
+    payload_status_porcelain_v2_z: ByteSnapshot,
+    payload_ls_files_stage_z: ByteSnapshot,
+    payload_ls_files_verbose_z: ByteSnapshot,
+    config_values: Vec<ConfigValueProof>,
+    refs: Vec<PathProof>,
+    pointer_files: Vec<PathProof>,
+    metadata: Vec<ConfigValueProof>,
+    #[allow(
+        dead_code,
+        reason = "kept only so deny_unknown_fields still matches schema 1 exactly"
+    )]
+    guide: LegacyContentProof,
+}
+
+/// The guide phase's content proof, exactly as schema 1 wrote it. Its
+/// `sha256`/`mode` are read (so `deny_unknown_fields` still catches a truly
+/// unrecognized shape) but never checked: [`upgrade_legacy_journal`] drops
+/// the guide evidence entirely rather than validating it, since nothing
+/// downstream of the upgrade ever looks at it again.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(
+    dead_code,
+    reason = "kept only so deny_unknown_fields still matches schema 1 exactly"
+)]
+struct LegacyContentProof {
+    bytes: RawBytes,
+    sha256: [u8; 32],
+    mode: u32,
+}
+
+/// The literal `schema` value [`LegacyJournal`] accepts.
+const LEGACY_JOURNAL_SCHEMA: u32 = 1;
+
+/// A schema-1 journal always had exactly nine phases (operations), with the
+/// guide-install phase at 0-based index 7 -- see the guide-removal commit
+/// that renumbered phases 8 and 9 down to 7 and 8. Rejected as an
+/// unrecognized shape, not migrated, if some other schema-1 journal ever
+/// existed with a different phase count: this compatibility path targets
+/// the one schema-1 shape that shipped, not a hypothetical family of them.
+const LEGACY_ADOPT_PHASE_COUNT: usize = 9;
+const LEGACY_GUIDE_PHASE_INDEX: usize = 7;
+
+/// Upgrade a parsed schema-1 journal to the current schema-2 shape: drop
+/// the guide evidence from `generated`/`expected_final`, and drop the
+/// guide-install operation from `operations` (shifting the final phase,
+/// old index 8, down to the new index 7 it occupies in today's phase
+/// graph) so the result lines up with what `adopt --continue`/`--abort`'s
+/// phase-indexed logic already expects. Produces no filesystem side
+/// effects -- parsing stays a pure function of the journal's bytes -- so a
+/// guide file already written by a schema-1 `adopt` before it was
+/// interrupted is not retroactively removed; it is simply no longer
+/// journalled, exactly like a preexisting file `adopt` never touched.
+fn upgrade_legacy_journal(legacy: LegacyJournal) -> Result<Journal> {
+    if legacy.schema != LEGACY_JOURNAL_SCHEMA {
+        return Err(invalid(format!(
+            "unsupported adoption journal schema {}",
+            legacy.schema
+        )));
+    }
+    if legacy.operations.len() != LEGACY_ADOPT_PHASE_COUNT {
+        return Err(invalid(
+            "schema 1 adoption journal does not have the expected nine phases",
+        ));
+    }
+    let mut operations = legacy.operations;
+    operations.remove(LEGACY_GUIDE_PHASE_INDEX);
+
+    let plan = ImmutablePlan {
+        arguments: legacy.plan.arguments,
+        decisions: legacy.plan.decisions,
+        original: legacy.plan.original,
+        generated: GeneratedEvidence {
+            payload_pointer: legacy.plan.generated.payload_pointer,
+            default_pointer: legacy.plan.generated.default_pointer,
+        },
+        expected_final: FinalEvidence {
+            worktrees: legacy.plan.expected_final.worktrees,
+            payload_status_porcelain_v2_z: legacy.plan.expected_final.payload_status_porcelain_v2_z,
+            payload_ls_files_stage_z: legacy.plan.expected_final.payload_ls_files_stage_z,
+            payload_ls_files_verbose_z: legacy.plan.expected_final.payload_ls_files_verbose_z,
+            config_values: legacy.plan.expected_final.config_values,
+            refs: legacy.plan.expected_final.refs,
+            pointer_files: legacy.plan.expected_final.pointer_files,
+            metadata: legacy.plan.expected_final.metadata,
+        },
+    };
+
+    Ok(Journal {
+        schema: JOURNAL_SCHEMA,
+        generation: legacy.generation,
+        nonce: legacy.nonce,
+        root: legacy.root,
+        plan,
+        operations,
+        progress: legacy.progress,
+    })
 }
 
 fn validate_primitive(primitive: &Primitive) -> Result<()> {
@@ -1056,6 +1245,63 @@ mod tests {
             mode: 0o644,
         };
         assert!(bad.validate().is_err());
+    }
+
+    /// A schema-1 journal (nine operations, `guide` content proofs on both
+    /// `generated` and `expected_final`) must parse rather than being
+    /// rejected as corrupt, and must come back upgraded to today's shape:
+    /// schema 2, no `guide` field anywhere (the type doesn't have one), and
+    /// the guide-install operation (0-based index 7) gone from `operations`
+    /// -- everything else preserved exactly.
+    #[test]
+    fn parse_strict_accepts_and_upgrades_a_schema_1_journal_with_guide_evidence() {
+        let valid = journal();
+        let mut value = serde_json::to_value(&valid).unwrap();
+
+        value["schema"] = serde_json::json!(1);
+        let guide_proof = serde_json::json!({
+            "bytes": {"encoding": "Hex", "value": ""},
+            "sha256": vec![0; 32],
+            "mode": 420
+        });
+        value["plan"]["generated"]["guide"] = guide_proof.clone();
+        value["plan"]["expected_final"]["guide"] = guide_proof;
+
+        let operations = value["operations"].as_array_mut().unwrap();
+        assert_eq!(
+            operations.len(),
+            1,
+            "fixture drifted from the single-operation journal()"
+        );
+        let template = operations[0].clone();
+        operations.clear();
+        for id in 1..=9 {
+            let mut operation = template.clone();
+            operation["id"] = serde_json::json!(id);
+            operations.push(operation);
+        }
+        let guide_id = operations[7]["id"].clone();
+
+        let upgraded = Journal::parse_strict(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(upgraded.schema, JOURNAL_SCHEMA);
+        assert_eq!(upgraded.operations.len(), 8);
+        assert!(upgraded
+            .operations
+            .iter()
+            .all(|operation| { serde_json::to_value(operation.id).unwrap() != guide_id }));
+        assert_eq!(upgraded.plan.arguments, valid.plan.arguments);
+        assert_eq!(upgraded.plan.original, valid.plan.original);
+        assert_eq!(
+            upgraded.plan.generated.payload_pointer,
+            valid.plan.generated.payload_pointer
+        );
+
+        // A byte stream one field short of the one recognized schema-1
+        // shape (eight operations, not nine) is rejected, not silently
+        // patched over.
+        let mut short = value.clone();
+        short["operations"].as_array_mut().unwrap().pop();
+        assert!(Journal::parse_strict(&serde_json::to_vec(&short).unwrap()).is_err());
     }
 
     #[test]
