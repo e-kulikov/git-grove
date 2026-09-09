@@ -270,16 +270,36 @@ fn select_journal(transaction: &HeldDirectory) -> Result<Journal> {
                 None => Ok(current),
                 Some(new_bytes) => match Journal::parse_strict(&new_bytes) {
                     Ok(next) => {
-                        if let Err(error) = current.validate_next(&next) {
-                            // `validate_next` alone cannot see the one
-                            // legal transition the guide-removal upgrade
-                            // discards -- see
-                            // `Journal::is_erased_guide_transition`.
-                            if !Journal::is_erased_guide_transition(&current_bytes, &new_bytes) {
-                                return Err(GroveError::needs_decision(
-                                    "journal.json.new is not the unique legal next generation",
-                                )
-                                .with_detail(error.to_string()));
+                        // When both raw generations are schema-1, validate
+                        // them directly rather than trusting `validate_next`
+                        // on the two already-upgraded journals: the
+                        // guide-removal upgrade drops one operation from
+                        // both sides, so a generation whose only real
+                        // change is confined there is invisible to
+                        // `validate_next` -- but so is an *illegal* one
+                        // hidden there alongside an unrelated, otherwise
+                        // legal retained-operation change, which
+                        // `validate_next` alone would wrongly accept. See
+                        // `Journal::validate_legacy_pair`. Neither raw
+                        // stream parsing as schema-1 (an ordinary schema-2
+                        // pair) falls through to the schema-2 check as
+                        // always.
+                        match Journal::validate_legacy_pair(&current_bytes, &new_bytes) {
+                            Some(result) => {
+                                result.map_err(|error| {
+                                    GroveError::needs_decision(
+                                        "journal.json.new is not the unique legal next generation",
+                                    )
+                                    .with_detail(error.to_string())
+                                })?;
+                            }
+                            None => {
+                                current.validate_next(&next).map_err(|error| {
+                                    GroveError::needs_decision(
+                                        "journal.json.new is not the unique legal next generation",
+                                    )
+                                    .with_detail(error.to_string())
+                                })?;
                             }
                         }
                         promote_new(transaction)?;
