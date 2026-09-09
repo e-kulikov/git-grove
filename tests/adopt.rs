@@ -1059,6 +1059,105 @@ fn continue_and_abort_promote_a_torn_schema_one_journal_across_the_erased_guide_
     }
 }
 
+/// The mirror image of the forward torn-write case: a torn write from
+/// exactly the guide phase's own *reversal* during an abort (schema-1
+/// `journal.json` with `Progress::Aborting` and the guide operation Done,
+/// `journal.json.new` one generation ahead with it Pending, nothing else
+/// different) erases that operation the same way on upgrade, so
+/// `Journal::validate_next` alone cannot see the transition was legal here
+/// either. Interrupts a real `adopt --abort` via a failpoint (checkpoint 8
+/// lands after `Progress::Aborting` is durable but before any operation is
+/// reversed, empirically) to get an authentic mid-abort journal, then
+/// downgrades and injects the guide operation exactly as the forward case
+/// does, but in the abort direction.
+#[cfg(feature = "failpoints")]
+#[test]
+fn continue_and_abort_promote_a_torn_schema_one_journal_across_the_erased_guide_abort_transition() {
+    let sandbox = Sandbox::new();
+    let root = flat_repository(&sandbox, "schema-one-torn-abort");
+    std::fs::write(root.join("tracked"), b"schema one torn abort compat\n").unwrap();
+    sandbox
+        .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+        .env("GIT_GROVE_FAILPOINT", "error:25")
+        .assert()
+        .failure();
+    sandbox
+        .grove_in(
+            sandbox.root(),
+            &["adopt", "--abort", root.to_str().unwrap()],
+        )
+        .env("GIT_GROVE_FAILPOINT", "error:8")
+        .assert()
+        .failure();
+
+    let transaction = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".grove-adopt-")
+        })
+        .unwrap();
+    let journal_path = transaction.join("journal.json");
+    let bytes = std::fs::read(&journal_path).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        value["progress"],
+        serde_json::json!("aborting"),
+        "fixture is not mid-abort; checkpoint 8 may have drifted"
+    );
+
+    value["schema"] = serde_json::json!(1);
+    let guide_proof = serde_json::json!({
+        "bytes": {"encoding": "Hex", "value": ""},
+        "sha256": vec![0; 32],
+        "mode": 420
+    });
+    value["plan"]["generated"]["guide"] = guide_proof.clone();
+    value["plan"]["expected_final"]["guide"] = guide_proof;
+
+    let operations = value["operations"].as_array_mut().unwrap();
+    assert_eq!(
+        operations.len(),
+        8,
+        "fixture drifted from today's eight-phase journal"
+    );
+    let mut guide_operation = operations[0].clone();
+    guide_operation["id"] = serde_json::json!(90);
+    guide_operation["state"] = serde_json::json!("done");
+    operations.insert(7, guide_operation);
+    assert_eq!(operations.len(), 9);
+
+    // `new` is one generation ahead of `current`, differing only in the
+    // guide operation's state going Done -> Pending -- the direction
+    // `remove_generated_guide`'s own reversal used to record.
+    let mut next_value = value.clone();
+    next_value["generation"] = serde_json::json!(value["generation"].as_u64().unwrap() + 1);
+    next_value["operations"][7]["state"] = serde_json::json!("pending");
+
+    std::fs::write(&journal_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    std::fs::write(
+        transaction.join("journal.json.new"),
+        serde_json::to_vec(&next_value).unwrap(),
+    )
+    .unwrap();
+
+    sandbox
+        .grove_in(
+            sandbox.root(),
+            &["adopt", "--abort", root.to_str().unwrap()],
+        )
+        .assert()
+        .success();
+    assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".grove-adopt-")));
+}
+
 #[cfg(feature = "failpoints")]
 #[test]
 fn continue_and_abort_preserve_user_owned_agent_files() {

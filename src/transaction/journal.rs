@@ -622,23 +622,27 @@ impl Journal {
         {
             return false;
         }
-        // A Pending -> Done operation transition is legal only while
-        // moving forward -- schema 1's own transition rule, identical to
-        // `Journal::validate_next`'s `Progress::Forward` arm. `current` and
-        // `next` are already known to carry the same `progress` above, so
-        // checking one side rules out `Aborting`/`Committed`/`Aborted`
-        // for both.
-        if current.progress != Progress::Forward {
-            return false;
-        }
+        // The guide operation's state transition is legal in exactly the
+        // two directions `Journal::validate_next` itself allows: forward
+        // (Pending -> Done, while `Progress::Forward`) and abort (Done ->
+        // Pending, while `Progress::Aborting`) -- a torn write can land on
+        // either side of that phase's own `finish_phase`/reverse call, and
+        // both are erased the same way by the upgrade. `Committed`/
+        // `Aborted` never legally change any operation's state, so neither
+        // direction applies there.
+        let (from, to) = match current.progress {
+            Progress::Forward => (OperationState::Pending, OperationState::Done),
+            Progress::Aborting => (OperationState::Done, OperationState::Pending),
+            Progress::Committed | Progress::Aborted => return false,
+        };
         for index in 0..LEGACY_ADOPT_PHASE_COUNT {
             let current_operation = &current.operations[index];
             let next_operation = &next.operations[index];
             if index == LEGACY_GUIDE_PHASE_INDEX {
                 if current_operation.id != next_operation.id
                     || current_operation.primitive != next_operation.primitive
-                    || current_operation.state != OperationState::Pending
-                    || next_operation.state != OperationState::Done
+                    || current_operation.state != from
+                    || next_operation.state != to
                 {
                     return false;
                 }
@@ -1466,9 +1470,9 @@ mod tests {
             &bytes(&different_guide_proof)
         ));
 
-        // Aborting progress: a Pending -> Done operation transition is
-        // never legal outside `Progress::Forward` -- schema 1's own rule,
-        // identical to what `Journal::validate_next` enforces today.
+        // Forward direction only accepts Pending -> Done: under Aborting,
+        // that same direction is the wrong one (Aborting only ever
+        // reverses Done -> Pending) and must still be rejected.
         let mut aborting_current = current.clone();
         aborting_current["progress"] = serde_json::json!("aborting");
         let mut aborting_next = next.clone();
@@ -1476,6 +1480,32 @@ mod tests {
         assert!(!Journal::is_erased_guide_transition(
             &bytes(&aborting_current),
             &bytes(&aborting_next)
+        ));
+
+        // The mirror-image legal case: aborting the guide phase reverses
+        // it from Done back to Pending. A torn write can land on either
+        // side of that phase's own reversal just as readily as its
+        // install, and the upgrade erases the operation the same way
+        // either direction, so this must be accepted too.
+        let mut abort_from = schema_1_value(5, "done");
+        abort_from["progress"] = serde_json::json!("aborting");
+        let mut abort_to = schema_1_value(6, "pending");
+        abort_to["progress"] = serde_json::json!("aborting");
+        assert!(Journal::is_erased_guide_transition(
+            &bytes(&abort_from),
+            &bytes(&abort_to)
+        ));
+
+        // Committed and Aborted never legally change any operation's
+        // state, so neither direction applies -- even a shape that
+        // otherwise looks like the legal abort transition is rejected.
+        let mut committed_from = abort_from.clone();
+        committed_from["progress"] = serde_json::json!("committed");
+        let mut committed_to = abort_to.clone();
+        committed_to["progress"] = serde_json::json!("committed");
+        assert!(!Journal::is_erased_guide_transition(
+            &bytes(&committed_from),
+            &bytes(&committed_to)
         ));
     }
 
