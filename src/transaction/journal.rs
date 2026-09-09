@@ -622,6 +622,15 @@ impl Journal {
         {
             return false;
         }
+        // A Pending -> Done operation transition is legal only while
+        // moving forward -- schema 1's own transition rule, identical to
+        // `Journal::validate_next`'s `Progress::Forward` arm. `current` and
+        // `next` are already known to carry the same `progress` above, so
+        // checking one side rules out `Aborting`/`Committed`/`Aborted`
+        // for both.
+        if current.progress != Progress::Forward {
+            return false;
+        }
         for index in 0..LEGACY_ADOPT_PHASE_COUNT {
             let current_operation = &current.operations[index];
             let next_operation = &next.operations[index];
@@ -1455,6 +1464,18 @@ mod tests {
         assert!(!Journal::is_erased_guide_transition(
             &bytes(&current),
             &bytes(&different_guide_proof)
+        ));
+
+        // Aborting progress: a Pending -> Done operation transition is
+        // never legal outside `Progress::Forward` -- schema 1's own rule,
+        // identical to what `Journal::validate_next` enforces today.
+        let mut aborting_current = current.clone();
+        aborting_current["progress"] = serde_json::json!("aborting");
+        let mut aborting_next = next.clone();
+        aborting_next["progress"] = serde_json::json!("aborting");
+        assert!(!Journal::is_erased_guide_transition(
+            &bytes(&aborting_current),
+            &bytes(&aborting_next)
         ));
     }
 
