@@ -5,7 +5,7 @@ use git_grove::commands::adopt::AdoptArgs;
 use git_grove::error::ExitClass;
 use git_grove::git::runner::RealGit;
 #[cfg(feature = "failpoints")]
-use git_grove::transaction::journal::{Journal, Primitive};
+use git_grove::transaction::journal::{sha256, Journal, Primitive};
 #[cfg(unix)]
 use harness::tree_snapshot;
 use harness::Sandbox;
@@ -899,7 +899,7 @@ fn journal_has_eight_phases_and_no_guide_evidence() {
     let mut old: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     old["plan"]["generated"]["guide"] = serde_json::json!({
         "bytes": {"encoding": "hex", "value": ""},
-        "sha256": vec![0; 32],
+        "sha256": sha256(b""),
         "mode": 420
     });
     assert!(Journal::parse_strict(&serde_json::to_vec(&old).unwrap()).is_err());
@@ -944,7 +944,7 @@ fn continue_and_abort_accept_a_schema_one_journal_with_guide_evidence() {
         value["schema"] = serde_json::json!(1);
         let guide_proof = serde_json::json!({
             "bytes": {"encoding": "Hex", "value": ""},
-            "sha256": vec![0; 32],
+            "sha256": sha256(b""),
             "mode": 420
         });
         value["plan"]["generated"]["guide"] = guide_proof.clone();
@@ -1015,7 +1015,7 @@ fn continue_and_abort_promote_a_torn_schema_one_journal_across_the_erased_guide_
         value["schema"] = serde_json::json!(1);
         let guide_proof = serde_json::json!({
             "bytes": {"encoding": "Hex", "value": ""},
-            "sha256": vec![0; 32],
+            "sha256": sha256(b""),
             "mode": 420
         });
         value["plan"]["generated"]["guide"] = guide_proof.clone();
@@ -1112,7 +1112,7 @@ fn continue_and_abort_promote_a_torn_schema_one_journal_across_the_erased_guide_
     value["schema"] = serde_json::json!(1);
     let guide_proof = serde_json::json!({
         "bytes": {"encoding": "Hex", "value": ""},
-        "sha256": vec![0; 32],
+        "sha256": sha256(b""),
         "mode": 420
     });
     value["plan"]["generated"]["guide"] = guide_proof.clone();

@@ -570,6 +570,10 @@ impl Journal {
 
     fn parse_strict_legacy_schema1(bytes: &[u8]) -> Result<Self> {
         let legacy = deserialize_legacy_journal(bytes)?;
+        // Validate the full nine-operation shape -- guide proofs and
+        // operation included -- before upgrading discards any of it. See
+        // `validate_legacy_journal`.
+        validate_legacy_journal(&legacy)?;
         let journal = upgrade_legacy_journal(legacy)?;
         journal.validate()?;
         Ok(journal)
@@ -621,6 +625,29 @@ impl Journal {
         let current = deserialize_legacy_journal(current_bytes).ok()?;
         let next = deserialize_legacy_journal(next_bytes).ok()?;
         Some(validate_legacy_next(&current, &next))
+    }
+
+    /// Whether `bytes` parses structurally as the schema-1 shape at all
+    /// (the required `guide` fields present, `deny_unknown_fields`
+    /// satisfied) -- nothing more. A genuinely schema-2-native byte stream
+    /// can never satisfy this (it lacks `guide` entirely), so a caller
+    /// comparing a `current`/`next` pair can use this to classify which
+    /// side is which *before* deciding how to validate the pair: schema-1
+    /// current with schema-1 next uses [`Self::validate_legacy_pair`];
+    /// schema-1 current with schema-2 next (an upgraded `current`
+    /// legitimately advancing under today's engine) falls through to the
+    /// ordinary [`Self::validate_next`] on the two already-parsed journals,
+    /// which is safe because `next` in that case was never independently
+    /// re-derived from raw legacy bytes of its own -- nothing about it was
+    /// ever discarded. A schema-2 `current` with a schema-1-shaped `next`
+    /// is the one direction that can never happen legitimately (no code
+    /// path ever regresses a journal back to the old shape), so a caller
+    /// must reject that combination outright rather than falling through
+    /// to `validate_next`, which -- comparing a genuine native `current`
+    /// against an upgraded, guide-erased `next` -- cannot see a forged
+    /// mutation confined to the discarded region either.
+    pub fn is_legacy_shaped(bytes: &[u8]) -> bool {
+        deserialize_legacy_journal(bytes).is_ok()
     }
 
     pub fn validate_next(&self, next: &Self) -> Result<()> {
@@ -787,6 +814,142 @@ fn deserialize_legacy_journal(bytes: &[u8]) -> Result<LegacyJournal> {
     Ok(legacy)
 }
 
+/// The schema-1 counterpart of [`validate_content`] applied to
+/// [`LegacyContentProof`]: `sha256(bytes.decode()) == sha256` and a valid
+/// permission-only `mode`. The shipped schema-1 binary checked exactly this
+/// on both `generated.guide` and `expected_final.guide` before writing or
+/// trusting a journal; [`upgrade_legacy_journal`] discards both proofs
+/// unconditionally, so nothing downstream of the upgrade would otherwise
+/// ever notice a malformed one.
+fn validate_content(content: &LegacyContentProof) -> Result<()> {
+    if sha256(&content.bytes.decode()) != content.sha256 {
+        return Err(invalid("content proof hash does not match"));
+    }
+    validate_mode(content.mode)
+}
+
+/// The schema-1 counterpart of [`validate_plan`]: identical checks over
+/// every field [`LegacyImmutablePlan`] shares with [`ImmutablePlan`], plus
+/// [`validate_content`] on both guide proofs `validate_plan` has no
+/// equivalent for.
+fn validate_legacy_plan(plan: &LegacyImmutablePlan) -> Result<()> {
+    for snapshot in [
+        &plan.original.worktree_list_porcelain_z,
+        &plan.original.status_porcelain_v2_z,
+        &plan.original.ls_files_stage_z,
+        &plan.original.ls_files_verbose_z,
+        &plan.expected_final.payload_status_porcelain_v2_z,
+        &plan.expected_final.payload_ls_files_stage_z,
+        &plan.expected_final.payload_ls_files_verbose_z,
+    ] {
+        validate_snapshot(snapshot)?;
+    }
+    for blob in [
+        Some(&plan.original.config),
+        plan.original.config_worktree.as_ref(),
+        Some(&plan.original.head),
+        plan.original.index.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_blob(blob)?;
+    }
+    for named in plan
+        .original
+        .shared_indexes
+        .iter()
+        .chain(&plan.original.refs)
+        .chain(&plan.original.private_state)
+    {
+        validate_blob(&named.blob)?;
+    }
+    validate_path_proof(&plan.generated.payload_pointer)?;
+    if let Some(pointer) = &plan.generated.default_pointer {
+        validate_path_proof(pointer)?;
+    }
+    for path in plan
+        .expected_final
+        .refs
+        .iter()
+        .chain(&plan.expected_final.pointer_files)
+    {
+        validate_path_proof(path)?;
+    }
+    for entry in &plan.original.payload_manifest {
+        match &entry.content {
+            ManifestContent::None => {}
+            ManifestContent::Blob {
+                bytes,
+                sha256: hash,
+            }
+            | ManifestContent::Symlink {
+                target: bytes,
+                sha256: hash,
+            } => {
+                if sha256(&bytes.decode()) != *hash {
+                    return Err(invalid("manifest content hash does not match"));
+                }
+            }
+        }
+    }
+    validate_content(&plan.generated.guide)?;
+    validate_content(&plan.expected_final.guide)?;
+    Ok(())
+}
+
+/// The schema-1 counterpart of [`Journal::validate`], restoring the exact
+/// semantic checks the shipped schema-1 binary applied -- including, via
+/// [`validate_legacy_plan`], both guide content proofs and, via
+/// [`validate_primitive`] below, the guide operation's own primitive --
+/// over the full nine-operation shape before anything is discarded.
+/// [`upgrade_legacy_journal`] drops operation 7 and both guide proofs
+/// unconditionally; running this first is what stops a malformed id,
+/// primitive, guide mode, or guide content hash confined to that discarded
+/// region from silently surviving the upgrade unvalidated.
+fn validate_legacy_journal(legacy: &LegacyJournal) -> Result<()> {
+    if legacy.schema != LEGACY_JOURNAL_SCHEMA {
+        return Err(invalid(format!(
+            "unsupported adoption journal schema {}",
+            legacy.schema
+        )));
+    }
+    if legacy.generation == 0 {
+        return Err(invalid("journal generation must be positive"));
+    }
+    let root = legacy.root.canonical_path.decode();
+    if root.contains(&0) || !Path::new(OsStr::from_bytes(&root)).is_absolute() {
+        return Err(invalid("journal root proof is not an absolute Linux path"));
+    }
+    validate_legacy_plan(&legacy.plan)?;
+    let mut ids = HashSet::new();
+    for operation in &legacy.operations {
+        if operation.id == 0 || !ids.insert(operation.id) {
+            return Err(invalid("journal operation IDs must be unique and nonzero"));
+        }
+        validate_primitive(&operation.primitive)?;
+    }
+    match legacy.progress {
+        Progress::Committed
+            if legacy
+                .operations
+                .iter()
+                .any(|operation| operation.state != OperationState::Done) =>
+        {
+            Err(invalid("committed journal contains a pending operation"))
+        }
+        Progress::Aborted
+            if legacy
+                .operations
+                .iter()
+                .any(|operation| operation.state != OperationState::Pending) =>
+        {
+            Err(invalid("aborted journal contains a completed operation"))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The schema-1 counterpart of [`Journal::validate_next`], operating on the
 /// raw nine-operation [`LegacyJournal`] shape with the guide operation
 /// still present -- see [`Journal::validate_legacy_pair`] for why this must
@@ -795,6 +958,8 @@ fn deserialize_legacy_journal(bytes: &[u8]) -> Result<LegacyJournal> {
 /// field; only the type being compared, and the extra `schema`/phase-count
 /// checks a genuine schema-1 journal must also satisfy, differ.
 fn validate_legacy_next(current: &LegacyJournal, next: &LegacyJournal) -> Result<()> {
+    validate_legacy_journal(current)?;
+    validate_legacy_journal(next)?;
     if current.schema != LEGACY_JOURNAL_SCHEMA || next.schema != LEGACY_JOURNAL_SCHEMA {
         return Err(invalid(format!(
             "unsupported adoption journal schema {}",
@@ -1392,7 +1557,7 @@ mod tests {
         value["schema"] = serde_json::json!(1);
         let guide_proof = serde_json::json!({
             "bytes": {"encoding": "Hex", "value": ""},
-            "sha256": vec![0; 32],
+            "sha256": sha256(b""),
             "mode": 420
         });
         value["plan"]["generated"]["guide"] = guide_proof.clone();
@@ -1446,7 +1611,7 @@ mod tests {
         value["generation"] = serde_json::json!(generation);
         let guide_proof = serde_json::json!({
             "bytes": {"encoding": "Hex", "value": ""},
-            "sha256": vec![0; 32],
+            "sha256": sha256(b""),
             "mode": 420
         });
         value["plan"]["generated"]["guide"] = guide_proof.clone();
@@ -1567,6 +1732,61 @@ mod tests {
             &serde_json::to_vec(&journal()).unwrap()
         )
         .is_none());
+    }
+
+    /// exec-reviewer's sixth-round finding: `upgrade_legacy_journal`
+    /// discards operation 7 and both guide content proofs unconditionally,
+    /// so a malformed one there -- a content hash that doesn't match its
+    /// own bytes, an invalid permission-only mode, or a duplicate
+    /// operation id -- must be caught by validation over the full raw
+    /// shape before the upgrade throws that region away, not silently
+    /// waved through because nothing downstream ever looks at it again.
+    #[test]
+    fn parse_strict_rejects_a_malformed_discarded_guide_region() {
+        let base = schema_1_value(1, "pending");
+        let parse =
+            |value: &serde_json::Value| Journal::parse_strict(&serde_json::to_vec(value).unwrap());
+
+        // Sanity: the unmodified fixture is accepted.
+        assert!(parse(&base).is_ok());
+
+        // A guide content proof whose hash doesn't match its own bytes.
+        let mut bad_generated_hash = base.clone();
+        bad_generated_hash["plan"]["generated"]["guide"]["sha256"] =
+            serde_json::json!(sha256(b"not the actual bytes"));
+        assert!(parse(&bad_generated_hash).is_err());
+
+        let mut bad_final_hash = base.clone();
+        bad_final_hash["plan"]["expected_final"]["guide"]["sha256"] =
+            serde_json::json!(sha256(b"not the actual bytes"));
+        assert!(parse(&bad_final_hash).is_err());
+
+        // A guide content proof mode with non-permission bits set.
+        let mut bad_mode = base.clone();
+        bad_mode["plan"]["generated"]["guide"]["mode"] = serde_json::json!(0o170000);
+        assert!(parse(&bad_mode).is_err());
+
+        // The guide operation's id collides with a retained operation's --
+        // invisible after the upgrade removes the guide operation, since
+        // only one of the two duplicates would remain.
+        let mut duplicate_id = base.clone();
+        duplicate_id["operations"][7]["id"] = duplicate_id["operations"][0]["id"].clone();
+        assert!(parse(&duplicate_id).is_err());
+    }
+
+    /// exec-reviewer's sixth-round finding: a schema-1-shaped `next`
+    /// following a schema-2-native `current` is impossible under any
+    /// legitimate history and must be classified as such before falling
+    /// through to the ordinary `validate_next`, which -- comparing a
+    /// genuine native journal against an upgraded, guide-erased one --
+    /// cannot see a forged mutation confined to the discarded region.
+    #[test]
+    fn is_legacy_shaped_distinguishes_native_from_legacy_bytes() {
+        let native = serde_json::to_vec(&journal()).unwrap();
+        assert!(!Journal::is_legacy_shaped(&native));
+
+        let legacy = serde_json::to_vec(&schema_1_value(1, "pending")).unwrap();
+        assert!(Journal::is_legacy_shaped(&legacy));
     }
 
     #[test]
