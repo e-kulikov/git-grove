@@ -257,36 +257,6 @@ fn exact_single_worktree(bytes: &[u8], root: &Path) -> bool {
     records == [root.as_os_str().as_bytes()]
 }
 
-/// Whether `current` -> `next` is the one legal journal-generation
-/// transition [`Journal::validate_next`] cannot see once both sides come
-/// from the schema-1 compatibility path: the guide-removal upgrade drops
-/// the guide operation regardless of whether it was the one that had just
-/// completed, so a generation whose *only* change was that operation's
-/// state (Pending -> Done) upgrades to something byte-for-byte identical to
-/// the generation before it, except for `generation` itself. Recognizing
-/// that specific, narrow shape -- both raw byte streams are schema-1, and
-/// the two already-upgraded journals differ only by `generation` -- lets a
-/// torn write from exactly that phase transition still promote its next
-/// generation, instead of failing recovery outright with "not the unique
-/// legal next generation" for a transition that was in fact legal under the
-/// schema it was written in.
-fn erased_by_guide_migration(
-    current_bytes: &[u8],
-    new_bytes: &[u8],
-    current: &Journal,
-    next: &Journal,
-) -> bool {
-    if next.generation != current.generation.wrapping_add(1) {
-        return false;
-    }
-    let mut normalized = next.clone();
-    normalized.generation = current.generation;
-    if normalized != *current {
-        return false;
-    }
-    Journal::is_legacy_schema1(current_bytes) && Journal::is_legacy_schema1(new_bytes)
-}
-
 fn select_journal(transaction: &HeldDirectory) -> Result<Journal> {
     let current = read_optional(transaction, JOURNAL_CURRENT)?;
     let new = read_optional(transaction, JOURNAL_NEW)?;
@@ -301,12 +271,11 @@ fn select_journal(transaction: &HeldDirectory) -> Result<Journal> {
                 Some(new_bytes) => match Journal::parse_strict(&new_bytes) {
                     Ok(next) => {
                         if let Err(error) = current.validate_next(&next) {
-                            if !erased_by_guide_migration(
-                                &current_bytes,
-                                &new_bytes,
-                                &current,
-                                &next,
-                            ) {
+                            // `validate_next` alone cannot see the one
+                            // legal transition the guide-removal upgrade
+                            // discards -- see
+                            // `Journal::is_erased_guide_transition`.
+                            if !Journal::is_erased_guide_transition(&current_bytes, &new_bytes) {
                                 return Err(GroveError::needs_decision(
                                     "journal.json.new is not the unique legal next generation",
                                 )
