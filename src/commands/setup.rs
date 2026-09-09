@@ -319,6 +319,26 @@ fn same_worktree(registered: &Path, candidate: &Path) -> bool {
     registered == candidate || canonical(registered) == canonical(candidate)
 }
 
+/// Whether `cwd` falls under (or is exactly) one of this grove's registered
+/// worktree paths, compared through the filesystem where possible so a
+/// symlinked route still matches. Used to tell apart, ahead of running
+/// `rev-parse`, the two reasons `worktree_toplevel` can fail: `cwd` is
+/// genuinely outside any working tree (the legitimate default-branch
+/// fallback below), versus `cwd` is inside a real, registered worktree
+/// whose Git state is broken for some unrelated reason -- a case that must
+/// surface as an error, not be swallowed into a silent redirect to the
+/// default worktree.
+fn cwd_under_a_registered_worktree(checkouts: &[query::WorktreeRecord], cwd: &Path) -> bool {
+    let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    checkouts.iter().any(|record| {
+        let canonical_record = record
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| record.path.clone());
+        canonical_cwd == canonical_record || canonical_cwd.starts_with(&canonical_record)
+    })
+}
+
 /// Resolve which worktree `setup --agent` operates on.
 ///
 /// `requested` is an explicit `--worktree <name>`: a path relative to the
@@ -364,26 +384,35 @@ pub fn resolve_worktree(
             });
     }
 
-    // A failure here is not an error to propagate: the grove root and every
-    // intermediate directory under it walk up to the bare repository, where
-    // `rev-parse --show-toplevel` fails outright, and that is precisely the
-    // default-worktree case handled below.
-    if let Ok(toplevel) = query::worktree_toplevel(runner, cwd) {
-        if let Some(record) = checkouts
-            .iter()
-            .find(|record| same_worktree(&record.path, &toplevel))
-        {
-            return Ok(record.path.clone());
+    // A failure here is not automatically an error to propagate: the grove
+    // root and every intermediate directory under it walk up to the bare
+    // repository, where `rev-parse --show-toplevel` fails outright, and
+    // that is precisely the default-worktree case handled below. But that
+    // is only the right read of the failure when `cwd` is not inside a
+    // registered worktree to begin with; a failure while `cwd` is under a
+    // real worktree's path means something is actually wrong with that
+    // worktree (e.g. a damaged `.git` pointer file), and must surface as an
+    // error rather than be silently redirected to the default worktree.
+    match query::worktree_toplevel(runner, cwd) {
+        Ok(toplevel) => {
+            if let Some(record) = checkouts
+                .iter()
+                .find(|record| same_worktree(&record.path, &toplevel))
+            {
+                return Ok(record.path.clone());
+            }
+            // A working tree that resolved, but is not one of this grove's
+            // worktrees: an unrelated repository nested under the grove root.
+            // Silently configuring some other worktree would be worse than
+            // saying so.
+            return Err(GroveError::usage(format!(
+                "{} is a Git working tree, but not a worktree of this grove",
+                toplevel.display()
+            ))
+            .with_detail(format!("{list_hint}; name one with --worktree <name>")));
         }
-        // A working tree that resolved, but is not one of this grove's
-        // worktrees: an unrelated repository nested under the grove root.
-        // Silently configuring some other worktree would be worse than
-        // saying so.
-        return Err(GroveError::usage(format!(
-            "{} is a Git working tree, but not a worktree of this grove",
-            toplevel.display()
-        ))
-        .with_detail(format!("{list_hint}; name one with --worktree <name>")));
+        Err(error) if cwd_under_a_registered_worktree(&checkouts, cwd) => return Err(error),
+        Err(_) => {}
     }
 
     let default_branch = metadata.default_branch.as_ref().ok_or_else(|| {
@@ -764,7 +793,7 @@ mod tests {
         );
         assert_eq!(
             value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "/abs/git-grove hook-guard --protocol claude-compatible PreToolUse"
+            "'/abs/git-grove' hook-guard --protocol claude-compatible PreToolUse"
         );
     }
 
@@ -786,7 +815,7 @@ mod tests {
         );
         assert_eq!(
             entry["hooks"][0]["command"].as_str(),
-            Some("/abs/git-grove hook-guard --protocol codex PreToolUse")
+            Some("'/abs/git-grove' hook-guard --protocol codex PreToolUse")
         );
     }
 
@@ -990,6 +1019,37 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.class, crate::error::ExitClass::Usage);
         assert!(error.message.contains("not a worktree of this grove"));
+    }
+
+    /// A `worktree_toplevel` failure while `cwd` is under a real, registered
+    /// worktree's path (e.g. a damaged `.git` pointer file in that worktree)
+    /// must propagate as an error, not be silently swallowed into a
+    /// redirect to the grove's default-branch worktree -- see Finding 3.
+    #[test]
+    fn a_rev_parse_failure_under_a_registered_worktree_propagates_instead_of_falling_back() {
+        let root = tempfile::tempdir().unwrap();
+        let grove = grove_at(root.path());
+        std::fs::create_dir_all(grove.root.join("topic")).unwrap();
+        std::fs::create_dir_all(grove.root.join("main")).unwrap();
+
+        let fake = RecordingFake::new();
+        fake.push_response(output(
+            0,
+            &worktree_list(&grove, &[("main", "main"), ("topic", "topic")]),
+        ));
+        fake.push_response(output(128, b""));
+
+        let error = resolve_worktree(
+            &fake,
+            &grove,
+            &metadata_with_default(Some("main")),
+            None,
+            &grove.root.join("topic"),
+        )
+        .unwrap_err();
+        assert_eq!(error.class, crate::error::ExitClass::Usage);
+        assert!(!error.message.contains("records no default branch"));
+        assert!(!error.message.contains("not checked out in any worktree"));
     }
 
     #[test]

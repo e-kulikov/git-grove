@@ -12,6 +12,16 @@ pub const CODEX_MARKER_VALUE: &str = "git-grove.protect-metadata.v1";
 /// Seconds a harness gives one installed handler before abandoning it.
 pub const TIMEOUT_SECONDS: i64 = 15;
 
+/// POSIX single-quote a path for embedding in a shell `command` string: wrap
+/// it in single quotes, and escape any embedded single quote as `'\''` (end
+/// the quoted string, an escaped literal quote, reopen). Both hook protocols
+/// hand `command` to a shell, so an installation path containing a space or
+/// a shell metacharacter must not be interpolated raw -- see
+/// `hooks::config::tests::shell_quote_*`.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 /// Which serialization an agent's native hook-config file uses. The tree is
 /// identical either way — see [`HookGroup`]; only the bytes differ.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +50,7 @@ impl HookGroup {
     /// The group Claude Code and Copilot CLI share. `executable` is the
     /// canonicalized absolute path to the current `git-grove` binary.
     pub fn claude_compatible(executable: &str) -> Self {
+        let executable = shell_quote(executable);
         Self {
             marker_key: CLAUDE_COMPATIBLE_MARKER_KEY,
             marker_value: CLAUDE_COMPATIBLE_MARKER_VALUE,
@@ -52,6 +63,7 @@ impl HookGroup {
     /// on top of the shared three. `executable` is the canonicalized
     /// absolute path to the current `git-grove` binary.
     pub fn codex(executable: &str) -> Self {
+        let executable = shell_quote(executable);
         Self {
             marker_key: CODEX_MARKER_KEY,
             marker_value: CODEX_MARKER_VALUE,
@@ -440,6 +452,24 @@ mod tests {
     }
 
     #[test]
+    fn shell_quote_wraps_a_path_containing_a_space() {
+        let group = claude("/tmp/Grove Tools/git-grove");
+        assert_eq!(
+            group.command,
+            "'/tmp/Grove Tools/git-grove' hook-guard --protocol claude-compatible PreToolUse"
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_an_embedded_single_quote() {
+        let group = codex("/tmp/o'brien/git-grove");
+        assert_eq!(
+            group.command,
+            r"'/tmp/o'\''brien/git-grove' hook-guard --protocol codex PreToolUse"
+        );
+    }
+
+    #[test]
     fn appends_the_group_to_an_absent_file() {
         let group = claude("/bin/git-grove");
         let merged = merge(b"", &group).unwrap();
@@ -550,7 +580,7 @@ mod tests {
              \n\
              [[hooks.PreToolUse.hooks]]\n\
              type = \"command\"\n\
-             command = \"/abs/git-grove hook-guard --protocol codex PreToolUse\"\n\
+             command = \"'/abs/git-grove' hook-guard --protocol codex PreToolUse\"\n\
              timeout = 15\n"
         );
     }
@@ -577,7 +607,7 @@ mod tests {
         assert_eq!(array.len(), 1);
         assert_eq!(
             array.get(0).unwrap()["hooks"][0]["command"].as_str(),
-            Some("/new/git-grove hook-guard --protocol codex PreToolUse")
+            Some("'/new/git-grove' hook-guard --protocol codex PreToolUse")
         );
     }
 
@@ -664,7 +694,7 @@ mod tests {
                 .as_inline_table()
                 .unwrap()["command"]
                 .as_str(),
-            Some("/abs/git-grove hook-guard --protocol codex PreToolUse")
+            Some("'/abs/git-grove' hook-guard --protocol codex PreToolUse")
         );
 
         let rerun = merge_toml(&merged, &codex("/abs/git-grove")).unwrap();

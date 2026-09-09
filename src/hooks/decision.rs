@@ -109,12 +109,51 @@ fn shell_tokens(command: &str) -> Vec<String> {
     tokens
 }
 
+/// Find the earliest unquoted redirection operator (`>`, `>>`, `<`, `<<`)
+/// inside `token`, returning its byte offset and length. `>`/`<` are ASCII,
+/// so a byte-index split on them can never land inside a multi-byte UTF-8
+/// sequence.
+fn find_redirection(token: &str) -> Option<(usize, usize)> {
+    let bytes = token.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'>' || byte == b'<' {
+            let doubled = bytes.get(index + 1) == Some(&byte);
+            return Some((index, if doubled { 2 } else { 1 }));
+        }
+    }
+    None
+}
+
+/// Split one shell token on every redirection operator it contains,
+/// wherever it appears — not only at the token's start. Bash glues a
+/// redirection onto a preceding word with no separating space just as
+/// readily as it glues one onto a following path (`echo x>../.bare/config`
+/// tokenizes as the single token `x>../.bare/config`, not `x`, `>`,
+/// `../.bare/config`), so a start-anchored strip alone leaves that whole
+/// token as one unrecognized, non-matching path candidate — a real bypass
+/// of this feature's protection. The word immediately before an operator is
+/// dropped, not kept as a candidate, when it is entirely ASCII digits: bash
+/// treats a bare numeric word glued to a redirection as the file descriptor
+/// (`1>file`, `2>>file`, `0<file`), never as a word of its own.
+fn split_redirections(token: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut rest = token;
+    while let Some((offset, length)) = find_redirection(rest) {
+        let before = &rest[..offset];
+        if !before.is_empty() && !before.bytes().all(|byte| byte.is_ascii_digit()) {
+            parts.push(before.to_string());
+        }
+        rest = &rest[offset + length..];
+    }
+    if !rest.is_empty() {
+        parts.push(rest.to_string());
+    }
+    parts
+}
+
 /// Conservative, best-effort path-candidate extraction for a Bash command:
-/// every token that is not a recognized shell operator, with a glued
-/// leading redirection operator stripped — `>file`, `>>file`, `<file`, and
-/// the same three with a leading file-descriptor number glued on
-/// (`1>file`, `2>>file`, `0<file`; exec-reviewer caught `1>../.bare/config`
-/// surviving as one untouched candidate token in an earlier round). A token
+/// every token that is not a recognized shell operator, split on every
+/// redirection operator it contains (see [`split_redirections`]). A part
 /// that looks like a long or short option with its value glued on
 /// (`--flag=path`, `-o=path`) additionally yields the value half as its own
 /// candidate — otherwise `--output=../.git` resolves as the single
@@ -132,26 +171,17 @@ fn bash_candidates(command: &str) -> Vec<String> {
         if SHELL_OPERATORS.contains(&token.as_str()) {
             continue;
         }
-        let mut rest = token.as_str();
-        let digit_end = rest
-            .find(|character: char| !character.is_ascii_digit())
-            .unwrap_or(rest.len());
-        let after_digits = &rest[digit_end..];
-        for operator in [">>", "<<", ">", "<"] {
-            if let Some(stripped) = after_digits.strip_prefix(operator) {
-                rest = stripped;
-                break;
-            }
-        }
-        if rest.is_empty() {
-            continue;
-        }
-        candidates.push(rest.to_string());
-        if rest.starts_with('-') {
-            if let Some((_, value)) = rest.split_once('=') {
-                if !value.is_empty() {
-                    candidates.push(value.to_string());
-                }
+        for part in split_redirections(&token) {
+            let value = if part.starts_with('-') {
+                part.split_once('=')
+                    .map(|(_, value)| value.to_string())
+                    .filter(|value| !value.is_empty())
+            } else {
+                None
+            };
+            candidates.push(part);
+            if let Some(value) = value {
+                candidates.push(value);
             }
         }
     }
@@ -430,6 +460,28 @@ mod tests {
         let payload = NormalizedPayload {
             tool: Tool::Bash {
                 command: "tool 1>../.bare/config".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)));
+    }
+
+    #[test]
+    fn bash_candidates_splits_a_redirection_glued_to_a_preceding_word() {
+        assert_eq!(
+            bash_candidates("echo x>../.bare/config"),
+            vec!["echo", "x", "../.bare/config"]
+        );
+    }
+
+    #[test]
+    fn decide_denies_a_bash_command_reaching_bare_through_a_redirection_glued_to_a_word() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "echo x>../.bare/config".to_string(),
             },
             cwd: Some(root.path().join("main")),
         };
