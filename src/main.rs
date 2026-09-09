@@ -21,6 +21,21 @@ fn main() -> ExitCode {
     render(run(cli))
 }
 
+/// The canonicalized absolute path to this binary, which is what an
+/// installed hook command has to name. Resolved once per command that needs
+/// it.
+fn hook_executable() -> Result<String> {
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|error| {
+            GroveError::failure(format!("cannot resolve the current executable: {error}"))
+        })?;
+    executable
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| GroveError::failure("the current executable's path is not valid UTF-8"))
+}
+
 fn render(result: Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::from(ExitClass::Ok.code()),
@@ -121,7 +136,22 @@ fn run(cli: cli::Cli) -> Result<()> {
             )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
-            commands::add::run(&runner, &grove, mode).map(|_| ())
+            let path = commands::add::run(&runner, &grove, mode)?;
+            // A binary that cannot resolve its own path cannot write a hook
+            // command that would run, but that must not stop a worktree from
+            // being created: this reports it and provisions nothing.
+            let (executable, unresolved) = match hook_executable() {
+                Ok(executable) => (Some(executable), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            commands::add::provision_hooks(
+                &runner,
+                &grove,
+                &path,
+                executable.as_deref(),
+                unresolved.as_deref(),
+            );
+            Ok(())
         }
         cli::Command::List { porcelain } => {
             let runner = git::runner::RealGit::new();
@@ -259,7 +289,7 @@ fn run(cli: cli::Cli) -> Result<()> {
                 }
             }
         }
-        cli::Command::Setup { agent } => {
+        cli::Command::Setup { agent, worktree } => {
             let runner = git::runner::RealGit::new();
             let findings = policy::env::scan_os(std::env::vars_os());
             let mut interaction = policy::SystemInteraction;
@@ -267,14 +297,7 @@ fn run(cli: cli::Cli) -> Result<()> {
             let cwd = std::env::current_dir().map_err(|error| {
                 GroveError::failure(format!("cannot read the current directory: {error}"))
             })?;
-            let worktree_root = git::query::worktree_toplevel(&runner, &cwd)?;
             let grove = grove::discover::Grove::discover(&cwd)?;
-            if worktree_root == grove.root {
-                return Err(GroveError::usage(
-                    "run `git grove setup` from inside a worktree, not the grove root",
-                )
-                .with_detail(format!("{} is the grove root", worktree_root.display())));
-            }
             git_grove::transaction::recovery::ensure_none(&grove.root)?;
             let _lock = fsx::lock::GroveLock::acquire_path(
                 &grove.bare_dir(),
@@ -283,16 +306,16 @@ fn run(cli: cli::Cli) -> Result<()> {
             )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
-            let executable = std::env::current_exe()
-                .and_then(|path| path.canonicalize())
-                .map_err(|error| {
-                    GroveError::failure(format!("cannot resolve the current executable: {error}"))
-                })?;
-            let executable = executable.to_str().ok_or_else(|| {
-                GroveError::failure("the current executable's path is not valid UTF-8")
-            })?;
+            let worktree_root = commands::setup::resolve_worktree(
+                &runner,
+                &grove,
+                &metadata,
+                worktree.as_deref(),
+                &cwd,
+            )?;
+            let executable = hook_executable()?;
             let message =
-                commands::setup::run(&runner, &grove.root, &worktree_root, agent, executable)?;
+                commands::setup::run(&runner, &grove, &worktree_root, agent, &executable)?;
             std::io::Write::write_all(&mut std::io::stdout().lock(), message.as_bytes())
                 .map_err(|error| GroveError::failure(format!("cannot write stdout: {error}")))
         }

@@ -315,7 +315,7 @@ fn unset(runner: &dyn GitRunner, grove: &Grove, key: &str) -> Result<()> {
     }
 }
 
-fn config_path(grove: &Grove) -> PathBuf {
+pub(crate) fn config_path(grove: &Grove) -> PathBuf {
     grove.bare_dir().join("config")
 }
 

@@ -241,12 +241,26 @@ fn release_docs_loudly_state_the_generation_removal_and_its_replacements() {
             "{relative} omits the shared Claude/Copilot hook file location"
         );
         assert!(
-            document.contains(".codex/hooks.json"),
+            document.contains(".codex/config.toml"),
             "{relative} omits the Codex hook file location"
         );
         assert!(
             document.contains("1.0.80"),
             "{relative} omits the measured Copilot non-interactive version boundary"
+        );
+        // The one claim this release must never leave a reader guessing
+        // about: Codex writes a config that is not enforced yet, and why.
+        assert!(
+            document.contains("project_root_markers"),
+            "{relative} omits why Codex hook enforcement does not work in a grove"
+        );
+        assert!(
+            document.contains("does not work in a grove today"),
+            "{relative} does not state plainly that Codex enforcement is non-functional"
+        );
+        assert!(
+            document.contains("grove.hookAgent"),
+            "{relative} omits the project-level hook-agent policy key"
         );
     }
 }

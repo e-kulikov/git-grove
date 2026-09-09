@@ -321,28 +321,57 @@ Two replacements:
   invariants, and command surface to stdout, before any policy or Git work. It reflects the
   installed binary's own command surface, so it cannot drift out of date the way a
   once-generated file did.
-- `git grove setup --agent <claude|codex|copilot>` writes a project-local hook into the current
-  worktree that denies any Edit/Write/Bash tool call (and, for `codex` specifically, its
-  `apply_patch` tool) whose target resolves under `.bare` or the root `.git` pointer file —
-  replacing the old guide's one advisory sentence ("never edit `.bare`") with real enforcement.
+- `git grove setup --agent <claude|codex|copilot>` writes a project-local hook into one worktree
+  that denies any Edit/Write/Bash tool call (and, for `codex` specifically, its `apply_patch`
+  tool) whose target resolves under `.bare` or the root `.git` pointer file — replacing the old
+  guide's one advisory sentence ("never edit `.bare`") with real enforcement.
 
   `claude` and `copilot` converge on `<worktree>/.claude/settings.local.json`; run either once,
-  not both. `codex` writes `<worktree>/.codex/hooks.json`. Both files are per-worktree and kept
-  out of `git status` through the grove's own `.bare/info/exclude` — never tracked or committed.
-  `setup` writes no wrapper, alias, launcher flag, or global setting, and never bypasses an
-  agent's own trust model:
+  not both. `codex` writes `<worktree>/.codex/config.toml`, with the hook defined inline as TOML
+  and `features.hooks = true` alongside it; no separate hooks file is used. Every write is a
+  merge at those keys alone: unrelated settings, other hook events, hook groups someone else
+  wrote, and — in TOML — comments and formatting are all preserved, and a rerun converges
+  instead of appending. These files are per-worktree and kept out of `git status` through the
+  grove's own `.bare/info/exclude` — never tracked or committed. An exact tracked collision at
+  the target path is refused rather than merged. `setup` writes no wrapper, alias, launcher
+  flag, or global setting, and never bypasses an agent's own trust model:
 
   - Claude Code and an interactive Copilot CLI session enforce the shared file directly.
     Measured: Copilot CLI 1.0.80 does not fire this local hook source under non-interactive
     `copilot -p` — re-verify against your installed version before relying on this in
     automation.
-  - Codex requires an interactive trust review before its hook is enforced: start a bare
-    interactive `codex` session in the worktree, trust the project if prompted, open `/hooks`,
-    review the exact command and its hash, and trust it. `codex exec` is not protected until
-    that review is complete.
+  - **Codex hook enforcement does not work in a grove today. Do not rely on
+    `setup --agent codex` for protection.** Codex resolves its project root by walking up for
+    its own `project_root_markers` (default `.git`), and a grove root carries git-grove's own
+    `.git` pointer file, so Codex resolves the *grove root* as the project and never reads the
+    worktree's `.codex/` at all. The file `setup` writes is the exact shape measured working
+    (`/hooks` reporting Installed 1 / Active 1, and a live write into the bare repository
+    denied) in a grove built without that pointer file; making it work in a real grove requires
+    renaming git-grove's own grove-root signature away from `.git`, which is a separate change
+    that has not landed. Until it does, `setup --agent codex` writes a correct but inert config.
+    Independently of that, Codex also requires an interactive trust review — open `/hooks` in an
+    interactive `codex` session and trust the command — before it enforces any hook, and
+    `codex exec` is not protected until that review is complete.
 
-  `setup`'s own output names the exact next step for the agent you configured; it never runs or
-  approves those steps itself.
+  `setup`'s own output names the exact next step for the agent you configured, including the
+  Codex warning above; it never runs or approves those steps itself.
+
+  **Which worktree.** Run from inside a worktree and that worktree is configured. Run from
+  anywhere else in the grove — the grove root, or any intermediate directory — and the worktree
+  holding the grove's recorded default branch is configured instead. `--worktree <name>`
+  overrides both, naming a worktree by its path relative to the grove root (`feature/auth`); it
+  must already exist. A `--worktree` value naming no worktree of this grove is a usage error
+  (`64`); a grove that records no default branch, or whose default branch is checked out
+  nowhere, needs a decision (`2`), and the message names the fix.
+
+  **New worktrees inherit it.** Running `setup --agent <x>` also records `<x>` in the grove's own
+  `grove.hookAgent` key, and `git grove add` then configures every recorded agent in each
+  worktree it creates, with the same tracked-collision refusal and the same exclude entry.
+  This is opt-in and not retroactive: a grove whose owner never ran `setup` records nothing, and
+  `add` behaves exactly as it always did. Provisioning never fails worktree creation — a problem
+  is a loud stderr warning naming the remedy, because a worktree nobody protected is still
+  better than no worktree. Undo the policy with
+  `git config --file <grove>/.bare/config --unset-all grove.hookAgent`.
 
 ## Completions and manual
 

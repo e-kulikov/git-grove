@@ -329,8 +329,8 @@ The alias is
 .B completion \fR{\fBbash\fR|\fBzsh\fR|\fBfish\fR}
 Write completion source for the selected shell to standard output.
 .TP
-.B setup --agent \fR{\fBclaude\fR|\fBcodex\fR|\fBcopilot\fR}
-Write a project-local hook, scoped to the current worktree, that denies any
+.B setup --agent \fR{\fBclaude\fR|\fBcodex\fR|\fBcopilot\fR} \fR[\fB--worktree \fINAME\fR]
+Write a project-local hook, scoped to one worktree, that denies any
 Edit/Write/Bash tool call \(em and, for
 .B codex
 specifically, its
@@ -339,9 +339,7 @@ tool \(em whose target resolves under
 .B .bare
 or the root
 .B .git
-pointer file.  Must be run from inside a worktree; invocation at the grove
-root, or outside any Git working tree, is refused at exit status
-.BR 64 .
+pointer file.
 .RS
 .PP
 .B claude
@@ -349,36 +347,95 @@ and
 .B copilot
 converge on the same
 .B .claude/settings.local.json
-in the current worktree; run either once, not both.
+in the target worktree; run either once, not both.
 .B codex
 writes
-.BR .codex/hooks.json .
-Both files are per-worktree, and each is idempotently added to the grove's
-common
+.BR .codex/config.toml ,
+with the hook defined inline as TOML and
+.B "features.hooks = true"
+alongside it; no separate hooks file is used.  Each write is a merge at
+those keys alone: unrelated settings, other hook events, hook groups
+written by anyone else, and \(em in TOML \(em comments and formatting are
+preserved, and a rerun converges rather than appending.  Each file is
+per-worktree, and each is idempotently added to the grove's common
 .B .bare/info/exclude
 so it never appears in
 .BR "git status" ,
-and is never tracked or committed.  An exact tracked collision at the target
-path is refused at exit status
+and is never tracked or committed.  An exact tracked collision at the
+target path, and an existing target file that cannot be parsed, are both
+refused at exit status
 .B 2
-rather than merged.  Setup writes no wrapper, alias, launcher flag, or global
-setting, and never bypasses an agent's own trust model.
+rather than merged, writing no bytes.  Setup writes no wrapper, alias,
+launcher flag, or global setting, and never bypasses an agent's own trust
+model.
+.PP
+Which worktree is configured: the one containing the current directory,
+if there is one; otherwise \(em at the grove root, or in any intermediate
+directory under it, neither of which is a working tree \(em the worktree
+holding the grove's recorded
+.BR grove.defaultBranch .
+.B --worktree
+overrides both, naming a worktree by its path relative to the grove root
+(for example
+.BR feature/auth ),
+which must already be a registered worktree of this grove; a value that is
+not is refused at exit status
+.BR 64 .
+A grove that records no default branch, or whose recorded default branch is
+checked out in no worktree, is refused at exit status
+.B 2
+with a message naming the fix.
+.PP
+Running setup also records the agent in the grove's own multi-valued
+.B grove.hookAgent
+key, after the hook config is written successfully and never before.
+.B "git grove add"
+reads that key and configures every recorded agent in each worktree it
+creates, applying the same tracked-collision refusal and the same exclude
+entry.  This is opt-in and not retroactive: a grove that records no agent
+\(em every grove whose owner has never run setup \(em makes
+.B add
+behave exactly as it did before, and provisioning never fails worktree
+creation, reporting any problem as a warning on standard error instead.
+Remove the policy with
+.B "git config --file <grove>/.bare/config --unset-all grove.hookAgent" .
 .PP
 Claude Code and an interactive Copilot CLI session enforce the shared file
 directly.  Measured: Copilot CLI 1.0.80 does not fire this local hook source
 under non-interactive
 .BR "copilot -p" ;
 re-verify against the installed version before relying on this in
-automation.  Codex requires an interactive trust review before its hook is
-enforced: start a bare interactive
+automation.
+.PP
+Codex hook enforcement does not work in a grove today, and
+.B "setup --agent codex"
+must not be relied on for protection.  Codex resolves its project root by
+walking up for its own
+.B project_root_markers
+(default
+.BR .git ),
+and a grove root carries git-grove's own
+.B .git
+pointer file, so Codex resolves the grove root as the project and never
+reads the target worktree's
+.B .codex
+directory at all.  The file setup writes is the exact shape measured working
+in a grove built without that pointer file; making it work in a real grove
+requires renaming git-grove's own grove-root signature away from
+.BR .git ,
+which is a separate change that has not landed.  Independently of that,
+Codex requires an interactive trust review before it enforces any hook:
+open
+.B /hooks
+in an interactive
 .B codex
-session in the worktree, trust the project if prompted, open
-.BR /hooks ,
-review the exact command and its hash, and trust it \(em
+session, review the exact command and its hash, and trust it \(em and
 .B "codex exec"
-is not protected until that review is complete.  Setup's own output names
-the exact next step for the configured agent; it never runs or approves
-those steps itself.
+is not protected until that review is complete.
+.PP
+Setup's own output names the exact next step for the configured agent,
+including the Codex warning above; it never runs or approves those steps
+itself.
 .RE
 .SH OPTIONS
 .TP

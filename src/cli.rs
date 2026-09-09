@@ -205,6 +205,11 @@ pub enum Command {
         /// Which agent to configure a local hook for
         #[arg(long, value_enum)]
         agent: crate::commands::setup::Agent,
+        /// Worktree to configure, relative to the grove root (default: the
+        /// worktree containing the current directory, else the worktree
+        /// holding the grove's default branch)
+        #[arg(long, value_name = "NAME")]
+        worktree: Option<PathBuf>,
     },
     /// Internal hook handler invoked by an installed agent hook; not for
     /// direct interactive use
