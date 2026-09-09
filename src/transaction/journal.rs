@@ -580,6 +580,20 @@ impl Journal {
         Ok(journal)
     }
 
+    /// Whether `bytes` parses only via the schema-1 compatibility path in
+    /// [`Self::parse_strict`], not the current schema-2 shape directly.
+    /// `select_journal` (in `crate::transaction::recovery`) uses this to
+    /// recognize the one legal journal-generation transition
+    /// [`upgrade_legacy_journal`] cannot preserve: two schema-1 generations
+    /// that differ *only* by the now-discarded guide operation's state
+    /// (Pending -> Done) upgrade to byte-for-byte identical operations,
+    /// so `validate_next` sees no mutable field change and would otherwise
+    /// refuse a legitimate next generation as if it were corrupt.
+    pub fn is_legacy_schema1(bytes: &[u8]) -> bool {
+        Self::parse_strict_current(bytes).is_err()
+            && Self::parse_strict_legacy_schema1(bytes).is_ok()
+    }
+
     pub fn validate_next(&self, next: &Self) -> Result<()> {
         self.validate()?;
         next.validate()?;

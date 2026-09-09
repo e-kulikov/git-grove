@@ -976,6 +976,89 @@ fn continue_and_abort_accept_a_schema_one_journal_with_guide_evidence() {
     }
 }
 
+/// A torn write from exactly the guide-install phase transition (schema-1
+/// `journal.json` with the guide operation Pending, `journal.json.new` one
+/// generation ahead with it Done, nothing else different) upgrades both
+/// generations to byte-for-byte identical operations, since the guide
+/// operation is dropped either way. `Journal::validate_next` alone cannot
+/// see that the newer generation was legal -- it looks like no mutable
+/// field changed -- so recovery has to recognize this specific shape
+/// itself (`erased_by_guide_migration` in `transaction::recovery`) rather
+/// than reject a legitimate next generation as corrupt.
+#[cfg(feature = "failpoints")]
+#[test]
+fn continue_and_abort_promote_a_torn_schema_one_journal_across_the_erased_guide_transition() {
+    let sandbox = Sandbox::new();
+    for action in ["--continue", "--abort"] {
+        let root = flat_repository(&sandbox, &format!("schema-one-torn-{}", &action[2..]));
+        std::fs::write(root.join("tracked"), b"schema one torn compat\n").unwrap();
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", root.to_str().unwrap()])
+            .env("GIT_GROVE_FAILPOINT", "error:20")
+            .assert()
+            .failure();
+
+        let transaction = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".grove-adopt-")
+            })
+            .unwrap();
+        let journal_path = transaction.join("journal.json");
+        let bytes = std::fs::read(&journal_path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        value["schema"] = serde_json::json!(1);
+        let guide_proof = serde_json::json!({
+            "bytes": {"encoding": "Hex", "value": ""},
+            "sha256": vec![0; 32],
+            "mode": 420
+        });
+        value["plan"]["generated"]["guide"] = guide_proof.clone();
+        value["plan"]["expected_final"]["guide"] = guide_proof;
+
+        let operations = value["operations"].as_array_mut().unwrap();
+        assert_eq!(
+            operations.len(),
+            8,
+            "fixture drifted from today's eight-phase journal"
+        );
+        let mut guide_operation = operations[0].clone();
+        guide_operation["id"] = serde_json::json!(90);
+        guide_operation["state"] = serde_json::json!("pending");
+        operations.insert(7, guide_operation);
+        assert_eq!(operations.len(), 9);
+
+        // `new` is one generation ahead of `current`, differing only in the
+        // guide operation's state -- exactly the transition the guide
+        // phase's own `finish_phase` call used to record.
+        let mut next_value = value.clone();
+        next_value["generation"] = serde_json::json!(value["generation"].as_u64().unwrap() + 1);
+        next_value["operations"][7]["state"] = serde_json::json!("done");
+
+        std::fs::write(&journal_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        std::fs::write(
+            transaction.join("journal.json.new"),
+            serde_json::to_vec(&next_value).unwrap(),
+        )
+        .unwrap();
+
+        sandbox
+            .grove_in(sandbox.root(), &["adopt", action, root.to_str().unwrap()])
+            .assert()
+            .success();
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".grove-adopt-")));
+    }
+}
+
 #[cfg(feature = "failpoints")]
 #[test]
 fn continue_and_abort_preserve_user_owned_agent_files() {
