@@ -446,6 +446,22 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
     let mut assignment_confirmed = false;
     let mut chars = command.char_indices().peekable();
     while let Some((byte_index, character)) = chars.next() {
+        // A backslash-newline line continuation is a true no-op — both
+        // characters vanish, joining the next line directly onto this one
+        // with nothing inserted between them (`shell_tokens_scanned` treats
+        // it identically). It must not touch `tilde_boundary` either way:
+        // `printf x \<newline>~` (continuation right after a real word
+        // boundary) really does tilde-expand in Bash, while `abc\<newline>~`
+        // (continuation mid-word) does not — exactly the same as if the
+        // continuation had never been there at all, so this skips the rest
+        // of the loop body entirely rather than running the pair through
+        // the boundary/match logic below, which would treat the bare
+        // backslash as ordinary mid-word text and wrongly reset the
+        // boundary state.
+        if character == '\\' && !in_single && chars.peek().map(|&(_, next)| next) == Some('\n') {
+            chars.next();
+            continue;
+        }
         let word_start = tilde_boundary;
         if in_single || in_double {
             tilde_boundary = false;
@@ -2697,6 +2713,22 @@ mod tests {
                 "{command:?} must be denied"
             );
         }
+    }
+
+    /// exec-reviewer's own regression probe: a backslash-newline line
+    /// continuation is a true no-op (both characters vanish, joining the
+    /// next line directly onto this one, confirmed against Bash both
+    /// ways) — `printf x \<newline>~` really does tilde-expand (the
+    /// continuation sits right after a real word boundary, the space
+    /// after `x`), while `printf abc\<newline>~` does not (the
+    /// continuation is mid-word, joining directly onto `abc`). Treating
+    /// the continuation as an ordinary backslash escape wrongly reset the
+    /// boundary state either way — a miss on the first, and would have
+    /// been an unnecessary denial on the second had it gone the other way.
+    #[test]
+    fn unsafe_bash_character_treats_line_continuation_as_invisible_for_tilde_boundary() {
+        assert!(unsafe_bash_character("printf x \\\n~").is_some());
+        assert_eq!(unsafe_bash_character("printf abc\\\n~"), None);
     }
 
     #[test]
