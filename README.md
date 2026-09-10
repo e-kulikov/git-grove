@@ -353,6 +353,19 @@ Two replacements:
     interactive `codex` session and trust the command — before it enforces any hook, and
     `codex exec` is not protected until that review is complete.
 
+  **What the guard proves, and what it can't.** The Bash check statically analyzes the command
+  line itself and denies anything it cannot fully account for — a directory change, `eval`/`exec`
+  and the other dispatch or reserved words, a subshell, command/process substitution, a variable
+  inside a path-looking argument, and a handful of directory-changing flags, including inside
+  quoted content handed to another program. That is real, meaningful protection against every one
+  of those constructs. It cannot prove what an *external interpreter* invoked with a computed
+  string will do with it once it runs (`python3 -c '...'`, `perl -e '...'`, and so on for any
+  interpreter that accepts one): a payload written in a language this guard does not parse, that
+  both avoids every Bash-shaped signal it looks for and still reaches protected metadata, is not
+  something static analysis of the outer Bash command line can rule out. Closing that class needs
+  a different mechanism entirely — OS-level sandboxing (Landlock, seccomp, or similar) enforced on
+  the process actually performing the write — which this hook does not attempt.
+
   `setup`'s own output names the exact next step for the agent you configured, including the
   Codex warning above; it never runs or approves those steps itself.
 

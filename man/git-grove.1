@@ -433,6 +433,27 @@ session, review the exact command and its hash, and trust it \(em and
 .B "codex exec"
 is not protected until that review is complete.
 .PP
+The Bash guard statically analyzes the command line itself and denies
+whatever it cannot fully account for \(em a directory change, a dispatch or
+reserved word such as
+.BR eval " or " exec ,
+a subshell, command or process substitution, a variable inside a
+path-looking argument, and a handful of directory-changing flags, including
+inside quoted content handed to another program.  That is real, meaningful
+protection against every one of those constructs.  It cannot prove what an
+external interpreter invoked with a computed string will do with it once
+that interpreter runs (a Python or Perl one-liner passed as its own
+.B -c
+or
+.B -e
+argument, and so on for any interpreter that accepts one): a payload
+written in a language this guard does not parse, that avoids every
+Bash-shaped signal it looks for and still reaches protected metadata, is
+not something static analysis of the outer Bash command line can rule out.
+Closing that class needs a different mechanism entirely \(em OS-level
+sandboxing (Landlock, seccomp, or similar) enforced on the process actually
+performing the write \(em which this hook does not attempt.
+.PP
 Setup's own output names the exact next step for the configured agent,
 including the Codex warning above; it never runs or approves those steps
 itself.
