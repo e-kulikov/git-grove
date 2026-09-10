@@ -905,8 +905,14 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
     }
     for segment in split_bash_segments(command) {
         let tokens = shell_tokens(&segment);
-        let Some(command_word_index) = command_word_index_in_segment(&tokens) else {
-            continue;
+        let command_word_index = match command_word_index_in_segment(&tokens) {
+            Ok(Some(index)) => index,
+            Ok(None) => continue,
+            Err(token) => {
+                return Some(format!(
+                    "an assignment or redirection prefix (`{token}`) whose grammar is not fully recognized"
+                ));
+            }
         };
         if let Some(reason) = resolve_directory_flag(&tokens, command_word_index) {
             return Some(reason);
@@ -921,12 +927,26 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
 /// [`unsafe_command_word_in_segment`] does, since this helper answers the
 /// same question ("which token is the real command word") for
 /// [`unsafe_bash_directory_flag`]'s narrower, per-program `-C` check.
-/// `None` if the segment has no tokens, or its first non-prefix token is
-/// an unrecognized assignment/redirection prefix (see
-/// [`looks_like_unrecognized_prefix`]) — that case is already denied by
-/// `unsafe_command_word_in_segment` separately, so this helper's callers
-/// can simply skip the segment rather than duplicate that denial.
-fn command_word_index_in_segment(tokens: &[String]) -> Option<usize> {
+///
+/// `Ok(None)` if the segment has no tokens at all past its own leading
+/// assignments/redirections (genuinely nothing left to check). `Err` —
+/// not folded into `Ok(None)` — if its first non-prefix token is an
+/// unrecognized assignment/redirection prefix (see
+/// [`looks_like_unrecognized_prefix`]), carrying that token back to the
+/// caller to deny with: at the *top level*, this case is also separately
+/// denied by `unsafe_bash_command_word`/`unsafe_command_word_in_segment`,
+/// but `unsafe_bash_directory_flag` recurses into quoted content on its
+/// own, unconditionally, unlike that construct-level scan (gated by
+/// [`looks_like_shell_code`]) — so a quoted string whose own evidence
+/// doesn't trip that gate (`"alias.x=!git -C / status"`, no operator or
+/// evidence word in `looks_like_shell_code`'s narrower vocabulary) would
+/// otherwise reach only this function, which previously just skipped the
+/// whole segment on the same unrecognized-prefix token and silently
+/// missed a live `-C` later in it. Returning `Err` here, rather than
+/// `Ok(None)`, lets this scan deny that case itself instead of silently
+/// relying on an invariant ("already denied elsewhere") that only holds
+/// for the top-level call.
+fn command_word_index_in_segment(tokens: &[String]) -> Result<Option<usize>, &str> {
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index].as_str();
@@ -942,11 +962,11 @@ fn command_word_index_in_segment(tokens: &[String]) -> Option<usize> {
             continue;
         }
         if looks_like_unrecognized_prefix(token) {
-            return None;
+            return Err(token);
         }
-        return Some(index);
+        return Ok(Some(index));
     }
-    None
+    Ok(None)
 }
 
 /// Find the command word of every simple command in `command` (splitting
@@ -2461,6 +2481,50 @@ mod tests {
         let payload = NormalizedPayload {
             tool: Tool::Bash {
                 command: "bash -c 'env -C .. touch .bare/config'".to_string(),
+            },
+            cwd: Some(root.path().to_path_buf()),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    /// exec-reviewer's own discovery: a git alias whose value starts with
+    /// `!` runs its remainder as a shell command via `sh -c`, so `git -c
+    /// "alias.x=!git -C / status" x` hides a real, later `-C` behind a
+    /// leading token (`alias.x=!git`) that isn't a valid Bash assignment (a
+    /// `.` in the name) and isn't a recognized redirection either —
+    /// [`looks_like_unrecognized_prefix`]'s exact case. The bug was
+    /// structural, not specific to git aliases:
+    /// `command_word_index_in_segment` used to fold "segment empty" and
+    /// "unrecognized prefix" into the same `None`, so
+    /// `unsafe_bash_directory_flag`, when `unsafe_bash_construct` recurses
+    /// it directly into a quoted token's own text, silently skipped the
+    /// *entire* segment — including any real `-C` later in it — relying on
+    /// an invariant ("already denied elsewhere") that only holds for a
+    /// top-level call, not for this recursive one. Any quoted string with
+    /// the same shape reproduces it, with no alias or `!` involved at all
+    /// — tested directly against the quoted content's own text, the same
+    /// way `unsafe_bash_construct`'s recursion invokes this function, not
+    /// against the outer command (whose own `-c` legitimately consumes the
+    /// whole quoted string as its own value, correctly, and is not the
+    /// bug here).
+    #[test]
+    fn unsafe_bash_directory_flag_denies_rather_than_skips_an_unrecognized_prefix_hiding_a_later_c()
+    {
+        for quoted_content in ["alias.x=!git -C / status", "not.valid=weird -C / status"] {
+            assert!(
+                unsafe_bash_directory_flag(quoted_content).is_some(),
+                "{quoted_content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_denies_a_git_alias_hiding_a_c_flag_behind_an_unrecognized_prefix() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: r#"git -c "alias.x=!git -C / status" x"#.to_string(),
             },
             cwd: Some(root.path().to_path_buf()),
         };
