@@ -416,6 +416,34 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
                     "an unquoted `{character}` (Bash pathname expansion, whose result this scan cannot predict)"
                 ));
             }
+            '{' if !in_single && !in_double => {
+                // Brace expansion (`.{b,b}are/config`, `.b{,}are`) is, like
+                // pathname expansion, inert inside either quote style, and
+                // for the same reason denied outright rather than modeled:
+                // predicting its expanded words would mean re-implementing
+                // Bash's own brace-expansion grammar, not just recognizing
+                // a construct exists. This also subsumes the compound-
+                // command-group reading of a bare `{` this scan already
+                // denies as a command word (`UNSAFE_COMMAND_WORDS`) — that
+                // check only ever sees `{` in command-word position, this
+                // one catches it anywhere in the token.
+                return Some(
+                    "an unquoted `{` (Bash brace expansion, whose result this scan cannot predict)"
+                        .to_string(),
+                );
+            }
+            '~' if !in_single && !in_double => {
+                // Tilde expansion substitutes a user's home directory (or,
+                // as `~+`/`~-`, the shell's own $PWD/$OLDPWD) wherever it
+                // appears at the front of a word — again inert inside
+                // either quote style, and again denied outright rather
+                // than resolved, since this scan has no access to the
+                // environment Bash itself would expand it against.
+                return Some(
+                    "an unquoted `~` (Bash tilde expansion, whose result this scan cannot predict)"
+                        .to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -493,96 +521,182 @@ fn is_short_c_flag(token: &str) -> bool {
 /// command, without altering how any later program's own flags are parsed
 /// — scheduling and process-group wrappers, not shells or interpreters. A
 /// directory-changing program named right after one of these is exactly as
-/// live as if the wrapper were not there, so `unsafe_bash_directory_flag`'s
-/// per-program `-C` check must see past it (see
-/// [`skip_transparent_wrappers`]) to find the real command word, instead of
-/// mistaking the wrapper's own name — or, worse, one of its option values —
-/// for it.
+/// live as if the wrapper were not there, so [`resolve_directory_flag`]
+/// must see past it to find the real command word, instead of mistaking
+/// the wrapper's own name — or, worse, one of its option values — for it.
+/// `env` is handled separately, not listed here: unlike these three, `env`
+/// also has its own `-C`/`--chdir` that can directly precede the command it
+/// execs, so it needs its own leading-option/assignment scan instead of a
+/// blind skip — see the `env` arm of [`resolve_directory_flag`].
 const TRANSPARENT_WRAPPER_PROGRAMS: &[&str] = &["nice", "nohup", "setsid"];
 
-/// The one short option, among [`TRANSPARENT_WRAPPER_PROGRAMS`]'s own
-/// grammars, that takes its value as a separate following word rather than
-/// only glued on: `nice -n 10 cmd` alongside `nice -n10 cmd`. `nohup` and
-/// `setsid` take no value-bearing short option before the command they run.
-const WRAPPER_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-n"];
+/// [`TRANSPARENT_WRAPPER_PROGRAMS`]'s own short and long options that take
+/// their value as a separate following word rather than only glued on:
+/// `nice -n 10 cmd`/`nice --adjustment 10 cmd` alongside `nice -n10 cmd`.
+/// `nohup` and `setsid` take no value-bearing option before the command
+/// they run.
+const WRAPPER_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-n", "--adjustment"];
 
-/// Whether `command_word` names one of [`TRANSPARENT_WRAPPER_PROGRAMS`],
-/// matched the same way [`names_directory_changing_program`] is: by final
-/// path component, so an absolute or relative path to the wrapper counts
-/// too.
-fn is_transparent_wrapper(command_word: &str) -> bool {
+/// `env`'s own long-standing options that take their value as a separate
+/// following word rather than only glued on (`env -u FOO cmd`, not only
+/// `env -uFOO cmd`) — the same shape [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`]
+/// exists for. `-C`/`--chdir` are deliberately excluded: finding either
+/// bare is the match [`resolve_directory_flag`]'s `env` arm is looking for,
+/// not something to skip past.
+const ENV_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-u", "--unset", "-S", "--split-string"];
+
+/// Whether `token` is one of `git`'s own long-standing global options that
+/// takes its value as a separate following word, rather than only glued
+/// onto the flag itself — the same shape
+/// [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`]/[`ENV_OPTIONS_WITH_SEPARATE_VALUE`]
+/// exist for. This only matters for [`resolve_directory_flag`]'s stop-at-
+/// first-non-option-token rule for `git`: without skipping the value too,
+/// `git -c alias.v=version -C / v`'s `alias.v=version` (the *value* of
+/// `-c`, not a subcommand) would wrongly look like the boundary and hide
+/// the `-C` straight after it — a false negative, exactly the kind of
+/// regression the boundary rule exists to avoid introducing. Bounded to
+/// `git`'s own documented global-option grammar (fixed and small), not
+/// attempting to enumerate a subcommand's options too — a later `-c`
+/// belonging to a *subcommand* is already unreachable once the subcommand
+/// itself is correctly recognized as the stopping boundary.
+fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
     let name = Path::new(command_word)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command_word);
-    TRANSPARENT_WRAPPER_PROGRAMS.contains(&name)
+    name == "git"
+        && matches!(
+            token,
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--exec-path"
+        )
 }
 
-/// Advance `index` — already a simple command's word — past any number of
-/// chained [`TRANSPARENT_WRAPPER_PROGRAMS`] and each one's own leading
-/// options, to the command word of the real program they ultimately run:
-/// `nice nohup git -C / status` must be seen as naming `git`, not `nice`.
-/// Consumes each wrapper's own flags the same way a real getopt parser
-/// would — a bare flag, `-n` together with its separate value (see
-/// [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`]), or a literal `--` (consumed,
-/// then stops) — until the first token that is not one of the wrapper's own
-/// flags, which becomes the next candidate command word and is itself
-/// checked for being a further wrapper. Returns `tokens.len()` if a
-/// wrapper's own flags run to the end of the segment with no command word
-/// ever following, so callers that index with the result must check bounds
-/// first — exactly as they already must for any command-word index.
-fn skip_transparent_wrappers(tokens: &[String], mut index: usize) -> usize {
-    while index < tokens.len() && is_transparent_wrapper(&tokens[index]) {
-        index += 1;
-        while index < tokens.len() {
-            let token = tokens[index].as_str();
+/// Resolve one simple command's directory-changing exposure, starting at
+/// `index` — a command word, either the segment's own or a wrapper's exec
+/// target, reached by recursing into this same function: whether it, or
+/// any program it transparently execs in turn, contains a live directory-
+/// changing flag. `None` once `index` runs off the end of `tokens` (a
+/// wrapper whose own flags ran out with no command word following it has
+/// nothing left to resolve).
+///
+/// - A [`TRANSPARENT_WRAPPER_PROGRAMS`] name: skip its own leading flags
+///   (a bare flag, one with a separate value from
+///   [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`], or a literal `--`, which
+///   stops the skip) and recurse into whatever command word follows —
+///   `nice nohup git -C / status` must be seen as naming `git`.
+/// - `env`: walk its own `[OPTION]... [NAME=VALUE]... [COMMAND [ARG]...]`
+///   grammar directly, rather than through the generic wrapper skip above,
+///   since a bare `env -C`/`--chdir` is itself exactly the live flag this
+///   whole function exists to find. In order: a literal `--` ends option
+///   parsing (consumed, then falls through to recursion); a bare `-C`
+///   (see [`is_short_c_flag`]) or `--chdir`/`=value` form denies outright;
+///   one of [`ENV_OPTIONS_WITH_SEPARATE_VALUE`] consumes its separate
+///   value too; any other `-`-prefixed token, or an
+///   [`is_assignment_word`] leading `NAME=VALUE`, is skipped as one more
+///   of `env`'s own leading tokens; the first token that is none of those
+///   is the command `env` execs, recursed into the same way (`env git -C /
+///   status` reaches `git`'s own `-C` this way; `env FOO=bar mytool -C /`
+///   correctly does *not* treat that `-C` as `env`'s own, since it is only
+///   found after recursing into `mytool`).
+/// - Any other program: `None` unless it names one of
+///   [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`], in which case its own
+///   arguments are scanned for a live `-C`, stopping at a literal `--`
+///   unconditionally, and — for `git` specifically, via
+///   [`option_consumes_separate_value`] — at the first token that is
+///   neither `-C` nor one of `git`'s own separate-value options nor
+///   otherwise `-`-prefixed, since that is `git`'s subcommand and anything
+///   after belongs to the subcommand's own argument grammar, not `git`'s
+///   (`git grep -C 1 pattern`'s `-C` belongs to `grep`). `make`/`tar` are
+///   deliberately never stopped early this way: both legitimately repeat
+///   `-C` after a non-option argument already went by (`tar -cf out.tar
+///   file1 -C dir2 file2`), so no subcommand-like boundary is assumed for
+///   either.
+fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
+    let command_word = tokens.get(index)?;
+    let name = Path::new(command_word.as_str())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_word.as_str());
+
+    if TRANSPARENT_WRAPPER_PROGRAMS.contains(&name) {
+        let mut next = index + 1;
+        while next < tokens.len() {
+            let token = tokens[next].as_str();
             if token == "--" {
-                index += 1;
+                next += 1;
                 break;
             }
             if !token.starts_with('-') {
                 break;
             }
             let consumes_next_word = WRAPPER_OPTIONS_WITH_SEPARATE_VALUE.contains(&token);
-            index += 1;
+            next += 1;
             if consumes_next_word {
-                index += 1;
+                next += 1;
+            }
+        }
+        return resolve_directory_flag(tokens, next);
+    }
+
+    if name == "env" {
+        let mut next = index + 1;
+        while next < tokens.len() {
+            let token = tokens[next].as_str();
+            if token == "--" {
+                next += 1;
+                break;
+            }
+            if is_short_c_flag(token) {
+                return Some(format!(
+                    "a directory-changing `-C` flag on `{command_word}`"
+                ));
+            }
+            if ENV_OPTIONS_WITH_SEPARATE_VALUE.contains(&token) {
+                next += 2;
+                continue;
+            }
+            if token.starts_with('-') || is_assignment_word(token) {
+                next += 1;
+                continue;
+            }
+            break;
+        }
+        return resolve_directory_flag(tokens, next);
+    }
+
+    if !names_directory_changing_program(command_word) {
+        return None;
+    }
+    let stop_at_first_positional = name == "git";
+    let mut rest = tokens[index + 1..].iter();
+    while let Some(token) = rest.next() {
+        if token == "--" {
+            break;
+        }
+        if is_short_c_flag(token) {
+            return Some(format!(
+                "a directory-changing `-C` flag on `{command_word}`"
+            ));
+        }
+        if stop_at_first_positional {
+            if option_consumes_separate_value(command_word, token) {
+                rest.next();
+                continue;
+            }
+            if !token.starts_with('-') {
+                break;
             }
         }
     }
-    index
+    None
 }
 
-/// [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`] whose own `-C` only ever
-/// means "change directory" while it appears before the program's first
-/// non-option argument — `git`'s subcommand (`git grep -C 1 pattern`'s `-C`
-/// belongs to `grep`, not to `git` itself, once the subcommand word has
-/// been seen) or `env`'s own `NAME=value`/command tokens (`env FOO=bar
-/// mytool -C src`'s `-C` belongs to `mytool`, which `env` merely execs).
-/// `make` and `tar` are deliberately not listed here: both accept `-C`
-/// intermixed with non-option arguments throughout their own argument list
-/// (`tar -cf out.tar file1 -C dir2 file2` legitimately uses a second `-C`
-/// after a non-option filename already went by), so stopping this scan at
-/// the first non-option token for either would silently stop *finding*
-/// exactly the flag this check exists to catch — a false negative, not
-/// merely an unnecessary denial, so unlike `git`/`env` they are scanned in
-/// full instead.
-const PROGRAMS_SCOPING_SHORT_C_TO_LEADING_OPTIONS: &[&str] = &["git", "env"];
-
 /// Whether `command` contains one of [`UNSAFE_DIRECTORY_FLAGS`] (bare or
-/// with a glued `=value`) anywhere among its plain tokens, or a `-C`
-/// (bare, with its value glued on, or clustered with other short options —
-/// see [`is_short_c_flag`]) among the arguments of a simple command whose
-/// own command word — after unwrapping any
-/// [`TRANSPARENT_WRAPPER_PROGRAMS`], see [`skip_transparent_wrappers`] —
-/// names one of [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`] (see
-/// [`names_directory_changing_program`] for how an absolute or relative
-/// path to that program is matched too). The scan stops at a literal `--`
-/// unconditionally (nothing after it is an option, for any of the four
-/// programs), and — for [`PROGRAMS_SCOPING_SHORT_C_TO_LEADING_OPTIONS`]
-/// only — at the first non-option token too, since a later `-C` there
-/// belongs to a different program's own argument grammar, not to this
-/// command word's.
+/// with a glued `=value`) anywhere among its plain tokens, or — via
+/// [`resolve_directory_flag`], starting from each simple command's own
+/// word — a live directory-changing `-C` on that command word itself, on
+/// any program it transparently execs through [`TRANSPARENT_WRAPPER_PROGRAMS`]
+/// or `env`, or in `env`'s own leading options.
 fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
     for token in shell_tokens(command) {
         let name = token
@@ -597,27 +711,8 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
         let Some(command_word_index) = command_word_index_in_segment(&tokens) else {
             continue;
         };
-        let command_word_index = skip_transparent_wrappers(&tokens, command_word_index);
-        let Some(command_word) = tokens.get(command_word_index) else {
-            continue;
-        };
-        if !names_directory_changing_program(command_word) {
-            continue;
-        }
-        let stop_at_first_positional =
-            PROGRAMS_SCOPING_SHORT_C_TO_LEADING_OPTIONS.contains(&command_word.as_str());
-        for token in &tokens[command_word_index + 1..] {
-            if token == "--" {
-                break;
-            }
-            if is_short_c_flag(token) {
-                return Some(format!(
-                    "a directory-changing `-C` flag on `{command_word}`"
-                ));
-            }
-            if stop_at_first_positional && !token.starts_with('-') {
-                break;
-            }
+        if let Some(reason) = resolve_directory_flag(&tokens, command_word_index) {
+            return Some(reason);
         }
     }
     None
@@ -1942,7 +2037,27 @@ mod tests {
             "env -iC../.. touch .bare/config",
             "nice /usr/bin/git -C / status harmless",
             "nice -n 10 git -C / status",
+            "nice --adjustment 10 git -C / status",
             "nice nohup git -C / status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// `env` with no `-C` of its own still transparently execs whatever
+    /// command follows its leading options/assignments — `env git -C /
+    /// status` must be seen as reaching `git`'s own `-C`, exactly as if
+    /// `env` were not there, the same way `nice`/`nohup`/`setsid` already
+    /// are. `env FOO=bar mytool -C /` must *not* treat that `-C` as
+    /// `env`'s own (it is only live once recursed into `mytool`), so this
+    /// also doubles as another option/command-boundary regression check.
+    #[test]
+    fn unsafe_bash_directory_flag_treats_env_as_a_transparent_wrapper_too() {
+        for command in [
+            "env git -C / status",
+            "env FOO=bar git -C / status",
+            "env -i FOO=bar BAZ=qux git -C / status",
+            "nice env -C / git status",
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
@@ -1959,10 +2074,27 @@ mod tests {
         }
     }
 
+    /// A `git -c`/`env -u`-style separate-value global option, appearing
+    /// before a real `-C`, must not be mistaken for the subcommand boundary
+    /// [`unsafe_bash_directory_flag_respects_option_and_command_boundaries`]
+    /// checks for — its *value* is not a subcommand and must be skipped
+    /// over, or the live `-C` right after it goes unseen.
+    #[test]
+    fn unsafe_bash_directory_flag_still_finds_short_c_past_a_separate_value_option() {
+        for command in [
+            "git -c alias.v=version -C / v",
+            "git --git-dir /somewhere -C / status",
+            "env -u FOO -C / pwd",
+            "env -S 'a b' -C / pwd",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
     /// `tar`/`make` are deliberately not scoped to leading options only
-    /// (see [`PROGRAMS_SCOPING_SHORT_C_TO_LEADING_OPTIONS`]): `tar` in
-    /// particular legitimately repeats `-C` after a non-option filename
-    /// already went by, so this must still be caught in full.
+    /// (see [`resolve_directory_flag`]'s `stop_at_first_positional` rule):
+    /// `tar` in particular legitimately repeats `-C` after a non-option
+    /// filename already went by, so this must still be caught in full.
     #[test]
     fn unsafe_bash_directory_flag_still_scans_tar_and_make_past_a_non_option_argument() {
         for command in ["tar -cf out.tar file1 -C dir2 file2", "make target -C dir"] {
@@ -2006,6 +2138,41 @@ mod tests {
             r#"echo '[a-z]* matches lowercase'"#,
             r#"printf "%s" "a[b]c?d*e""#,
         ] {
+            assert_eq!(
+                unsafe_bash_character(command),
+                None,
+                "{command:?} must not be denied"
+            );
+        }
+    }
+
+    /// The same discovery as `decide_denies_unquoted_glob_metacharacters`,
+    /// for Bash's two other unquoted-word expansions: brace expansion
+    /// (`.{b,b}are/config` becomes the literal path `.bare/config`, twice
+    /// over, while never containing that substring itself) and tilde
+    /// expansion (substitutes `$HOME`/`$PWD`/`$OLDPWD`, none of which this
+    /// scan has access to).
+    #[test]
+    fn decide_denies_unquoted_brace_and_tilde_expansion() {
+        let (root, canonical_bare, canonical_git) = grove();
+        for command in ["cat .b{,}are/config", "cat ~/.bare/config"] {
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().to_path_buf()),
+            };
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert!(
+                matches!(verdict, Verdict::Deny(_)),
+                "{command:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_bash_character_allows_brace_and_tilde_when_quoted() {
+        for command in [r#"echo "a set of {choices}""#, r#"echo '~ marks the spot'"#] {
             assert_eq!(
                 unsafe_bash_character(command),
                 None,
