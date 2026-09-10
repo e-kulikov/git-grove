@@ -80,11 +80,21 @@ const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", ">", ">>", "<", "<<", "
 /// Command words `unsafe_bash_command_word` refuses outright wherever one
 /// appears as a command's first word: each one invalidates the
 /// single-fixed-cwd model `decide` resolves every other candidate
-/// against. `cd`/`pushd`/`popd` change the directory a later command in
-/// the same compound runs in, which nothing here tracks; `eval`/`exec` can
-/// run an arbitrary computed string as a command in its own right, which
-/// nothing here can see into.
-const UNSAFE_COMMAND_WORDS: &[&str] = &["cd", "pushd", "popd", "eval", "exec"];
+/// against, or wraps/dispatches a *nested* command word this scan does not
+/// look inside of. `cd`/`pushd`/`popd` change the directory a later
+/// command in the same compound runs in, which nothing here tracks;
+/// `eval`/`exec`/`command`/`builtin`/`time`/`coproc` can all run another,
+/// arbitrary command word in their own right, which nothing here can see
+/// into; `if`/`while`/`until`/`for`/`case`/`select`/`function`/`{` each
+/// start compound-command grammar whose body can run `cd` (or any of the
+/// above) without ever appearing as this simple command's own first word
+/// (`if cd ..; then :; fi`) — denying the reserved word itself, rather
+/// than trying to look inside the compound command it introduces, is the
+/// same fail-closed choice this whole scan makes everywhere else.
+const UNSAFE_COMMAND_WORDS: &[&str] = &[
+    "cd", "pushd", "popd", "eval", "exec", "command", "builtin", "time", "coproc", "if", "while",
+    "until", "for", "case", "select", "function", "{",
+];
 
 /// Minimal, intentionally forgiving shell tokenizer: honors single/double
 /// quoting and backslash escapes, splits on unquoted whitespace. It is not
@@ -235,7 +245,7 @@ fn split_bash_segments(command: &str) -> Vec<String> {
     let mut current = String::new();
     let mut in_single = false;
     let mut in_double = false;
-    let mut chars = command.chars();
+    let mut chars = command.chars().peekable();
     while let Some(character) = chars.next() {
         match character {
             '\'' if !in_double => {
@@ -251,6 +261,24 @@ fn split_bash_segments(command: &str) -> Vec<String> {
                 if let Some(next) = chars.next() {
                     current.push(next);
                 }
+            }
+            // `&`/`|` glued directly onto a preceding `>`/`<` (`>&`, `<&`,
+            // `>|`) or `&` immediately followed by a `>` at the start of a
+            // fresh word (`&>`, `&>>`) is part of a redirect operator
+            // token, not a command separator — splitting here would hand
+            // `unsafe_command_word_in_segment` a truncated token
+            // (`>`/`<` alone) it would then wrongly treat as fully
+            // recognized, exactly defeating the fail-closed check that
+            // token was supposed to trigger.
+            '&' | '|'
+                if !in_single
+                    && !in_double
+                    && (current.ends_with(['>', '<'])
+                        || (character == '&'
+                            && current.is_empty()
+                            && chars.peek() == Some(&'>'))) =>
+            {
+                current.push(character);
             }
             ';' | '&' | '|' | '\n' if !in_single && !in_double => {
                 segments.push(std::mem::take(&mut current));
@@ -272,6 +300,15 @@ fn split_bash_segments(command: &str) -> Vec<String> {
 /// real command word and this function only needs to know whether *that
 /// one* is unsafe: a redirection or filename appearing *after* the real
 /// command word (`printf x > cd`) is an argument, not a fresh command.
+///
+/// A token that merely *looks* like an assignment or a redirection but
+/// does not match [`is_assignment_word`]/[`redirection_prefix`] exactly
+/// (`A+=x`, `a[0]=x`, a herestring `<<<`, `>&`, `<>`, `>|`, …) is denied
+/// outright rather than treated as the real command word: falling through
+/// to "it must be the command word, and it's not on the unsafe list" for a
+/// token this scan does not actually understand is exactly the kind of
+/// silent, ungrounded assumption the fail-closed design exists to refuse.
+/// See [`looks_like_unrecognized_prefix`].
 fn unsafe_command_word_in_segment(segment: &str) -> Option<String> {
     let tokens = shell_tokens(segment);
     let mut index = 0;
@@ -290,6 +327,11 @@ fn unsafe_command_word_in_segment(segment: &str) -> Option<String> {
                 index += 1;
             }
             continue;
+        }
+        if looks_like_unrecognized_prefix(token) {
+            return Some(format!(
+                "an assignment or redirection prefix (`{token}`) whose grammar is not fully recognized"
+            ));
         }
         return UNSAFE_COMMAND_WORDS
             .contains(&token)
@@ -313,14 +355,24 @@ fn is_assignment_word(token: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-/// Whether `token` is a redirection operator that can legitimately precede
-/// the real command word (`>out cd ..`, `2>&1 cd ..`) — the same
-/// digit-prefix-then-operator shape [`split_redirections`] strips a
-/// redirection off of, checked instead at the *start* of the whole token.
-/// `None` if `token` is not a redirection at all. `Some(true)` if it is a
-/// *bare* operator with no target glued onto it (`>`, `2>>`), meaning the
-/// following word is its target and must be skipped too; `Some(false)` if
-/// the target is already glued on (`>out`, `2>>log`).
+/// Whether `token` is a redirection operator this scan fully understands,
+/// that can legitimately precede the real command word (`>out cd ..`,
+/// `2>&1 cd ..`) — the same digit-prefix-then-operator shape
+/// [`split_redirections`] strips a redirection off of, checked instead at
+/// the *start* of the whole token, and restricted to exactly `<`, `<<`,
+/// `>`, or `>>`. `None` if `token` does not match this precisely: neither
+/// "not a redirection at all" nor "some other redirection form this scan
+/// does not fully understand" (a herestring `<<<`, `>&`, `<>`, `>|`, …)
+/// can safely be treated the same as "definitely not one" here — see
+/// [`looks_like_unrecognized_prefix`], which the caller checks next to
+/// tell those two apart. `Some(true)` if the matched operator is *bare*,
+/// with no target glued onto it (`>`, `2>>`), meaning the following word
+/// is its target and must be skipped too; `Some(false)` if the target is
+/// already glued on (`>out`, `2>>log`) — glued text that itself starts
+/// with another redirect-special character (`>&`'s `&`, a herestring's
+/// third `<`) does not count as an ordinary glued target and falls
+/// through to `None` instead, precisely because that shape is one of the
+/// forms this function does not fully understand.
 fn redirection_prefix(token: &str) -> Option<bool> {
     let digit_end = token
         .find(|character: char| !character.is_ascii_digit())
@@ -328,10 +380,45 @@ fn redirection_prefix(token: &str) -> Option<bool> {
     let rest = &token[digit_end..];
     for operator in [">>", "<<", ">", "<"] {
         if let Some(target) = rest.strip_prefix(operator) {
-            return Some(target.is_empty());
+            if target.is_empty() {
+                return Some(true);
+            }
+            return if target.starts_with(['<', '>', '&', '|']) {
+                None
+            } else {
+                Some(false)
+            };
         }
     }
     None
+}
+
+/// Whether `token` looks like it is attempting to be an assignment or
+/// redirection prefix — starts (after an optional digit file-descriptor
+/// prefix) with `<` or `>`, or contains an unquoted `=` that is not its
+/// first character — without matching [`is_assignment_word`] or
+/// [`redirection_prefix`] exactly. Bash has more assignment and
+/// redirection grammar than those two functions fully model (compound
+/// assignment `NAME+=value`, array-element assignment `name[0]=value`, a
+/// herestring `<<<`, combined-stream and clobber-override redirects `>&`/
+/// `<>`/`>|`, …), and each of those can precede the real command word
+/// exactly as legitimately as the forms that are recognized — the point of
+/// this check is to fail closed on all of them at once, rather than
+/// enumerating every spelling one at a time.
+fn looks_like_unrecognized_prefix(token: &str) -> bool {
+    let digit_end = token
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(token.len());
+    if matches!(
+        token.as_bytes()[digit_end..].first(),
+        Some(b'<') | Some(b'>')
+    ) {
+        return true;
+    }
+    token
+        .char_indices()
+        .skip(1)
+        .any(|(_, character)| character == '=')
 }
 
 /// Find the earliest unquoted redirection operator (`>`, `>>`, `<`, `<<`)
@@ -956,5 +1043,58 @@ mod tests {
         assert_eq!(unsafe_bash_command_word("X=1 git status"), None);
         assert_eq!(unsafe_bash_command_word(">out.log git status"), None);
         assert_eq!(unsafe_bash_command_word("true; git status"), None);
+    }
+
+    /// exec-reviewer's second-round finding on the command-word scan: a
+    /// dispatch wrapper (`command`/`builtin`), a reserved word introducing
+    /// compound grammar (`if ... fi`), a compound-assignment prefix
+    /// (`A+=x`), and four redirection forms this scan does not fully
+    /// model (a herestring, and the combined-stream/clobber-override/
+    /// read-write spellings) each still hide `cd` from the previous
+    /// design. Each must now be denied -- the dispatch/reserved words by
+    /// being on the unsafe list directly, the rest by
+    /// `looks_like_unrecognized_prefix` refusing to guess.
+    #[test]
+    fn unsafe_bash_command_word_denies_dispatch_wrappers_reserved_words_and_unrecognized_prefixes()
+    {
+        for command in [
+            "command cd ..",
+            "builtin cd ..",
+            "if cd ..; then :; fi",
+            "A+=x cd ..",
+            "<<< x cd ..",
+            ">& 2 cd ..",
+            "<> file cd ..",
+            ">| file cd ..",
+        ] {
+            assert!(
+                unsafe_bash_command_word(command).is_some(),
+                "expected {command:?} to be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_denies_each_dispatch_reserved_word_and_unrecognized_prefix_bypass() {
+        for command in [
+            "command cd ..",
+            "builtin cd ..",
+            "if cd ..; then :; fi",
+            "A+=x cd ..",
+        ] {
+            let (root, canonical_bare, canonical_git) = grove();
+            std::fs::create_dir(root.path().join("main")).unwrap();
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().join("main")),
+            };
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert!(
+                matches!(verdict, Verdict::Deny(_)),
+                "{command:?}: {verdict:?}"
+            );
+        }
     }
 }
