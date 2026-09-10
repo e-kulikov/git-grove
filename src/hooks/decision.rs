@@ -538,30 +538,124 @@ const TRANSPARENT_WRAPPER_PROGRAMS: &[&str] = &["nice", "nohup", "setsid"];
 /// they run.
 const WRAPPER_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-n", "--adjustment"];
 
-/// `env`'s own long-standing options that take their value as a separate
-/// following word rather than only glued on (`env -u FOO cmd`, not only
-/// `env -uFOO cmd`) — the same shape [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`]
-/// exists for. `-C`/`--chdir` are deliberately excluded: finding either
-/// bare is the match [`resolve_directory_flag`]'s `env` arm is looking for,
-/// not something to skip past.
-const ENV_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-u", "--unset", "-S", "--split-string"];
+/// `env`'s own one-letter short options that take no value at all
+/// (`-i`/`--ignore-environment`, `-0`/`--null`, `-v`/`--debug`) — see
+/// [`short_option_cluster_needs_separate_value`], which this classifies
+/// GNU-style clustering against. `-C` is deliberately excluded even
+/// though it is also a short option: [`resolve_directory_flag`]'s `env`
+/// arm checks for it, via [`is_short_c_flag`], before consulting this at
+/// all, since finding it is the match that arm is looking for, not
+/// something to classify and skip past.
+const ENV_NO_VALUE_SHORT_FLAGS: &str = "i0v";
 
-/// `timeout`'s own short and long options that take their value as a
-/// separate following word rather than only glued on — the same shape
-/// [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`] exists for. `timeout` is not
-/// one of [`TRANSPARENT_WRAPPER_PROGRAMS`], and gets its own arm in
-/// [`resolve_directory_flag`] instead of being added to that list: unlike
-/// `nice`/`nohup`/`setsid`, its grammar (`timeout [OPTION] DURATION
-/// COMMAND [ARG]...`) has a mandatory positional `DURATION` between its
-/// own options and the command it execs, which the generic wrapper skip
-/// (options only, no bare positional) does not account for.
-const TIMEOUT_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-k", "--kill-after", "-s", "--signal"];
+/// `env`'s own one-letter short options that take a value, either glued
+/// on (`-uFOO`) or as a separate following word (`-u FOO`) — see
+/// [`short_option_cluster_needs_separate_value`].
+const ENV_VALUE_SHORT_FLAGS: &str = "uS";
+
+/// `env`'s own long options that take no value at all.
+const ENV_NO_VALUE_LONG_OPTIONS: &[&str] = &[
+    "--ignore-environment",
+    "--null",
+    "--debug",
+    "--help",
+    "--version",
+];
+
+/// `env`'s own long options that take a value, either glued on via `=`
+/// (`--unset=FOO`) or as a separate following word (`--unset FOO`).
+const ENV_VALUE_LONG_OPTIONS: &[&str] = &["--unset", "--split-string"];
+
+/// `timeout`'s own one-letter short options that take no value at all
+/// (`-f`/`--foreground`, `-p`/`--preserve-status`, `-v`/`--verbose`).
+const TIMEOUT_NO_VALUE_SHORT_FLAGS: &str = "fpv";
+
+/// `timeout`'s own one-letter short options that take a value, either
+/// glued on (`-k5`) or as a separate following word (`-k 5`).
+const TIMEOUT_VALUE_SHORT_FLAGS: &str = "ks";
+
+/// `timeout`'s own long options that take no value at all.
+const TIMEOUT_NO_VALUE_LONG_OPTIONS: &[&str] = &[
+    "--foreground",
+    "--preserve-status",
+    "--verbose",
+    "--help",
+    "--version",
+];
+
+/// `timeout`'s own long options that take a value, either glued on via
+/// `=` (`--kill-after=5`) or as a separate following word.
+const TIMEOUT_VALUE_LONG_OPTIONS: &[&str] = &["--kill-after", "--signal"];
+
+/// Classify one `-`-prefixed, non-`--` option token — a single short flag
+/// or several bundled together, GNU-getopt style (`-i`, `-iv`, `-uFOO`,
+/// `-ivuFOO`) — against a wrapper's own complete, fixed set of one-letter
+/// options of each kind. Only the *last* letter in a bundle may carry a
+/// value, exactly like real getopt short-option clustering: `env -iuFOO`
+/// is `-i -u FOO`(glued), not `-i -u -F -O -O`. Returns:
+///
+/// - `Some(true)` if the bundle is fully recognized and its last letter is
+///   a value-taking flag with *nothing* glued after it, so the value is
+///   the next separate word (`env -iu FOO` → `-i`, `-u` needing `FOO`).
+/// - `Some(false)` if the bundle is fully recognized and needs no separate
+///   word — every letter is a no-value flag, or the last is value-taking
+///   with its value already glued on (`env -iuFOO` → `-i`, `-u` with `FOO`
+///   glued).
+/// - `None` if any letter in the bundle is not one of the two given sets
+///   at all: an unrecognized option must never be silently treated as
+///   "no value" (that is exactly the miscount that let `env -iu FOO -C /
+///   cmd` slip through before this function existed — `-iu`, treated as a
+///   bare flag, consumed nothing, so `FOO` was mistaken for `env`'s
+///   command instead of `-u`'s value), so callers must fail closed on
+///   `None` instead of guessing.
+fn short_option_cluster_needs_separate_value(
+    token: &str,
+    no_value_flags: &str,
+    value_flags: &str,
+) -> Option<bool> {
+    let rest = token.strip_prefix('-')?;
+    if rest.is_empty() || rest.starts_with('-') {
+        return None;
+    }
+    let mut chars = rest.chars();
+    while let Some(letter) = chars.next() {
+        if value_flags.contains(letter) {
+            return Some(chars.next().is_none());
+        }
+        if !no_value_flags.contains(letter) {
+            return None;
+        }
+    }
+    Some(false)
+}
+
+/// Classify one `--`-prefixed long option token — with an optional glued
+/// `=value` — against a wrapper's own complete, fixed set of long
+/// options of each kind. Same three-way result as
+/// [`short_option_cluster_needs_separate_value`], for the same reason:
+/// `None` (unrecognized) must never be treated the same as `Some(false)`
+/// (recognized, needs nothing more).
+fn long_option_needs_separate_value(
+    token: &str,
+    no_value_options: &[&str],
+    value_options: &[&str],
+) -> Option<bool> {
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    if value_options.contains(&name) {
+        return Some(!token.contains('='));
+    }
+    if no_value_options.contains(&name) {
+        return Some(false);
+    }
+    None
+}
 
 /// Whether `token` is one of `git`'s own long-standing global options that
 /// takes its value as a separate following word, rather than only glued
-/// onto the flag itself — the same shape
-/// [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`]/[`ENV_OPTIONS_WITH_SEPARATE_VALUE`]
-/// exist for. This only matters for [`resolve_directory_flag`]'s stop-at-
+/// onto the flag itself — the same question
+/// [`short_option_cluster_needs_separate_value`]/[`long_option_needs_separate_value`]
+/// answer for `env`/`timeout`. This only matters for
+/// [`resolve_directory_flag`]'s stop-at-
 /// first-non-option-token rule for `git`: without skipping the value too,
 /// `git -c alias.v=version -C / v`'s `alias.v=version` (the *value* of
 /// `-c`, not a subcommand) would wrongly look like the boundary and hide
@@ -596,25 +690,27 @@ fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
 ///   [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`], or a literal `--`, which
 ///   stops the skip) and recurse into whatever command word follows —
 ///   `nice nohup git -C / status` must be seen as naming `git`.
-/// - `timeout`: the same wrapper skip, plus one more step its own grammar
-///   requires and `TRANSPARENT_WRAPPER_PROGRAMS` never has to: a mandatory
-///   `DURATION` positional between its own options
-///   ([`TIMEOUT_OPTIONS_WITH_SEPARATE_VALUE`]) and the command it execs,
-///   unconditionally skipped once (not gated on looking option-like, since
-///   `timeout`'s grammar always has exactly one there whenever a command
-///   follows at all) before recursing — `timeout 2 git -C / status` must
-///   be seen as naming `git`, not `2`.
-/// - `env`: walk its own `[OPTION]... [NAME=VALUE]... [COMMAND [ARG]...]`
-///   grammar directly, rather than through the generic wrapper skip above,
-///   since a bare `env -C`/`--chdir` is itself exactly the live flag this
-///   whole function exists to find. In order: a literal `--` ends option
-///   parsing (consumed, then falls through to recursion); a bare `-C`
-///   (see [`is_short_c_flag`]) or `--chdir`/`=value` form denies outright;
-///   one of [`ENV_OPTIONS_WITH_SEPARATE_VALUE`] consumes its separate
-///   value too; any other `-`-prefixed token, or an
-///   [`is_assignment_word`] leading `NAME=VALUE`, is skipped as one more
-///   of `env`'s own leading tokens; the first token that is none of those
-///   is the command `env` execs, recursed into the same way (`env git -C /
+/// - `timeout`/`env`: each walks its own option grammar directly via
+///   [`short_option_cluster_needs_separate_value`] (bundled short flags —
+///   `env -iu FOO` is `-i`, then `-u` needing `FOO` as its separate value,
+///   not one bare flag `-iu` that consumes nothing) and
+///   [`long_option_needs_separate_value`], denying outright on any option
+///   token neither recognizes rather than guessing how many words it
+///   spans — silently guessing "no value" for an unrecognized option is
+///   exactly the miscount that let `env -iu FOO -C / cmd` slip through
+///   before these functions existed. `timeout` additionally has one more
+///   step `TRANSPARENT_WRAPPER_PROGRAMS` never needs: a mandatory
+///   `DURATION` positional between its own options and the command it
+///   execs, unconditionally skipped once (not gated on looking
+///   option-like, since `timeout`'s grammar always has exactly one there
+///   whenever a command follows at all) before recursing — `timeout 2 git
+///   -C / status` must be seen as naming `git`, not `2`. `env` also has
+///   its own bare `-C`/`--chdir`, checked before consulting either
+///   classifier at all, since finding it is itself exactly the live flag
+///   this whole function exists to find; a leading `NAME=VALUE` (see
+///   [`is_assignment_word`]) is skipped as one more of `env`'s own leading
+///   tokens. Either way, the first token that is none of those is the
+///   command the wrapper execs, recursed into the same way (`env git -C /
 ///   status` reaches `git`'s own `-C` this way; `env FOO=bar mytool -C /`
 ///   correctly does *not* treat that `-C` as `env`'s own, since it is only
 ///   found after recursing into `mytool`).
@@ -669,9 +765,26 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             if !token.starts_with('-') {
                 break;
             }
-            let consumes_next_word = TIMEOUT_OPTIONS_WITH_SEPARATE_VALUE.contains(&token);
+            let needs_value = if token.starts_with("--") {
+                long_option_needs_separate_value(
+                    token,
+                    TIMEOUT_NO_VALUE_LONG_OPTIONS,
+                    TIMEOUT_VALUE_LONG_OPTIONS,
+                )
+            } else {
+                short_option_cluster_needs_separate_value(
+                    token,
+                    TIMEOUT_NO_VALUE_SHORT_FLAGS,
+                    TIMEOUT_VALUE_SHORT_FLAGS,
+                )
+            };
+            let Some(needs_value) = needs_value else {
+                return Some(format!(
+                    "an unrecognized option (`{token}`) on `{command_word}`"
+                ));
+            };
             next += 1;
-            if consumes_next_word {
+            if needs_value {
                 next += 1;
             }
         }
@@ -698,11 +811,39 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                     "a directory-changing `-C` flag on `{command_word}`"
                 ));
             }
-            if ENV_OPTIONS_WITH_SEPARATE_VALUE.contains(&token) {
-                next += 2;
+            if token.starts_with("--") {
+                let Some(needs_value) = long_option_needs_separate_value(
+                    token,
+                    ENV_NO_VALUE_LONG_OPTIONS,
+                    ENV_VALUE_LONG_OPTIONS,
+                ) else {
+                    return Some(format!(
+                        "an unrecognized option (`{token}`) on `{command_word}`"
+                    ));
+                };
+                next += 1;
+                if needs_value {
+                    next += 1;
+                }
                 continue;
             }
-            if token.starts_with('-') || is_assignment_word(token) {
+            if token.starts_with('-') {
+                let Some(needs_value) = short_option_cluster_needs_separate_value(
+                    token,
+                    ENV_NO_VALUE_SHORT_FLAGS,
+                    ENV_VALUE_SHORT_FLAGS,
+                ) else {
+                    return Some(format!(
+                        "an unrecognized option (`{token}`) on `{command_word}`"
+                    ));
+                };
+                next += 1;
+                if needs_value {
+                    next += 1;
+                }
+                continue;
+            }
+            if is_assignment_word(token) {
                 next += 1;
                 continue;
             }
@@ -2151,6 +2292,53 @@ mod tests {
             "env -u FOO -C / pwd",
             "env -S 'a b' -C / pwd",
         ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's own probe (`env -iu FOO ...`, `timeout -vk 1 2
+    /// ...`): a value-taking short option bundled together with other
+    /// short flags in one GNU-getopt-style cluster (`-iu`, `-vk`) was
+    /// previously matched only by its bare exact form (`-u`, `-k`), so the
+    /// cluster was wrongly treated as a no-value flag that consumed
+    /// nothing — silently hiding the real command word (and its own live
+    /// `-C`) one position too early. `short_option_cluster_needs_separate_value`
+    /// closes this by classifying the whole bundle, not just an exact
+    /// match.
+    #[test]
+    fn unsafe_bash_directory_flag_finds_short_c_past_a_clustered_separate_value_option() {
+        for command in [
+            "env -iu FOO -C / git status",
+            "timeout -vk 1 2 git -C / status",
+            "env -iuFOO -C / git status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// The same clustering, with no `-C` anywhere, must still be allowed —
+    /// `short_option_cluster_needs_separate_value` correctly recognizing a
+    /// bundle must not turn into over-denial of the ordinary case.
+    #[test]
+    fn unsafe_bash_directory_flag_allows_ordinary_clustered_options_with_no_c() {
+        for command in ["env -iu FOO sh -c 'true'", "timeout -vk 1 2 sh -c 'true'"] {
+            assert_eq!(
+                unsafe_bash_directory_flag(command),
+                None,
+                "{command:?} must not be denied"
+            );
+        }
+    }
+
+    /// An option this scan does not recognize at all — on `env` or
+    /// `timeout`'s own leading-option grammar — must fail closed rather
+    /// than be silently treated as a no-value flag that consumes nothing:
+    /// treating an unrecognized option as "no value" is exactly the kind
+    /// of miscounted skip that hid a live `-C` in the clustering bypass
+    /// above.
+    #[test]
+    fn unsafe_bash_directory_flag_denies_an_unrecognized_option_on_env_or_timeout() {
+        for command in ["env -zzz FOO cmd", "timeout --bogus 2 cmd"] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
     }
