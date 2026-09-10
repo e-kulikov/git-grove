@@ -2763,6 +2763,28 @@ mod tests {
         }
     }
 
+    /// exec-reviewer's own follow-up probe: within an assignment word, the
+    /// `:`-triggered tilde boundary requires the `:` itself to be
+    /// unquoted, not merely present — confirmed four ways directly
+    /// against Bash: `A="x:"~` and `B=x":"~` (colon quoted either way) do
+    /// not expand; `C="x":~` (colon unquoted, outside the quotes) does;
+    /// `D=x:"~"` (tilde itself quoted) does not.
+    #[test]
+    fn unsafe_bash_character_requires_the_colon_itself_to_be_unquoted_in_an_assignment() {
+        for command in [
+            r#"A="x:"~ echo hi"#,
+            r#"B=x":"~ echo hi"#,
+            r#"D=x:"~" echo hi"#,
+        ] {
+            assert_eq!(
+                unsafe_bash_character(command),
+                None,
+                "{command:?} must not be denied"
+            );
+        }
+        assert!(unsafe_bash_character(r#"C="x":~ echo hi"#).is_some());
+    }
+
     /// exec-reviewer's own regression probe: a backslash-newline line
     /// continuation is a true no-op (both characters vanish, joining the
     /// next line directly onto this one, confirmed against Bash both
