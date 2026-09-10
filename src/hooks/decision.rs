@@ -345,6 +345,51 @@ fn unsafe_bash_construct(command: &str) -> Option<String> {
     None
 }
 
+/// Whether the unquoted `{` at byte offset `open` in `command` opens a
+/// *live* Bash brace expansion — one Bash will actually expand, not
+/// merely literal use of the character (`find ... -exec cmd {} \;`'s
+/// placeholder, or a shell function/compound-command body's own `{
+/// ...; }`, neither of which contains what Bash requires: at least one
+/// unquoted comma, or a `..` range, somewhere between a matching pair of
+/// braces). Scans forward from `open`, tracking brace nesting depth and
+/// quote state the same way the rest of this file does, until the
+/// matching close brace at depth zero; returns whether a comma was seen
+/// at any nesting level within that span, or the span's text contains
+/// `..` (a coarse but safely conservative stand-in for Bash's exact
+/// `{x..y}`/`{x..y..z}` sequence grammar — over-matching here only costs
+/// an unnecessary denial, never a miss). `false` if the brace is never
+/// closed at all: an unmatched `{` with no comma/range inside is simply
+/// literal text to Bash either way, and an unterminated *quote* opened
+/// while scanning for the match is separately, unconditionally denied by
+/// this function's caller already.
+fn looks_like_live_brace_expansion(command: &str, open: usize) -> bool {
+    let bytes = command.as_bytes();
+    let mut depth: usize = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut has_comma = false;
+    let mut index = open;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'\\' if !in_single => index += 1,
+            b'{' if !in_single && !in_double => depth += 1,
+            b'}' if !in_single && !in_double => {
+                depth -= 1;
+                if depth == 0 {
+                    let inner = &command[open + 1..index];
+                    return has_comma || inner.contains("..");
+                }
+            }
+            b',' if !in_single && !in_double && depth >= 1 => has_comma = true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 /// Scan `command` character by character, tracking the same quote state
 /// [`shell_tokens`] tracks (deliberately re-derived here, not shared,
 /// since this check must not itself decide where tokens split — see
@@ -390,8 +435,8 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
     // regardless of position was a real false-positive regression on an
     // extremely common command.
     let mut at_word_start = true;
-    let mut chars = command.chars().peekable();
-    while let Some(character) = chars.next() {
+    let mut chars = command.char_indices().peekable();
+    while let Some((byte_index, character)) = chars.next() {
         let word_start = at_word_start;
         at_word_start = !in_single
             && !in_double
@@ -433,19 +478,32 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
                     "an unquoted `{character}` (Bash pathname expansion, whose result this scan cannot predict)"
                 ));
             }
-            '{' if !in_single && !in_double => {
+            '{' if !in_single
+                && !in_double
+                && looks_like_live_brace_expansion(command, byte_index) =>
+            {
                 // Brace expansion (`.{b,b}are/config`, `.b{,}are`) is, like
                 // pathname expansion, inert inside either quote style, and
                 // for the same reason denied outright rather than modeled:
                 // predicting its expanded words would mean re-implementing
                 // Bash's own brace-expansion grammar, not just recognizing
-                // a construct exists. This also subsumes the compound-
-                // command-group reading of a bare `{` this scan already
-                // denies as a command word (`UNSAFE_COMMAND_WORDS`) — that
-                // check only ever sees `{` in command-word position, this
-                // one catches it anywhere in the token.
+                // a construct exists. Gated on
+                // `looks_like_live_brace_expansion`, unlike the pathname
+                // characters above: Bash itself only expands a `{...}`
+                // group that contains a comma or a `..` range directly
+                // inside it — a bare `{}`/`{single}` is left completely
+                // literal, and `find ... -exec cmd {} \;`'s placeholder is
+                // exactly that shape, denying it outright was a real
+                // false-positive regression on an extremely common
+                // command. This also subsumes the compound-command-group
+                // reading of a bare `{` this scan already denies as a
+                // command word (`UNSAFE_COMMAND_WORDS`) only when it's
+                // actually live — a `{ cmd; }` group's own body always has
+                // more than a bare pair of braces, so the existing
+                // command-word check still catches it independently, and
+                // is unaffected by this gate.
                 return Some(
-                    "an unquoted `{` (Bash brace expansion, whose result this scan cannot predict)"
+                    "an unquoted `{...}` (Bash brace expansion, whose result this scan cannot predict)"
                         .to_string(),
                 );
             }
@@ -2512,6 +2570,34 @@ mod tests {
             assert!(
                 matches!(verdict, Verdict::Deny(_)),
                 "{command:?}: {verdict:?}"
+            );
+        }
+    }
+
+    /// exec-reviewer's own regression probe: `find ... -exec cmd {} \;`'s
+    /// placeholder is an extremely common idiom, and Bash never expands a
+    /// bare `{}` (or any single, comma-/range-free `{word}`) at all —
+    /// unconditional denial on the mere presence of `{` was a real
+    /// false-positive regression, the same shape as the tilde one.
+    /// `looks_like_live_brace_expansion` must still catch the cases that
+    /// really do expand.
+    #[test]
+    fn unsafe_bash_character_allows_non_expanding_braces_but_still_denies_live_ones() {
+        for command in [
+            r#"find . -name "*.txt" -exec cat {} \;"#,
+            "echo {}",
+            "echo {single}",
+        ] {
+            assert_eq!(
+                unsafe_bash_character(command),
+                None,
+                "{command:?} must not be denied"
+            );
+        }
+        for command in ["cat .b{,}are/config", "echo {1..5}", "echo {a..z}"] {
+            assert!(
+                unsafe_bash_character(command).is_some(),
+                "{command:?} must be denied"
             );
         }
     }
