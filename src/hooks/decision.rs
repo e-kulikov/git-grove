@@ -425,25 +425,52 @@ fn looks_like_live_brace_expansion(command: &str, open: usize) -> bool {
 fn unsafe_bash_character(command: &str) -> Option<String> {
     let mut in_single = false;
     let mut in_double = false;
-    // Whether the character about to be matched sits at the start of a
-    // word (or right after `=`/`:`, the two extra positions Bash also
-    // tilde-expands from — `FOO=~/x`, a `PATH`-like `~/a:~/b`) — tracked
-    // only for `~` below: unlike every other character this scan flags
-    // anywhere in a word, Bash only tilde-expands from one of these
-    // specific positions, never mid-word. `git log HEAD~3..HEAD`'s `~` is
-    // ordinary revision syntax, not live tilde expansion, and denying it
-    // regardless of position was a real false-positive regression on an
-    // extremely common command.
-    let mut at_word_start = true;
+    // Whether the character about to be matched is a position Bash would
+    // tilde-expand from — tracked only for `~` below, since unlike every
+    // other character this scan flags anywhere in a word, Bash only
+    // tilde-expands from specific positions, never arbitrarily mid-word:
+    // the start of a word (`~/x`), or — strictly within a word that is
+    // *itself* shaped like a `NAME=value` assignment, not any word that
+    // merely contains `=`/`:` — right after the first `=` or any later
+    // unquoted `:` (`FOO=~/x`, a `PATH`-like `FOO=~/a:~/b`). Both
+    // `git log HEAD~3..HEAD` (a bare `~` mid-word, no assignment shape at
+    // all) and `scp host:~/file` (a `:` inside an ordinary argument that
+    // is not a `NAME=value` word — confirmed against real Bash: this `~`
+    // does not expand) are real commands whose `~` must not be flagged;
+    // `assignment_prefix_ok`/`assignment_confirmed` track, per word,
+    // whether it still could be — or already is — assignment-shaped, the
+    // same shape [`is_assignment_word`] recognizes, so the `:`-triggered
+    // boundary only ever fires inside one.
+    let mut tilde_boundary = true;
+    let mut assignment_prefix_ok = true;
+    let mut assignment_confirmed = false;
     let mut chars = command.char_indices().peekable();
     while let Some((byte_index, character)) = chars.next() {
-        let word_start = at_word_start;
-        at_word_start = !in_single
-            && !in_double
-            && matches!(
-                character,
-                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '=' | ':' | '<' | '>'
-            );
+        let word_start = tilde_boundary;
+        if in_single || in_double {
+            tilde_boundary = false;
+        } else if matches!(
+            character,
+            ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+        ) {
+            // A fresh word starts right after any of these — reset the
+            // per-word assignment-shape tracking too.
+            tilde_boundary = true;
+            assignment_prefix_ok = true;
+            assignment_confirmed = false;
+        } else if assignment_confirmed {
+            tilde_boundary = character == ':';
+        } else if assignment_prefix_ok {
+            if character == '=' {
+                assignment_confirmed = true;
+                tilde_boundary = true;
+            } else {
+                assignment_prefix_ok = character.is_ascii_alphanumeric() || character == '_';
+                tilde_boundary = false;
+            }
+        } else {
+            tilde_boundary = false;
+        }
         match character {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
@@ -2640,6 +2667,31 @@ mod tests {
             "cat ~root/somewhere",
             "FOO=~/bar echo hi",
         ] {
+            assert!(
+                unsafe_bash_character(command).is_some(),
+                "{command:?} must be denied"
+            );
+        }
+    }
+
+    /// exec-reviewer's own follow-up regression probe: Bash only expands a
+    /// `~` right after a `:` when the *whole word* is itself a
+    /// `NAME=value` assignment (`FOO=x:~`, `PATH`-like) — not in an
+    /// ordinary argument that merely contains a colon. `scp host:~/file`
+    /// is real, common remote-path syntax whose `~` does not expand
+    /// (confirmed directly against Bash), and the first version of the
+    /// `:`-boundary rule denied it and `echo x:~` outright regardless of
+    /// assignment shape.
+    #[test]
+    fn unsafe_bash_character_only_treats_colon_as_a_tilde_boundary_inside_an_assignment_word() {
+        for command in ["scp host:~/somewhere .", "echo x:~", "echo a:b:~c"] {
+            assert_eq!(
+                unsafe_bash_character(command),
+                None,
+                "{command:?} must not be denied"
+            );
+        }
+        for command in ["FOO=x:~ echo hi", "FOO=a:b:~ echo hi"] {
             assert!(
                 unsafe_bash_character(command).is_some(),
                 "{command:?} must be denied"
