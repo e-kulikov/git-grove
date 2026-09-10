@@ -1248,25 +1248,28 @@ fn is_assignment_word(token: &str) -> bool {
 
 /// Whether `token` is one of `env`'s own leading `NAME=VALUE` arguments —
 /// deliberately more permissive than [`is_assignment_word`]: real GNU
-/// `env` performs no identifier validation on the name half at all, it
-/// simply treats any non-option argument containing an `=` (not as its
-/// first character) as an assignment to make in the child's environment
-/// before exec'ing the command (confirmed directly: `env 'X.Y=z' printenv
-/// X.Y` sets it despite the `.`, which `is_assignment_word` would reject
-/// as not a valid shell identifier). Reusing `is_assignment_word`'s
-/// stricter shell-identifier rule here meant `env X.Y=z git -C / status`
-/// stopped this arm's scan at `X.Y=z`, mistaking `env`'s own real
-/// assignment argument for the boundary and never reaching `git`'s own
-/// live `-C` right after it — a real, unquoted-command miss (the quoted
-/// form happened to still be caught, coincidentally, by this file's
+/// `env` performs no identifier validation on the name half at all, and
+/// does not even require a non-empty one. It simply treats any
+/// non-option argument containing an `=` anywhere as an assignment to
+/// make in the child's environment before exec'ing the command —
+/// confirmed directly, three ways: `env 'X.Y=z' printenv X.Y` sets it
+/// despite the `.` (which `is_assignment_word` would reject as not a
+/// valid shell identifier); `env '=z' echo reached` and even `env '='
+/// echo reached` both still reach and run `echo`, with an entirely empty
+/// name. Reusing `is_assignment_word`'s stricter shell-identifier rule
+/// here — or requiring a non-empty name, an earlier, still-too-strict
+/// version of this same function — meant `env X.Y=z git -C / status` and
+/// `env '=z' git -C / status` both stopped this arm's scan at the
+/// assignment token itself, mistaking `env`'s own real assignment
+/// argument for the boundary and never reaching `git`'s own live `-C`
+/// right after it — a real, unquoted-command miss (the quoted form of the
+/// first happened to still be caught, coincidentally, by this file's
 /// separate unrecognized-prefix check on `command_word_index_in_segment`,
 /// which does apply the stricter shell rule, but only because recursing
 /// into a quoted token treats its content as its own freestanding command
 /// line; the unquoted form has no such recursion to fall back on).
 fn looks_like_env_assignment(token: &str) -> bool {
-    token
-        .split_once('=')
-        .is_some_and(|(name, _)| !name.is_empty())
+    token.contains('=')
 }
 
 /// Whether `token` is a redirection operator this scan fully understands,
@@ -2449,7 +2452,12 @@ mod tests {
     /// which has no `env`-specific leniency at all).
     #[test]
     fn unsafe_bash_directory_flag_accepts_envs_own_looser_assignment_shape() {
-        for command in ["env X.Y=z git -C / status", "env 'X.Y=z' git -C / status"] {
+        for command in [
+            "env X.Y=z git -C / status",
+            "env 'X.Y=z' git -C / status",
+            "env '=z' git -C / status",
+            "env '=' git -C / status",
+        ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
     }
