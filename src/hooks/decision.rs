@@ -986,7 +986,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 }
                 continue;
             }
-            if is_assignment_word(token) {
+            if looks_like_env_assignment(token) {
                 next += 1;
                 continue;
             }
@@ -1244,6 +1244,29 @@ fn is_assignment_word(token: &str) -> bool {
         && name
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Whether `token` is one of `env`'s own leading `NAME=VALUE` arguments —
+/// deliberately more permissive than [`is_assignment_word`]: real GNU
+/// `env` performs no identifier validation on the name half at all, it
+/// simply treats any non-option argument containing an `=` (not as its
+/// first character) as an assignment to make in the child's environment
+/// before exec'ing the command (confirmed directly: `env 'X.Y=z' printenv
+/// X.Y` sets it despite the `.`, which `is_assignment_word` would reject
+/// as not a valid shell identifier). Reusing `is_assignment_word`'s
+/// stricter shell-identifier rule here meant `env X.Y=z git -C / status`
+/// stopped this arm's scan at `X.Y=z`, mistaking `env`'s own real
+/// assignment argument for the boundary and never reaching `git`'s own
+/// live `-C` right after it — a real, unquoted-command miss (the quoted
+/// form happened to still be caught, coincidentally, by this file's
+/// separate unrecognized-prefix check on `command_word_index_in_segment`,
+/// which does apply the stricter shell rule, but only because recursing
+/// into a quoted token treats its content as its own freestanding command
+/// line; the unquoted form has no such recursion to fall back on).
+fn looks_like_env_assignment(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(name, _)| !name.is_empty())
 }
 
 /// Whether `token` is a redirection operator this scan fully understands,
@@ -2410,6 +2433,23 @@ mod tests {
             "env -i FOO=bar BAZ=qux git -C / status",
             "nice env -C / git status",
         ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's own regression probe: real GNU `env` performs no
+    /// identifier validation on an assignment's name half at all (`env
+    /// 'X.Y=z' printenv X.Y` sets it despite the `.`, confirmed directly),
+    /// but the env arm previously reused `is_assignment_word`'s stricter
+    /// shell-identifier rule, so `X.Y=z` stopped the scan there and never
+    /// reached `git`'s own `-C` right after it — a real miss on the
+    /// unquoted form (the quoted form happened to still be caught, but
+    /// only by an unrelated, coincidental path: recursing into a quoted
+    /// token treats its content as its own freestanding command line,
+    /// which has no `env`-specific leniency at all).
+    #[test]
+    fn unsafe_bash_directory_flag_accepts_envs_own_looser_assignment_shape() {
+        for command in ["env X.Y=z git -C / status", "env 'X.Y=z' git -C / status"] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
     }
