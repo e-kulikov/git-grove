@@ -77,6 +77,21 @@ fn is_protected(resolved: &Path, canonical_bare: &Path, canonical_git: &Path) ->
 /// syntax, never as a path candidate.
 const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", ">", ">>", "<", "<<", "&", "2>&1"];
 
+/// The subset of `SHELL_OPERATORS` that starts a fresh command, per Bash
+/// grammar — the token right after one of these is a command word. The
+/// redirection operators are not command separators: `cmd > file` still
+/// has `file` as an argument of `cmd`, not a new command.
+const COMMAND_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "&"];
+
+/// Command words `unsafe_bash_command_word` refuses outright wherever one
+/// appears as a command's first word: each one invalidates the
+/// single-fixed-cwd model `decide` resolves every other candidate
+/// against. `cd`/`pushd`/`popd` change the directory a later command in
+/// the same compound runs in, which nothing here tracks; `eval`/`exec` can
+/// run an arbitrary computed string as a command in its own right, which
+/// nothing here can see into.
+const UNSAFE_COMMAND_WORDS: &[&str] = &["cd", "pushd", "popd", "eval", "exec"];
+
 /// Minimal, intentionally forgiving shell tokenizer: honors single/double
 /// quoting and backslash escapes, splits on unquoted whitespace. It is not
 /// a POSIX shell parser and is not meant to be one — see `bash_candidates`.
@@ -107,6 +122,111 @@ fn shell_tokens(command: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// Whether `command` contains a construct that makes resolving every path
+/// candidate against one fixed, unchanging cwd unsound to reason about
+/// statically, and if so, a short human-readable description of which one
+/// — for the denial message, not for further parsing. `decide` denies the
+/// whole command outright when this returns `Some`, without attempting to
+/// resolve any of its path candidates: correctly tracking a `cd`'s effect
+/// on later path resolution, or looking inside a subshell, command
+/// substitution, or `eval`'d string, is an unbounded problem (the next
+/// bypass is always one more construct away), so this closes the class by
+/// refusing to reason past the point where reasoning would have to start
+/// guessing, rather than chasing individual bypass patterns one at a time.
+///
+/// Checks two independent things, in order: [`unsafe_bash_character`]
+/// (unquoted syntax that changes what a later token means or lets Bash run
+/// a computed string) and [`unsafe_bash_command_word`] (a command word
+/// that changes the cwd, or hands off execution, for a *later* command in
+/// the same compound).
+fn unsafe_bash_construct(command: &str) -> Option<String> {
+    unsafe_bash_character(command).or_else(|| unsafe_bash_command_word(command))
+}
+
+/// Scan `command` character by character, tracking the same quote state
+/// [`shell_tokens`] tracks (deliberately re-derived here, not shared,
+/// since this check must not itself decide where tokens split — see
+/// [`unsafe_bash_construct`]), for a character that is live Bash syntax
+/// wherever it is found unquoted or inside a double-quoted string —
+/// only single quotes fully neutralize `$`, a backtick, and (for command
+/// substitution) parentheses in Bash:
+///
+/// - `(` or `)` outside any quoting: a subshell, or the parenthesis half
+///   of `$(...)`/`<(...)`/`>(...)` — flagging the bare parenthesis covers
+///   all of command substitution, process substitution, and a subshell
+///   without needing to separately recognize each spelling.
+/// - `` ` `` anywhere not inside single quotes: backtick command
+///   substitution, live even inside double quotes.
+/// - `$` anywhere not inside single quotes: `$(...)` command substitution
+///   or a `$NAME`/`${NAME}` variable expansion, live even inside double
+///   quotes. Flagged globally rather than only "inside a path-looking
+///   token": `bash_candidates` already treats nearly every non-operator
+///   token as a path candidate, so scoping this check narrower would not
+///   meaningfully reduce false positives while adding a second, easy-to-get-
+///   wrong notion of "looks like a path" for a bypass to hide in the gap
+///   of.
+///
+/// A character immediately after an unquoted backslash is consumed as a
+/// literal escaped character by the same rule [`shell_tokens`] uses, and
+/// is never checked here — `\$file` is a literal dollar sign, not live
+/// syntax, exactly because escaping it is what makes it one.
+///
+/// An unterminated quote at the end of `command` is flagged too: whatever
+/// [`shell_tokens`] made of a command whose own quoting is unbalanced is
+/// not something this scan's quote-state tracking agrees with either, so
+/// nothing tokenized under it can be trusted.
+fn unsafe_bash_character(command: &str) -> Option<String> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '\\' if !in_single => {
+                chars.next();
+            }
+            '(' | ')' if !in_single && !in_double => {
+                return Some(format!(
+                    "an unquoted `{character}` (a subshell, or command/process substitution)"
+                ));
+            }
+            '`' if !in_single => {
+                return Some("a backtick command substitution".to_string());
+            }
+            '$' if !in_single => {
+                return Some("a `$` variable expansion or command substitution".to_string());
+            }
+            _ => {}
+        }
+    }
+    if in_single || in_double {
+        return Some("an unterminated quote".to_string());
+    }
+    None
+}
+
+/// Scan `command`'s tokens (via the unmodified [`shell_tokens`]) for a
+/// command word — the first token, or the token right after one of
+/// [`COMMAND_SEPARATORS`] — that names one of [`UNSAFE_COMMAND_WORDS`]. A
+/// redirection operator (`>`, `<`, …) is not a command separator, so the
+/// token after one is still an argument, not a fresh command word:
+/// `printf x > cd` does not flag `cd`.
+fn unsafe_bash_command_word(command: &str) -> Option<String> {
+    let mut command_word_next = true;
+    for token in shell_tokens(command) {
+        if SHELL_OPERATORS.contains(&token.as_str()) {
+            command_word_next = COMMAND_SEPARATORS.contains(&token.as_str());
+            continue;
+        }
+        if command_word_next && UNSAFE_COMMAND_WORDS.contains(&token.as_str()) {
+            return Some(format!("`{token}` as a command word"));
+        }
+        command_word_next = false;
+    }
+    None
 }
 
 /// Find the earliest unquoted redirection operator (`>`, `>>`, `<`, `<<`)
@@ -254,7 +374,15 @@ pub fn decide(
     process_cwd: &Path,
 ) -> Verdict {
     let candidates = match &payload.tool {
-        Tool::Bash { command } => bash_candidates(command),
+        Tool::Bash { command } => match unsafe_bash_construct(command) {
+            Some(reason) => {
+                return Verdict::Deny(format!(
+                    "grove invariant: this command contains {reason}, whose target path \
+                     cannot be safely verified; split this into separate tool calls"
+                ))
+            }
+            None => bash_candidates(command),
+        },
         Tool::Edit { path } | Tool::Write { path } => vec![path.clone()],
         Tool::ApplyPatch { patch } => match apply_patch_candidates(patch) {
             Ok(candidates) => candidates,
@@ -510,5 +638,143 @@ mod tests {
         std::fs::create_dir(root.path().join("main")).unwrap();
         let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
         assert!(matches!(verdict, Verdict::Deny(_)));
+    }
+
+    fn denies_with_reason(verdict: &Verdict, needle: &str) -> bool {
+        matches!(verdict, Verdict::Deny(message) if message.contains(needle))
+    }
+
+    #[test]
+    fn decide_denies_the_reported_cd_bypass_because_it_refuses_to_reason_not_because_it_resolves() {
+        // From a worktree cwd, this reaches the real .bare only once bash
+        // actually executes `cd ..` first -- resolving the redirect target
+        // against the stale, pre-cd cwd alone (the old behavior) would
+        // wrongly see it as a harmless, nonexistent sibling path and allow
+        // it. The fix is to refuse the whole command because `cd` breaks
+        // the single-fixed-cwd model, not because this particular target
+        // happens to resolve into `.bare`.
+        let (root, canonical_bare, canonical_git) = grove();
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "cd .. && printf x > .bare/config".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(denies_with_reason(&verdict, "cd"), "{verdict:?}");
+    }
+
+    #[test]
+    fn decide_denies_a_subshell_wrapping_the_cd_bypass() {
+        let (root, canonical_bare, canonical_git) = grove();
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "(cd .. && printf x > .bare/config)".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)));
+    }
+
+    #[test]
+    fn decide_denies_command_substitution_used_as_a_redirect_target() {
+        let (root, canonical_bare, canonical_git) = grove();
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: r#"printf x > "$(echo ../.bare/config)""#.to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)));
+    }
+
+    #[test]
+    fn decide_denies_eval_of_a_computed_string() {
+        let (root, canonical_bare, canonical_git) = grove();
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: r#"eval "printf x > ../.bare/config""#.to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(denies_with_reason(&verdict, "eval"), "{verdict:?}");
+    }
+
+    #[test]
+    fn decide_allows_a_compound_but_safe_command_with_no_cwd_changing_or_indirection() {
+        // `&&` alone does not make path resolution unsound -- only a
+        // construct that actually changes the cwd or hides the target
+        // behind computation does. Plain sequential simple commands must
+        // not be over-denied.
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "mkdir foo && touch foo/bar".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert_eq!(verdict, Verdict::Allow, "{verdict:?}");
+    }
+
+    #[test]
+    fn unsafe_bash_construct_flags_each_named_construct() {
+        for (command, needle) in [
+            ("cd ..", "cd"),
+            ("pushd ..", "pushd"),
+            ("popd", "popd"),
+            (r#"eval "cat file""#, "eval"),
+            ("exec sh", "exec"),
+            ("(echo hi)", "subshell"),
+            ("echo )", "subshell"),
+            ("echo $(echo hi)", "command substitution"),
+            ("echo `echo hi`", "backtick"),
+            ("echo $HOME", "variable"),
+            ("echo ${HOME}", "variable"),
+            ("cat <(echo hi)", "subshell"),
+            ("tee >(cat)", "subshell"),
+            ("echo 'unterminated", "unterminated quote"),
+        ] {
+            let reason = unsafe_bash_construct(command);
+            assert!(reason.is_some(), "expected a deny reason for {command:?}");
+            assert!(
+                reason.as_deref().unwrap().contains(needle),
+                "command {command:?} gave reason {reason:?}, expected it to mention {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_bash_construct_allows_ordinary_commands() {
+        for command in [
+            "git status",
+            "mkdir foo && touch foo/bar",
+            "echo 'literal $HOME and (parens) are safe in single quotes'",
+            r#"echo "a literal (paren) with no dollar sign is safe in double quotes""#,
+            "printf x > .bare/config",
+            "echo \\$HOME",
+            "cat .bare/config; echo done",
+        ] {
+            assert_eq!(
+                unsafe_bash_construct(command),
+                None,
+                "expected {command:?} to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_bash_command_word_ignores_a_redirection_target_that_looks_like_a_command_word() {
+        // A redirection operator is not a command separator: the word
+        // after `>` is still an argument, not a fresh command word.
+        assert_eq!(unsafe_bash_command_word("printf x > cd"), None);
     }
 }
