@@ -196,25 +196,81 @@ fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
     tokens
 }
 
+/// The subset of [`UNSAFE_COMMAND_WORDS`] specific enough, as an exact
+/// standalone token, to be real evidence of shell code rather than
+/// ordinary English prose — unlike most of that list. `cd`, `if`, `while`,
+/// `until`, `for`, `case`, `select`, `function`, `time`, `command`,
+/// `source`, `trap`, `alias`, `!`, `.`, and `{` are all common ordinary
+/// words or punctuation (`"cd into src before building"`, `"save time"`,
+/// `"the source of truth"`, an exclamation mark ending any sentence, a
+/// lone `.` ending one) that would make [`looks_like_shell_code`]
+/// false-positive on completely ordinary quoted text constantly if used
+/// as evidence the same way — an earlier version of this list did exactly
+/// that, and was caught by this file's own test suite before it shipped.
+/// This subset is what remains once every word plausible as ordinary
+/// prose is excluded: shell/dispatch jargon that essentially never
+/// appears as a bare, standalone lowercase word outside of actual shell
+/// code.
+const SHELL_CODE_EVIDENCE_WORDS: &[&str] = &[
+    "exec", "eval", "pushd", "popd", "coproc", "shopt", "builtin",
+];
+
 /// Whether `text` shows evidence, once its own quoting is considered, of
 /// being intended as a shell command rather than ordinary quoted string
-/// data: an unquoted Bash separator (`;`, `&`, `|`, or a newline — see
-/// [`split_bash_segments`]) or redirection character (`>`/`<`, bare or
-/// glued onto a word — see [`find_redirection`]) appearing anywhere in it.
-/// [`unsafe_bash_construct`]'s recursion into quoted content uses this to
-/// decide whether a quoted token is worth recursing into at all: an
-/// operator character is a much more specific signal than "this is
-/// quoted, multi-word text" — ordinary free-text data (a commit message, a
-/// grep pattern, an echoed string) essentially never contains one, while a
-/// string actually meant to run as shell code (most commonly an
-/// interpreter's own `-c`/`-e` argument) almost always does, since
-/// chaining or redirecting is the entire reason to hand a multi-word shell
-/// command to another program in the first place.
+/// data. [`unsafe_bash_construct`]'s recursion into quoted content uses
+/// this to decide whether a quoted token is worth recursing into at all;
+/// each signal below is specific enough that ordinary free-text data (a
+/// commit message, a grep pattern, an echoed string) essentially never
+/// produces it, while a string actually meant to run as shell code (most
+/// commonly an interpreter's own `-c`/`-e` argument) very often does:
+///
+/// - An unquoted Bash separator (`;`, `&`, `|`, or a newline — see
+///   [`split_bash_segments`]) or redirection character (`>`/`<`, bare or
+///   glued onto a word — see [`find_redirection`]) appearing anywhere in
+///   it: chaining or redirecting is the entire reason to hand a
+///   multi-word shell command to another program in the first place. This
+///   alone already covers a hidden `cd` combined with anything
+///   consequential (`cd ..; printf x > file`) — `cd` on its own, with no
+///   separator or redirect anywhere in the same quoted string, has no
+///   observable effect once the interpreter it was handed to exits, so
+///   `cd` itself is deliberately *not* also evidence on its own; see
+///   [`SHELL_CODE_EVIDENCE_WORDS`] for why it (and most of
+///   [`UNSAFE_COMMAND_WORDS`]) is excluded from the next signal too.
+/// - One of [`SHELL_CODE_EVIDENCE_WORDS`] or [`UNSAFE_DIRECTORY_FLAGS`]
+///   appearing as its own whole token anywhere in it: a single dispatch
+///   word like `exec` with no separator around it at all (`exec env
+///   --chdir .. touch .bare/config`) still needs to trigger recursion for
+///   `unsafe_bash_command_word`/`unsafe_bash_directory_flag` to ever see
+///   it, and unlike the excluded majority of `UNSAFE_COMMAND_WORDS`,
+///   this narrower vocabulary is not plausible as ordinary prose.
+///
+/// Deliberately does *not* also trigger on the presence of `(`, `)`, `` ` ``,
+/// or `$` alone: those are common in ordinary prose and data with no shell
+/// meaning at all (a parenthetical aside, a literal dollar amount, a grep
+/// pattern with a literal `(group)`), and recursing on their presence
+/// alone reintroduces exactly the false-positive regression an earlier
+/// version of this function caused — seeing them just means Bash would not
+/// treat this content specially were it unquoted, not that some other
+/// language given the same text wouldn't. This leaves one acknowledged,
+/// not-yet-closed gap: a quoted payload written in a *different*
+/// language's syntax that both avoids every signal above and still
+/// resolves a relative path against a directory it changed to itself
+/// (most concretely, a `python3 -c` argument using `os.chdir`/`open(...)`
+/// with no semicolon-separated statements and no call to a flagged
+/// command) is not recognized as code by this function and is not
+/// recursed into. Reliably distinguishing "this quoted string is
+/// executable code" from "this quoted string is data that happens to
+/// contain code-shaped punctuation" for an unbounded set of possible
+/// target languages is the same kind of open-ended problem denying by
+/// enumerated construct was chosen to avoid chasing in the first place;
+/// see the design note on [`UNSAFE_COMMAND_WORDS`].
 fn looks_like_shell_code(text: &str) -> bool {
     split_bash_segments(text).len() > 1
-        || shell_tokens(text)
-            .iter()
-            .any(|token| find_redirection(token).is_some())
+        || shell_tokens(text).iter().any(|token| {
+            find_redirection(token).is_some()
+                || SHELL_CODE_EVIDENCE_WORDS.contains(&token.as_str())
+                || UNSAFE_DIRECTORY_FLAGS.contains(&token.as_str())
+        })
 }
 
 /// Whether `command` contains a construct that makes resolving every path
@@ -336,25 +392,36 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
 }
 
 /// GNU-convention flags, shared by name across several common external
-/// programs (`env -C dir cmd`, `git -C dir cmd`, `make -C dir`, `tar -C
-/// dir`), that change the effective working directory a later argument or
-/// the program's own child process resolves paths against — the same
+/// programs (`env --chdir dir cmd`, `git --directory dir cmd`), that
+/// change the effective working directory a later argument or the
+/// program's own child process resolves paths against — the same
 /// invalidation of the single-fixed-cwd model a `cd` command word causes,
 /// just spelled as an ordinary argument instead of a shell builtin.
 /// Checked anywhere in the command, not only in a command-word position,
 /// since a flag like this can appear after any command name.
 ///
-/// Deliberately only the unambiguous long forms: a bare `-C` collides with
-/// `grep -C`/`diff -C`'s context-line count, common enough in ordinary
-/// agent usage that blocklisting it outright would cost far more false
-/// positives than it closes — declining it is a considered choice, not an
-/// oversight, matching this scan's standing rule of over-denying a real
-/// construct but not enumerating every collision-prone spelling of one.
+/// Deliberately only these unambiguous long forms at the top level — see
+/// [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`] for how the collision-prone
+/// short form (`-C`) is instead scoped to the specific programs where it
+/// unambiguously means this, rather than either enumerated here (denying
+/// `grep -C`/`diff -C`'s unrelated context-line count everywhere) or
+/// ignored entirely.
 const UNSAFE_DIRECTORY_FLAGS: &[&str] = &["--directory", "--chdir"];
 
-/// Whether `command` contains one of [`UNSAFE_DIRECTORY_FLAGS`], bare or
-/// with a glued `=value`, anywhere among its plain (non-quote-stripped
-/// specially) tokens.
+/// External programs, by long-standing Unix convention, whose `-C`
+/// argument unambiguously means "change directory to the following value
+/// before doing anything else" — the exact same effect as
+/// [`UNSAFE_DIRECTORY_FLAGS`]'s long forms, just spelled with the short
+/// form that collides with `grep -C`/`diff -C`'s unrelated context-line
+/// count everywhere else. Scoping the check to only these specific command
+/// words (rather than a blanket `-C` ban) removes that collision entirely,
+/// since neither `grep` nor `diff` appears here.
+const DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS: &[&str] = &["env", "git", "make", "tar"];
+
+/// Whether `command` contains one of [`UNSAFE_DIRECTORY_FLAGS`] (bare or
+/// with a glued `=value`) anywhere among its plain tokens, or a bare `-C`
+/// among the arguments of a simple command whose own command word is one
+/// of [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`].
 fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
     for token in shell_tokens(command) {
         let name = token
@@ -363,6 +430,56 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
         if UNSAFE_DIRECTORY_FLAGS.contains(&name) {
             return Some(format!("a directory-changing flag (`{token}`)"));
         }
+    }
+    for segment in split_bash_segments(command) {
+        let tokens = shell_tokens(&segment);
+        let Some(command_word_index) = command_word_index_in_segment(&tokens) else {
+            continue;
+        };
+        let command_word = tokens[command_word_index].as_str();
+        if DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS.contains(&command_word)
+            && tokens[command_word_index + 1..]
+                .iter()
+                .any(|token| token == "-C")
+        {
+            return Some(format!(
+                "a directory-changing `-C` flag on `{command_word}`"
+            ));
+        }
+    }
+    None
+}
+
+/// Find the command word of one simple command (a [`split_bash_segments`]
+/// slice, already tokenized), returning its index into `tokens` — skipping
+/// past assignment words and prefix redirections exactly like
+/// [`unsafe_command_word_in_segment`] does, since this helper answers the
+/// same question ("which token is the real command word") for
+/// [`unsafe_bash_directory_flag`]'s narrower, per-program `-C` check.
+/// `None` if the segment has no tokens, or its first non-prefix token is
+/// an unrecognized assignment/redirection prefix (see
+/// [`looks_like_unrecognized_prefix`]) — that case is already denied by
+/// `unsafe_command_word_in_segment` separately, so this helper's callers
+/// can simply skip the segment rather than duplicate that denial.
+fn command_word_index_in_segment(tokens: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if is_assignment_word(token) {
+            index += 1;
+            continue;
+        }
+        if let Some(bare) = redirection_prefix(token) {
+            index += 1;
+            if bare {
+                index += 1;
+            }
+            continue;
+        }
+        if looks_like_unrecognized_prefix(token) {
+            return None;
+        }
+        return Some(index);
     }
     None
 }
@@ -1526,6 +1643,65 @@ mod tests {
             r#"git commit -m "cd into src before building""#,
         ] {
             assert_eq!(unsafe_bash_construct(command), None, "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's fifth-round finding: a dispatch word with no
+    /// separator or redirect anywhere around it in the same quoted string
+    /// (`exec env --chdir .. touch .bare/config` -- no `;`, `&`, `|`, `>`,
+    /// or `<` at all) still needed to trigger recursion for
+    /// `unsafe_bash_command_word` to ever see the `exec`. Closed by
+    /// `SHELL_CODE_EVIDENCE_WORDS`/`UNSAFE_DIRECTORY_FLAGS` membership
+    /// being its own trigger, alongside operator evidence.
+    #[test]
+    fn decide_denies_a_dispatch_word_with_no_operator_evidence_hidden_in_quoted_content() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "bash -c 'exec env --chdir .. touch .bare/config'".to_string(),
+            },
+            cwd: Some(root.path().to_path_buf()),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    /// exec-reviewer's fifth-round finding: `env -C ..` at the top level
+    /// (no quoting at all) was never covered by the long-form-only
+    /// directory-flag check. Closed by scoping the short `-C` form to the
+    /// specific programs where it unambiguously means "change directory"
+    /// (`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`), rather than a blanket
+    /// ban that would also catch `grep -C`/`diff -C`'s unrelated
+    /// context-line count.
+    #[test]
+    fn decide_denies_env_dash_capital_c_but_still_allows_grep_and_diff_context_flags() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "env -C .. touch .bare/config".to_string(),
+            },
+            cwd: Some(root.path().to_path_buf()),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+
+        for command in ["grep -C 3 pattern file", "diff -C 5 a b"] {
+            assert_eq!(
+                unsafe_bash_directory_flag(command),
+                None,
+                "{command:?} must not be denied by the scoped -C check"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_bash_directory_flag_covers_git_make_and_tar_short_c_form_too() {
+        for command in [
+            "git -C .. status",
+            "make -C .. build",
+            "tar -C .. -xf archive.tar",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
     }
 }
