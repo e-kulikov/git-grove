@@ -95,23 +95,31 @@ const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", ">", ">>", "<", "<<", "
 /// later, on a signal or a debug/exit event, exactly as unseen as
 /// `eval`'s string; `source`/`.` read and run an entire file's contents as
 /// shell commands, which can contain any of the above just as easily as
-/// the top-level command line can.
+/// the top-level command line can. `alias`/`shopt` can redefine what a
+/// later, ordinary-looking word in the *same* command means (`shopt -s
+/// expand_aliases; alias up="cd .."; up` really does change the cwd,
+/// non-interactively, once both are set in the same script this scan
+/// already sees) — refusing either as a command word closes that without
+/// having to simulate alias expansion.
 ///
-/// Deliberately does *not* extend to denying every external program that
-/// could itself interpret an embedded command string or change its own
-/// process's environment (`bash -c '...'`, `env -C dir ...`, and similar)
-/// or to shell-only, session-state facilities with no lasting effect on
-/// this or any later tool call in isolation (alias expansion, which only
-/// applies in interactive/`shopt -s expand_aliases` shells this hook does
-/// not invoke) — recognizing every program on the system that offers a
-/// "run this string" or "run relative to this directory" flag is the
-/// unbounded, non-terminating version of exactly the problem denying
-/// `cd`/`eval`/subshells/substitution by *construct* was chosen to close
-/// instead of chasing; see the module-level design note this list's
-/// history is documented against.
+/// Deliberately does *not* extend to enumerating every external program by
+/// name that could itself interpret an embedded command string
+/// (`bash -c '...'`, `python -c '...'`, and so on indefinitely) — recognizing
+/// every program on the system that offers a "run this string" flag is the
+/// unbounded, non-terminating version of exactly the problem denying by
+/// *construct* was chosen to close instead of chasing. That class is
+/// closed a different way instead: [`unsafe_bash_construct`] recurses into
+/// every quoted token's content as its own nested command line, so a
+/// `cd`/`eval`/subshell/substitution hidden inside a quoted argument is
+/// still caught regardless of which program the string was headed for,
+/// without this scan ever needing to know its name. A directory-changing
+/// *flag* on an ordinary program (`env -C dir cmd`, `git -C dir cmd`) is
+/// narrower still — see [`unsafe_bash_directory_flag`] for what is and is
+/// not covered there, and why.
 const UNSAFE_COMMAND_WORDS: &[&str] = &[
     "cd", "pushd", "popd", "eval", "exec", "command", "builtin", "time", "coproc", "if", "while",
-    "until", "for", "case", "select", "function", "{", "!", "trap", "source", ".",
+    "until", "for", "case", "select", "function", "{", "!", "trap", "source", ".", "alias",
+    "shopt",
 ];
 
 /// Minimal, intentionally forgiving shell tokenizer: honors single/double
@@ -188,6 +196,27 @@ fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
     tokens
 }
 
+/// Whether `text` shows evidence, once its own quoting is considered, of
+/// being intended as a shell command rather than ordinary quoted string
+/// data: an unquoted Bash separator (`;`, `&`, `|`, or a newline — see
+/// [`split_bash_segments`]) or redirection character (`>`/`<`, bare or
+/// glued onto a word — see [`find_redirection`]) appearing anywhere in it.
+/// [`unsafe_bash_construct`]'s recursion into quoted content uses this to
+/// decide whether a quoted token is worth recursing into at all: an
+/// operator character is a much more specific signal than "this is
+/// quoted, multi-word text" — ordinary free-text data (a commit message, a
+/// grep pattern, an echoed string) essentially never contains one, while a
+/// string actually meant to run as shell code (most commonly an
+/// interpreter's own `-c`/`-e` argument) almost always does, since
+/// chaining or redirecting is the entire reason to hand a multi-word shell
+/// command to another program in the first place.
+fn looks_like_shell_code(text: &str) -> bool {
+    split_bash_segments(text).len() > 1
+        || shell_tokens(text)
+            .iter()
+            .any(|token| find_redirection(token).is_some())
+}
+
 /// Whether `command` contains a construct that makes resolving every path
 /// candidate against one fixed, unchanging cwd unsound to reason about
 /// statically, and if so, a short human-readable description of which one
@@ -206,7 +235,41 @@ fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
 /// that changes the cwd, or hands off execution, for a *later* command in
 /// the same compound).
 fn unsafe_bash_construct(command: &str) -> Option<String> {
-    unsafe_bash_character(command).or_else(|| unsafe_bash_command_word(command))
+    if let Some(reason) = unsafe_bash_character(command) {
+        return Some(reason);
+    }
+    if let Some(reason) = unsafe_bash_command_word(command) {
+        return Some(reason);
+    }
+    if let Some(reason) = unsafe_bash_directory_flag(command) {
+        return Some(reason);
+    }
+    // Bash keeps a quoted region as one word — including, inside single
+    // quotes, one that itself contains further `"`-quoting, `$(...)`,
+    // backticks, or a `cd`/`eval`/… command word, none of which mean
+    // anything to *this* shell while still inside the outer quoting. But
+    // many programs turn straight around and parse that word as a command
+    // line of their own — most commonly an interpreter's own `-c`/`-e`
+    // flag. Scanning a quoted token's content with exactly this same
+    // function, recursively, closes that class without needing to know
+    // which program is on the receiving end: a quote nested inside a
+    // quote is unwound the same way, one recursive call at a time, and
+    // recursion terminates because each nested string is strictly shorter
+    // than the one that contained it.
+    //
+    // Gated on `looks_like_shell_code`, not run unconditionally over every
+    // quoted token: ordinary quoted *data* -- a commit message, a grep
+    // pattern, an echoed string -- routinely contains `$`, `(`, or the bare
+    // word `cd` with no shell meaning whatsoever (`git commit -m "cd into
+    // src before building"`), and recursing into it unconditionally would
+    // deny that as readily as it denies actual embedded shell code. See
+    // `looks_like_shell_code` for the narrower, operator-based evidence
+    // this scan requires before treating quoted content as code instead of
+    // data.
+    shell_tokens_scanned(command)
+        .into_iter()
+        .filter(|token| token.quoted && looks_like_shell_code(&token.text))
+        .find_map(|token| unsafe_bash_construct(&token.text))
 }
 
 /// Scan `command` character by character, tracking the same quote state
@@ -268,6 +331,38 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
     }
     if in_single || in_double {
         return Some("an unterminated quote".to_string());
+    }
+    None
+}
+
+/// GNU-convention flags, shared by name across several common external
+/// programs (`env -C dir cmd`, `git -C dir cmd`, `make -C dir`, `tar -C
+/// dir`), that change the effective working directory a later argument or
+/// the program's own child process resolves paths against — the same
+/// invalidation of the single-fixed-cwd model a `cd` command word causes,
+/// just spelled as an ordinary argument instead of a shell builtin.
+/// Checked anywhere in the command, not only in a command-word position,
+/// since a flag like this can appear after any command name.
+///
+/// Deliberately only the unambiguous long forms: a bare `-C` collides with
+/// `grep -C`/`diff -C`'s context-line count, common enough in ordinary
+/// agent usage that blocklisting it outright would cost far more false
+/// positives than it closes — declining it is a considered choice, not an
+/// oversight, matching this scan's standing rule of over-denying a real
+/// construct but not enumerating every collision-prone spelling of one.
+const UNSAFE_DIRECTORY_FLAGS: &[&str] = &["--directory", "--chdir"];
+
+/// Whether `command` contains one of [`UNSAFE_DIRECTORY_FLAGS`], bare or
+/// with a glued `=value`, anywhere among its plain (non-quote-stripped
+/// specially) tokens.
+fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
+    for token in shell_tokens(command) {
+        let name = token
+            .split_once('=')
+            .map_or(token.as_str(), |(name, _)| name);
+        if UNSAFE_DIRECTORY_FLAGS.contains(&name) {
+            return Some(format!("a directory-changing flag (`{token}`)"));
+        }
     }
     None
 }
@@ -557,9 +652,14 @@ fn bash_candidates(command: &str) -> Vec<String> {
     for token in shell_tokens_scanned(command) {
         extract_candidates_from_word(&token.text, &mut candidates);
         if token.quoted {
-            for word in token.text.split_whitespace() {
-                extract_candidates_from_word(word, &mut candidates);
-            }
+            // Recurse, the same way `unsafe_bash_construct` does and for
+            // the same reason: re-parsing the quoted content as its own
+            // command line (rather than a flat whitespace split) resolves
+            // any further nested quoting correctly too, so a path that
+            // was itself inside a nested quote is found in its clean,
+            // unquoted form instead of the literal quote characters
+            // corrupting it into a nonexistent candidate.
+            candidates.extend(bash_candidates(&token.text));
         }
     }
     candidates
@@ -570,8 +670,8 @@ fn bash_candidates(command: &str) -> Vec<String> {
 /// redirection operator (see [`split_redirections`]) and, for a part that
 /// looks like a long or short option with its value glued on, also yield
 /// the value half. Shared by [`bash_candidates`]'s per-token pass and its
-/// extra pass over a quoted token's whitespace-split words, so the two
-/// never drift in what counts as a candidate.
+/// recursive pass into a quoted token's own content, so the two never
+/// drift in what counts as a candidate.
 fn extract_candidates_from_word(word: &str, candidates: &mut Vec<String>) {
     if SHELL_OPERATORS.contains(&word) {
         return;
@@ -1293,6 +1393,139 @@ mod tests {
             };
             let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
             assert_eq!(verdict, Verdict::Allow, "{command:?}: {verdict:?}");
+        }
+    }
+
+    /// exec-reviewer's fourth-round finding: the quoted-content extraction
+    /// alone did not deny a `cd` hidden inside a quoted multi-word
+    /// argument (only the *path* extraction recursed, not the unsafe-
+    /// construct check), and did not correctly re-unquote a nested quote
+    /// inside an outer quote. Both are now closed by
+    /// `unsafe_bash_construct` recursing into quoted content that shows
+    /// operator evidence of being shell code (see `looks_like_shell_code`).
+    #[test]
+    fn unsafe_bash_construct_denies_cd_hidden_inside_quoted_shell_code() {
+        let reason = unsafe_bash_construct("bash -c 'cd ..; printf x > .bare/config'");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cd")),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn decide_denies_cd_hidden_inside_quoted_shell_code_passed_to_an_unnamed_interpreter() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "bash -c 'cd ..; printf x > .bare/config'".to_string(),
+            },
+            cwd: Some(root.path().to_path_buf()),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    #[test]
+    fn decide_denies_a_bash_command_reaching_bare_through_a_nested_quote() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: r#"bash -c 'printf x > "../.bare/config"'"#.to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    #[test]
+    fn decide_denies_a_directory_changing_flag() {
+        let (root, canonical_bare, canonical_git) = grove();
+        for command in [
+            "env --chdir=.. touch .bare/config",
+            "git --directory=.. status",
+        ] {
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().join("main")),
+            };
+            std::fs::create_dir_all(root.path().join("main")).unwrap();
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert!(
+                matches!(verdict, Verdict::Deny(_)),
+                "{command:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_denies_alias_and_shopt_as_command_words() {
+        let (root, canonical_bare, canonical_git) = grove();
+        for command in ["shopt -s expand_aliases", r#"alias up="cd .." "#] {
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().to_path_buf()),
+            };
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert!(
+                matches!(verdict, Verdict::Deny(_)),
+                "{command:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_shell_code_does_not_flag_ordinary_quoted_data() {
+        // The exact false-positive risk of recursing into every quoted
+        // token unconditionally: ordinary quoted text containing `$`,
+        // `(`, or even the bare word `cd` with no shell meaning at all.
+        for text in [
+            "literal $HOME and (parens) are safe in single quotes",
+            "cd into src before building",
+            "fix the thing",
+            "some pattern",
+            "hello world",
+        ] {
+            assert!(
+                !looks_like_shell_code(text),
+                "expected {text:?} to not look like shell code"
+            );
+        }
+    }
+
+    #[test]
+    fn looks_like_shell_code_flags_operator_evidence() {
+        for text in [
+            "cd ..; printf x > file",
+            "printf x > file",
+            "a && b",
+            "a | b",
+        ] {
+            assert!(
+                looks_like_shell_code(text),
+                "expected {text:?} to look like shell code"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_bash_construct_still_allows_ordinary_quoted_text_containing_dollar_and_parens() {
+        // The regression this change must not reintroduce: recursing into
+        // quoted content only when it shows operator evidence, not
+        // unconditionally, so a commit message or echoed string
+        // containing `$`/`(`/`cd` with no shell meaning stays allowed.
+        for command in [
+            "echo 'literal $HOME and (parens) are safe in single quotes'",
+            r#"git commit -m "cd into src before building""#,
+        ] {
+            assert_eq!(unsafe_bash_construct(command), None, "{command:?}");
         }
     }
 }
