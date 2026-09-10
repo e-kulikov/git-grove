@@ -380,8 +380,25 @@ fn unsafe_bash_construct(command: &str) -> Option<String> {
 fn unsafe_bash_character(command: &str) -> Option<String> {
     let mut in_single = false;
     let mut in_double = false;
+    // Whether the character about to be matched sits at the start of a
+    // word (or right after `=`/`:`, the two extra positions Bash also
+    // tilde-expands from — `FOO=~/x`, a `PATH`-like `~/a:~/b`) — tracked
+    // only for `~` below: unlike every other character this scan flags
+    // anywhere in a word, Bash only tilde-expands from one of these
+    // specific positions, never mid-word. `git log HEAD~3..HEAD`'s `~` is
+    // ordinary revision syntax, not live tilde expansion, and denying it
+    // regardless of position was a real false-positive regression on an
+    // extremely common command.
+    let mut at_word_start = true;
     let mut chars = command.chars().peekable();
     while let Some(character) = chars.next() {
+        let word_start = at_word_start;
+        at_word_start = !in_single
+            && !in_double
+            && matches!(
+                character,
+                ' ' | '\t' | '\n' | ';' | '&' | '|' | '(' | ')' | '=' | ':' | '<' | '>'
+            );
         match character {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
@@ -432,13 +449,17 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
                         .to_string(),
                 );
             }
-            '~' if !in_single && !in_double => {
+            '~' if !in_single && !in_double && word_start => {
                 // Tilde expansion substitutes a user's home directory (or,
-                // as `~+`/`~-`, the shell's own $PWD/$OLDPWD) wherever it
-                // appears at the front of a word — again inert inside
-                // either quote style, and again denied outright rather
-                // than resolved, since this scan has no access to the
-                // environment Bash itself would expand it against.
+                // as `~+`/`~-`, the shell's own $PWD/$OLDPWD) — but, unlike
+                // every other character flagged in this function, only
+                // when it appears at the front of a word (or right after
+                // `=`/`:`, see `at_word_start` above), never mid-word: a
+                // `~` anywhere else (`HEAD~3`, a git revision range) is
+                // ordinary text with no shell meaning at all. Denied
+                // outright rather than resolved, same as the others, since
+                // this scan has no access to the environment Bash itself
+                // would expand a live one against.
                 return Some(
                     "an unquoted `~` (Bash tilde expansion, whose result this scan cannot predict)"
                         .to_string(),
@@ -2471,6 +2492,40 @@ mod tests {
                 unsafe_bash_character(command),
                 None,
                 "{command:?} must not be denied"
+            );
+        }
+    }
+
+    /// exec-reviewer's own regression probe: a `~` only tilde-expands at
+    /// the start of a word (or right after `=`/`:`) — `HEAD~1`, `HEAD~3`
+    /// in ordinary git revision syntax is ordinary text with no shell
+    /// meaning at all, and the first version of the tilde check (flagging
+    /// `~` anywhere, unconditionally) denied these extremely common
+    /// commands outright. Word-start tracking must both fix this and
+    /// still catch a genuinely live tilde (word-start, or right after `=`
+    /// in an assignment value).
+    #[test]
+    fn unsafe_bash_character_allows_tilde_mid_word_but_still_denies_it_at_a_word_boundary() {
+        for command in [
+            "git rev-parse HEAD~1",
+            "git log HEAD~3..HEAD",
+            "git diff HEAD~1 HEAD",
+            "echo a~b",
+        ] {
+            assert_eq!(
+                unsafe_bash_character(command),
+                None,
+                "{command:?} must not be denied"
+            );
+        }
+        for command in [
+            "cat ~/somewhere",
+            "cat ~root/somewhere",
+            "FOO=~/bar echo hi",
+        ] {
+            assert!(
+                unsafe_bash_character(command).is_some(),
+                "{command:?} must be denied"
             );
         }
     }
