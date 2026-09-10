@@ -322,10 +322,27 @@ fn unsafe_bash_construct(command: &str) -> Option<String> {
     // `looks_like_shell_code` for the narrower, operator-based evidence
     // this scan requires before treating quoted content as code instead of
     // data.
-    shell_tokens_scanned(command)
-        .into_iter()
-        .filter(|token| token.quoted && looks_like_shell_code(&token.text))
-        .find_map(|token| unsafe_bash_construct(&token.text))
+    for token in shell_tokens_scanned(command) {
+        if !token.quoted {
+            continue;
+        }
+        // `unsafe_bash_directory_flag` alone always recurses into quoted
+        // content, unlike the rest of this recursion below: it only
+        // denies on an exact match against a small, specific vocabulary
+        // (`--chdir`/`--directory`, or `-C` on one of four well-known
+        // programs), so it carries essentially none of the false-positive
+        // risk `looks_like_shell_code` exists to gate the broader
+        // character/command-word recursion against.
+        if let Some(reason) = unsafe_bash_directory_flag(&token.text) {
+            return Some(reason);
+        }
+        if looks_like_shell_code(&token.text) {
+            if let Some(reason) = unsafe_bash_construct(&token.text) {
+                return Some(reason);
+            }
+        }
+    }
+    None
 }
 
 /// Scan `command` character by character, tracking the same quote state
@@ -418,10 +435,35 @@ const UNSAFE_DIRECTORY_FLAGS: &[&str] = &["--directory", "--chdir"];
 /// since neither `grep` nor `diff` appears here.
 const DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS: &[&str] = &["env", "git", "make", "tar"];
 
+/// The command word that names a program in
+/// [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`], whether spelled bare
+/// (`env`) or via an absolute or relative path to it (`/usr/bin/env`,
+/// `./env`) — matched on the final path component, the same way a shell
+/// itself resolves which program a path invokes regardless of where it
+/// lives.
+fn names_directory_changing_program(command_word: &str) -> bool {
+    let name = Path::new(command_word)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command_word);
+    DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS.contains(&name)
+}
+
+/// Whether `token` is `-C` itself, or `-C` with its value glued directly
+/// onto it (`-C..`, `-Cdir`) — the same short-option-with-glued-value
+/// convention `env`/`git`/`make`/`tar` (and getopt-style parsing
+/// generally) all accept as equivalent to a separate following word.
+fn is_short_c_flag(token: &str) -> bool {
+    token == "-C" || (token.starts_with("-C") && token.len() > "-C".len())
+}
+
 /// Whether `command` contains one of [`UNSAFE_DIRECTORY_FLAGS`] (bare or
-/// with a glued `=value`) anywhere among its plain tokens, or a bare `-C`
-/// among the arguments of a simple command whose own command word is one
-/// of [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`].
+/// with a glued `=value`) anywhere among its plain tokens, or a `-C`
+/// (bare or with its value glued on — see [`is_short_c_flag`]) among the
+/// arguments of a simple command whose own command word names one of
+/// [`DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS`] (see
+/// [`names_directory_changing_program`] for how an absolute or relative
+/// path to that program is matched too).
 fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
     for token in shell_tokens(command) {
         let name = token
@@ -437,10 +479,10 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
             continue;
         };
         let command_word = tokens[command_word_index].as_str();
-        if DIRECTORY_CHANGING_SHORT_C_FLAG_PROGRAMS.contains(&command_word)
+        if names_directory_changing_program(command_word)
             && tokens[command_word_index + 1..]
                 .iter()
-                .any(|token| token == "-C")
+                .any(|token| is_short_c_flag(token))
         {
             return Some(format!(
                 "a directory-changing `-C` flag on `{command_word}`"
@@ -867,6 +909,37 @@ fn apply_patch_candidates(patch: &str) -> Result<Vec<String>, String> {
 /// this payload. An agent that `cd`s into a *different* grove B and writes
 /// a relative path into B's own `.bare/` is not denied by a hook installed
 /// for grove A, because only A is the yardstick here.
+///
+/// A second, structural limit, acknowledged rather than papered over: this
+/// guard statically analyzes the *Bash* command line the tool call names
+/// — its own syntax, and a bounded, enumerated set of constructs
+/// (`cd`/`pushd`/`popd`, `eval`/`exec` and the other dispatch/reserved
+/// words in `UNSAFE_COMMAND_WORDS`, subshells, command/process
+/// substitution, a variable inside a path-looking token, a handful of
+/// directory-changing flags) that would make resolving a path against one
+/// fixed cwd unsound — and denies whatever it cannot fully account for.
+/// It cannot prove what an arbitrary *external interpreter*, invoked with
+/// a computed-string argument in a language this guard does not parse
+/// (`python3 -c '...'`, `perl -e '...'`, and so on for every interpreter
+/// that accepts one), will actually do with that string once it runs:
+/// recursion into quoted Bash content closes the cases expressible in
+/// Bash's own grammar (see `unsafe_bash_construct`'s recursion and
+/// `looks_like_shell_code`), but a payload written in a different
+/// language's syntax that both avoids every Bash-shaped signal this scan
+/// looks for and still reaches a protected path is not something static
+/// analysis of the *outer* command can rule out — doing so would require
+/// parsing an open-ended set of target languages, which is the same kind
+/// of unbounded, non-terminating problem this whole guard's construct-based
+/// design was chosen to avoid chasing in the first place, not one more
+/// construct to enumerate. Genuine defense against that class of bypass
+/// needs a fundamentally different mechanism — OS-level sandboxing
+/// (Landlock, seccomp, or similar) enforced on the process actually
+/// performing the write, independent of what command line asked for it —
+/// which is out of scope for a hook that only ever sees the tool call's
+/// own text before anything runs. This guard is still real, meaningful
+/// protection against every construct it does close; it is not, and does
+/// not claim to be, a substitute for kernel-level enforcement against an
+/// arbitrary interpreter's own behavior.
 pub fn decide(
     payload: &NormalizedPayload,
     canonical_bare: &Path,
@@ -1703,5 +1776,35 @@ mod tests {
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
+    }
+
+    /// exec-reviewer's sixth-round finding on the scoped `-C` check: a
+    /// glued short-option value (`-C..`, the same convention the flag's
+    /// own long form and getopt-style parsing generally accept), an
+    /// absolute or relative path to the program instead of its bare name,
+    /// and the flag hidden inside quoted content with no other shell-code
+    /// evidence around it all still bypassed it.
+    #[test]
+    fn unsafe_bash_directory_flag_covers_glued_values_and_paths_to_the_program() {
+        for command in [
+            "env -C.. touch .bare/config",
+            "/usr/bin/env -C .. touch .bare/config",
+            "./env -C .. touch .bare/config",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn decide_denies_the_short_c_flag_hidden_inside_quoted_content_with_no_other_evidence() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "bash -c 'env -C .. touch .bare/config'".to_string(),
+            },
+            cwd: Some(root.path().to_path_buf()),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
     }
 }
