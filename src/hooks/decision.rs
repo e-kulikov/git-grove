@@ -651,30 +651,39 @@ fn long_option_needs_separate_value(
 }
 
 /// Whether `token` is one of `git`'s own long-standing global options that
-/// takes its value as a separate following word, rather than only glued
-/// onto the flag itself — the same question
+/// *always* takes its value as a separate following word, rather than
+/// only glued onto the flag itself — the same question
 /// [`short_option_cluster_needs_separate_value`]/[`long_option_needs_separate_value`]
 /// answer for `env`/`timeout`. This only matters for
-/// [`resolve_directory_flag`]'s stop-at-
-/// first-non-option-token rule for `git`: without skipping the value too,
-/// `git -c alias.v=version -C / v`'s `alias.v=version` (the *value* of
-/// `-c`, not a subcommand) would wrongly look like the boundary and hide
-/// the `-C` straight after it — a false negative, exactly the kind of
-/// regression the boundary rule exists to avoid introducing. Bounded to
-/// `git`'s own documented global-option grammar (fixed and small), not
-/// attempting to enumerate a subcommand's options too — a later `-c`
-/// belonging to a *subcommand* is already unreachable once the subcommand
-/// itself is correctly recognized as the stopping boundary.
+/// [`resolve_directory_flag`]'s stop-at-first-non-option-token rule for
+/// `git`: without skipping the value too, `git -c alias.v=version -C / v`'s
+/// `alias.v=version` (the *value* of `-c`, not a subcommand) would wrongly
+/// look like the boundary and hide the `-C` straight after it — a false
+/// negative, exactly the kind of regression the boundary rule exists to
+/// avoid introducing.
+///
+/// Deliberately does *not* include `--exec-path`, even though it is one of
+/// `git`'s own long-standing global options too: `git`'s own usage string
+/// documents it as `--exec-path[=<path>]` — an *optional* argument, valid
+/// bare with no value at all (confirmed: `git --exec-path` alone prints
+/// the path and exits) — so unlike `-c`/`--git-dir`/`--work-tree`/
+/// `--namespace` (each confirmed mandatory: bare, each errors with "no ...
+/// given" rather than treating the next word as anything) it must never
+/// unconditionally consume the following word; doing so once
+/// unconditionally consumed `git --exec-path -C / status`'s real `-C` as
+/// if it were `--exec-path`'s value, missing it entirely. Since
+/// `--exec-path` (like every other git global option not listed here) is
+/// simply left out, this scan neither skips past it specially nor treats
+/// it as the subcommand-boundary positional — it is just one more
+/// `-`-prefixed token the surrounding loop passes over unchanged, which is
+/// exactly correct for an optional-argument flag: whether or not a value
+/// happens to be glued on, nothing after it needs skipping.
 fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
     let name = Path::new(command_word)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command_word);
-    name == "git"
-        && matches!(
-            token,
-            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix" | "--exec-path"
-        )
+    name == "git" && matches!(token, "-c" | "--git-dir" | "--work-tree" | "--namespace")
 }
 
 /// Resolve one simple command's directory-changing exposure, starting at
@@ -2294,6 +2303,19 @@ mod tests {
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
+    }
+
+    /// `git --exec-path` is documented (and confirmed by running it) as an
+    /// *optional*-argument long option (`--exec-path[=<path>]`, valid bare
+    /// with no value and no error) — unlike `-c`/`--git-dir`/`--work-tree`/
+    /// `--namespace`, each confirmed mandatory. Treating it as always
+    /// consuming a separate word, the way an earlier version of
+    /// `option_consumes_separate_value` did, mistook a real following `-C`
+    /// for `--exec-path`'s own value and missed it entirely.
+    #[test]
+    fn unsafe_bash_directory_flag_does_not_swallow_c_after_bare_exec_path() {
+        assert!(unsafe_bash_directory_flag("git --exec-path -C / status").is_some());
+        assert_eq!(unsafe_bash_directory_flag("git --exec-path status"), None);
     }
 
     /// exec-reviewer's own probe (`env -iu FOO ...`, `timeout -vk 1 2
