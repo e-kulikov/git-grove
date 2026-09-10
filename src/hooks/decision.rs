@@ -85,15 +85,33 @@ const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", ">", ">>", "<", "<<", "
 /// command in the same compound runs in, which nothing here tracks;
 /// `eval`/`exec`/`command`/`builtin`/`time`/`coproc` can all run another,
 /// arbitrary command word in their own right, which nothing here can see
-/// into; `if`/`while`/`until`/`for`/`case`/`select`/`function`/`{` each
-/// start compound-command grammar whose body can run `cd` (or any of the
-/// above) without ever appearing as this simple command's own first word
-/// (`if cd ..; then :; fi`) — denying the reserved word itself, rather
-/// than trying to look inside the compound command it introduces, is the
-/// same fail-closed choice this whole scan makes everywhere else.
+/// into; `if`/`while`/`until`/`for`/`case`/`select`/`function`/`{`/`!`
+/// each start compound-command or negated-pipeline grammar whose body can
+/// run `cd` (or any of the above) without ever appearing as this simple
+/// command's own first word (`if cd ..; then :; fi`, `! cd ..`) — denying
+/// the reserved word itself, rather than trying to look inside the
+/// compound command it introduces, is the same fail-closed choice this
+/// whole scan makes everywhere else. `trap` registers a string to be run
+/// later, on a signal or a debug/exit event, exactly as unseen as
+/// `eval`'s string; `source`/`.` read and run an entire file's contents as
+/// shell commands, which can contain any of the above just as easily as
+/// the top-level command line can.
+///
+/// Deliberately does *not* extend to denying every external program that
+/// could itself interpret an embedded command string or change its own
+/// process's environment (`bash -c '...'`, `env -C dir ...`, and similar)
+/// or to shell-only, session-state facilities with no lasting effect on
+/// this or any later tool call in isolation (alias expansion, which only
+/// applies in interactive/`shopt -s expand_aliases` shells this hook does
+/// not invoke) — recognizing every program on the system that offers a
+/// "run this string" or "run relative to this directory" flag is the
+/// unbounded, non-terminating version of exactly the problem denying
+/// `cd`/`eval`/subshells/substitution by *construct* was chosen to close
+/// instead of chasing; see the module-level design note this list's
+/// history is documented against.
 const UNSAFE_COMMAND_WORDS: &[&str] = &[
     "cd", "pushd", "popd", "eval", "exec", "command", "builtin", "time", "coproc", "if", "while",
-    "until", "for", "case", "select", "function", "{",
+    "until", "for", "case", "select", "function", "{", "!", "trap", "source", ".",
 ];
 
 /// Minimal, intentionally forgiving shell tokenizer: honors single/double
@@ -109,6 +127,15 @@ fn shell_tokens(command: &str) -> Vec<String> {
         match character {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
+            // A backslash-newline is a Bash line continuation: both
+            // characters vanish, joining the following line onto this one
+            // with nothing inserted between them (`c\<newline>d` becomes
+            // the single word `cd`, not two words or a word containing a
+            // literal newline) — distinct from every other backslash
+            // escape, which keeps the escaped character as a literal.
+            '\\' if !in_single && chars.peek() == Some(&'\n') => {
+                chars.next();
+            }
             '\\' if !in_single => {
                 if let Some(next) = chars.next() {
                     current.push(next);
@@ -1096,5 +1123,55 @@ mod tests {
                 "{command:?}: {verdict:?}"
             );
         }
+    }
+
+    /// exec-reviewer's third-round finding: a backslash-newline line
+    /// continuation joins `c\<newline>d` into the single word `cd` in real
+    /// Bash, but the scan's tokenizer previously kept the escaped newline
+    /// as a literal character inside the token instead of performing the
+    /// join, producing a token that matched neither the safe case nor
+    /// `UNSAFE_COMMAND_WORDS`. Separately, `!` (pipeline negation),
+    /// `trap` (registers a string to run later, unseen, on a signal or
+    /// debug/exit event), and `source`/`.` (run an entire file's contents
+    /// as shell commands) are reserved/dispatch words the previous list
+    /// did not cover.
+    #[test]
+    fn unsafe_bash_command_word_finds_cd_past_a_line_continuation_and_denies_new_reserved_words() {
+        for (command, needle) in [
+            ("c\\\nd ..", "cd"),
+            ("! cd ..", "!"),
+            ("trap 'cd /' DEBUG", "trap"),
+            ("source ./script.sh", "source"),
+            (". ./script.sh", "."),
+        ] {
+            let reason = unsafe_bash_command_word(command);
+            assert!(
+                reason.is_some(),
+                "expected {command:?} to be denied, got None"
+            );
+            assert!(
+                reason.as_deref().unwrap().contains(needle),
+                "command {command:?} gave reason {reason:?}, expected it to mention {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_denies_the_line_continuation_bypass() {
+        let (root, canonical_bare, canonical_git) = grove();
+        std::fs::create_dir(root.path().join("main")).unwrap();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: "c\\\nd .. && printf x>.bare/config".to_string(),
+            },
+            cwd: Some(root.path().join("main")),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    #[test]
+    fn shell_tokens_joins_a_backslash_newline_line_continuation() {
+        assert_eq!(shell_tokens("c\\\nd .."), vec!["cd", ".."]);
     }
 }
