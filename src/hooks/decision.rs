@@ -524,10 +524,11 @@ fn is_short_c_flag(token: &str) -> bool {
 /// live as if the wrapper were not there, so [`resolve_directory_flag`]
 /// must see past it to find the real command word, instead of mistaking
 /// the wrapper's own name — or, worse, one of its option values — for it.
-/// `env` is handled separately, not listed here: unlike these three, `env`
-/// also has its own `-C`/`--chdir` that can directly precede the command it
-/// execs, so it needs its own leading-option/assignment scan instead of a
-/// blind skip — see the `env` arm of [`resolve_directory_flag`].
+/// `env` and `timeout` are handled separately, not listed here: `env` also
+/// has its own `-C`/`--chdir` that can directly precede the command it
+/// execs, and `timeout`'s grammar has a mandatory positional `DURATION`
+/// this generic skip does not account for — see their own arms of
+/// [`resolve_directory_flag`].
 const TRANSPARENT_WRAPPER_PROGRAMS: &[&str] = &["nice", "nohup", "setsid"];
 
 /// [`TRANSPARENT_WRAPPER_PROGRAMS`]'s own short and long options that take
@@ -544,6 +545,17 @@ const WRAPPER_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-n", "--adjustment"];
 /// bare is the match [`resolve_directory_flag`]'s `env` arm is looking for,
 /// not something to skip past.
 const ENV_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-u", "--unset", "-S", "--split-string"];
+
+/// `timeout`'s own short and long options that take their value as a
+/// separate following word rather than only glued on — the same shape
+/// [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`] exists for. `timeout` is not
+/// one of [`TRANSPARENT_WRAPPER_PROGRAMS`], and gets its own arm in
+/// [`resolve_directory_flag`] instead of being added to that list: unlike
+/// `nice`/`nohup`/`setsid`, its grammar (`timeout [OPTION] DURATION
+/// COMMAND [ARG]...`) has a mandatory positional `DURATION` between its
+/// own options and the command it execs, which the generic wrapper skip
+/// (options only, no bare positional) does not account for.
+const TIMEOUT_OPTIONS_WITH_SEPARATE_VALUE: &[&str] = &["-k", "--kill-after", "-s", "--signal"];
 
 /// Whether `token` is one of `git`'s own long-standing global options that
 /// takes its value as a separate following word, rather than only glued
@@ -584,6 +596,14 @@ fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
 ///   [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`], or a literal `--`, which
 ///   stops the skip) and recurse into whatever command word follows —
 ///   `nice nohup git -C / status` must be seen as naming `git`.
+/// - `timeout`: the same wrapper skip, plus one more step its own grammar
+///   requires and `TRANSPARENT_WRAPPER_PROGRAMS` never has to: a mandatory
+///   `DURATION` positional between its own options
+///   ([`TIMEOUT_OPTIONS_WITH_SEPARATE_VALUE`]) and the command it execs,
+///   unconditionally skipped once (not gated on looking option-like, since
+///   `timeout`'s grammar always has exactly one there whenever a command
+///   follows at all) before recursing — `timeout 2 git -C / status` must
+///   be seen as naming `git`, not `2`.
 /// - `env`: walk its own `[OPTION]... [NAME=VALUE]... [COMMAND [ARG]...]`
 ///   grammar directly, rather than through the generic wrapper skip above,
 ///   since a bare `env -C`/`--chdir` is itself exactly the live flag this
@@ -634,6 +654,33 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             if consumes_next_word {
                 next += 1;
             }
+        }
+        return resolve_directory_flag(tokens, next);
+    }
+
+    if name == "timeout" {
+        let mut next = index + 1;
+        while next < tokens.len() {
+            let token = tokens[next].as_str();
+            if token == "--" {
+                next += 1;
+                break;
+            }
+            if !token.starts_with('-') {
+                break;
+            }
+            let consumes_next_word = TIMEOUT_OPTIONS_WITH_SEPARATE_VALUE.contains(&token);
+            next += 1;
+            if consumes_next_word {
+                next += 1;
+            }
+        }
+        // The mandatory DURATION positional, between timeout's own options
+        // and the command it execs — skipped unconditionally, unlike a
+        // wrapper's optional flags, since timeout's own grammar always has
+        // exactly one here whenever a command follows at all.
+        if next < tokens.len() {
+            next += 1;
         }
         return resolve_directory_flag(tokens, next);
     }
@@ -2058,6 +2105,23 @@ mod tests {
             "env FOO=bar git -C / status",
             "env -i FOO=bar BAZ=qux git -C / status",
             "nice env -C / git status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// `timeout`'s mandatory `DURATION` positional (`timeout [OPTION]
+    /// DURATION COMMAND [ARG]...`) sits between its own options and the
+    /// command it execs, unlike `nice`/`nohup`/`setsid` — it needs its own
+    /// arm in `resolve_directory_flag`, not just membership in
+    /// `TRANSPARENT_WRAPPER_PROGRAMS`, or the duration itself gets
+    /// mistaken for the command word.
+    #[test]
+    fn unsafe_bash_directory_flag_treats_timeout_as_a_wrapper_with_a_duration_positional() {
+        for command in [
+            "timeout 2 git -C / status",
+            "timeout -k 5 2 git -C / status",
+            "timeout --signal=KILL 2 git -C / status",
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
