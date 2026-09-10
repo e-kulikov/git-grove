@@ -77,12 +77,6 @@ fn is_protected(resolved: &Path, canonical_bare: &Path, canonical_git: &Path) ->
 /// syntax, never as a path candidate.
 const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", ">", ">>", "<", "<<", "&", "2>&1"];
 
-/// The subset of `SHELL_OPERATORS` that starts a fresh command, per Bash
-/// grammar — the token right after one of these is a command word. The
-/// redirection operators are not command separators: `cmd > file` still
-/// has `file` as an argument of `cmd`, not a new command.
-const COMMAND_SEPARATORS: &[&str] = &["&&", "||", ";", "|", "&"];
-
 /// Command words `unsafe_bash_command_word` refuses outright wherever one
 /// appears as a command's first word: each one invalidates the
 /// single-fixed-cwd model `decide` resolves every other candidate
@@ -208,23 +202,134 @@ fn unsafe_bash_character(command: &str) -> Option<String> {
     None
 }
 
-/// Scan `command`'s tokens (via the unmodified [`shell_tokens`]) for a
-/// command word — the first token, or the token right after one of
-/// [`COMMAND_SEPARATORS`] — that names one of [`UNSAFE_COMMAND_WORDS`]. A
-/// redirection operator (`>`, `<`, …) is not a command separator, so the
-/// token after one is still an argument, not a fresh command word:
-/// `printf x > cd` does not flag `cd`.
+/// Find the command word of every simple command in `command` (splitting
+/// on `;`/`&`/`|`/newline via [`split_bash_segments`], since `cd` after a
+/// separator glued directly onto the previous word — `true;cd ..` — is
+/// exactly as much a fresh command word as `cd` after one with spaces
+/// around it) and check each against [`UNSAFE_COMMAND_WORDS`] — see
+/// [`unsafe_command_word_in_segment`] for how a command word is found
+/// within one simple command once assignment and prefix-redirection words
+/// are skipped.
 fn unsafe_bash_command_word(command: &str) -> Option<String> {
-    let mut command_word_next = true;
-    for token in shell_tokens(command) {
-        if SHELL_OPERATORS.contains(&token.as_str()) {
-            command_word_next = COMMAND_SEPARATORS.contains(&token.as_str());
+    split_bash_segments(command)
+        .iter()
+        .find_map(|segment| unsafe_command_word_in_segment(segment))
+}
+
+/// Split `command` into the substrings between every unquoted Bash command
+/// separator — `;`, `&`, `|` (a bare `&`/`|` and their doubled forms
+/// `&&`/`||` are both split on the same way, since finding every boundary
+/// is all `unsafe_bash_command_word` needs; it does not need `&&`'s own
+/// short-circuit semantics), or a literal newline. Unlike
+/// [`shell_tokens`], this splits on these separators wherever they occur
+/// — including glued directly onto adjacent text with no surrounding
+/// whitespace (`true;cd ..`), which real Bash still treats as two
+/// commands — because [`unsafe_command_word_in_segment`]'s reasoning about
+/// where one simple command's word begins depends on getting that
+/// boundary right independent of spacing. Quote characters are kept in
+/// each segment (not stripped), since every segment is re-tokenized with
+/// [`shell_tokens`] afterward, which needs them for its own quote
+/// tracking.
+fn split_bash_segments(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut chars = command.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(character);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(character);
+            }
+            '\\' if !in_single => {
+                current.push(character);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ';' | '&' | '|' | '\n' if !in_single && !in_double => {
+                segments.push(std::mem::take(&mut current));
+            }
+            character => current.push(character),
+        }
+    }
+    segments.push(current);
+    segments
+}
+
+/// Find the command word of one simple command (a `split_bash_segments`
+/// slice with no unquoted `;`/`&`/`|`/newline left in it) and check it
+/// against [`UNSAFE_COMMAND_WORDS`], skipping past every leading
+/// assignment word (`NAME=value`, Bash allows any number before the real
+/// command: `X=1 Y=2 cd ..`) and prefix redirection (`>out cd ..`, `2>&1
+/// cd ..`) first — neither is the command word itself. Stops at (and
+/// returns `None` for) the first token that is neither, since that is the
+/// real command word and this function only needs to know whether *that
+/// one* is unsafe: a redirection or filename appearing *after* the real
+/// command word (`printf x > cd`) is an argument, not a fresh command.
+fn unsafe_command_word_in_segment(segment: &str) -> Option<String> {
+    let tokens = shell_tokens(segment);
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if is_assignment_word(token) {
+            index += 1;
             continue;
         }
-        if command_word_next && UNSAFE_COMMAND_WORDS.contains(&token.as_str()) {
-            return Some(format!("`{token}` as a command word"));
+        if let Some(bare) = redirection_prefix(token) {
+            index += 1;
+            if bare {
+                // A bare operator with no target glued on (`>`, `2>>`)
+                // takes the *next* word as its target; that word is not
+                // the command word either.
+                index += 1;
+            }
+            continue;
         }
-        command_word_next = false;
+        return UNSAFE_COMMAND_WORDS
+            .contains(&token)
+            .then(|| format!("`{token}` as a command word"));
+    }
+    None
+}
+
+/// Whether `token` is a Bash assignment word (`NAME=value`) that can
+/// legitimately precede the real command word — `NAME` a valid shell
+/// identifier: starts with a letter or underscore, and every character is
+/// alphanumeric or an underscore.
+fn is_assignment_word(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// Whether `token` is a redirection operator that can legitimately precede
+/// the real command word (`>out cd ..`, `2>&1 cd ..`) — the same
+/// digit-prefix-then-operator shape [`split_redirections`] strips a
+/// redirection off of, checked instead at the *start* of the whole token.
+/// `None` if `token` is not a redirection at all. `Some(true)` if it is a
+/// *bare* operator with no target glued onto it (`>`, `2>>`), meaning the
+/// following word is its target and must be skipped too; `Some(false)` if
+/// the target is already glued on (`>out`, `2>>log`).
+fn redirection_prefix(token: &str) -> Option<bool> {
+    let digit_end = token
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(token.len());
+    let rest = &token[digit_end..];
+    for operator in [">>", "<<", ">", "<"] {
+        if let Some(target) = rest.strip_prefix(operator) {
+            return Some(target.is_empty());
+        }
     }
     None
 }
@@ -776,5 +881,80 @@ mod tests {
         // A redirection operator is not a command separator: the word
         // after `>` is still an argument, not a fresh command word.
         assert_eq!(unsafe_bash_command_word("printf x > cd"), None);
+    }
+
+    /// exec-reviewer's finding: the first version of this scan located a
+    /// command word only via whitespace-delimited `shell_tokens`, so a
+    /// separator glued directly onto adjacent text with no surrounding
+    /// whitespace, a newline separator, a leading assignment word, or a
+    /// leading prefix redirection all hid the real command word from it.
+    /// Each of these four forms reaches the real `.bare` with a `cd ..`
+    /// the old scan would have missed entirely.
+    #[test]
+    fn unsafe_bash_command_word_finds_cd_past_glued_separators_assignments_and_prefix_redirections()
+    {
+        for (command, label) in [
+            ("true;cd ..;printf x>.bare/config", "glued semicolons"),
+            ("true\ncd ..\nprintf x>.bare/config", "newline separator"),
+            ("X=1 cd .. && printf x>.bare/config", "assignment prefix"),
+            (
+                ">harmless cd .. && printf x>.bare/config",
+                "redirection prefix",
+            ),
+        ] {
+            let reason = unsafe_bash_command_word(command);
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("cd")),
+                "{label} ({command:?}) should have flagged `cd`, got {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_denies_each_glued_separator_assignment_and_prefix_redirection_bypass() {
+        for command in [
+            "true;cd ..;printf x>.bare/config",
+            "true\ncd ..\nprintf x>.bare/config",
+            "X=1 cd .. && printf x>.bare/config",
+            ">harmless cd .. && printf x>.bare/config",
+        ] {
+            let (root, canonical_bare, canonical_git) = grove();
+            std::fs::create_dir(root.path().join("main")).unwrap();
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().join("main")),
+            };
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert!(
+                matches!(verdict, Verdict::Deny(_)),
+                "{command:?}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_bash_command_word_skips_multiple_assignments_and_a_bare_redirect_operator() {
+        // Several assignments in a row, and a *bare* redirect operator
+        // (its target a separate word, not glued on) both precede the
+        // real command word.
+        assert!(unsafe_bash_command_word("X=1 Y=2 cd ..")
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cd")));
+        assert!(unsafe_bash_command_word("> harmless cd ..")
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cd")));
+    }
+
+    #[test]
+    fn unsafe_bash_command_word_still_allows_ordinary_assignments_and_prefix_redirections() {
+        // An assignment or prefix redirection ahead of an ordinary,
+        // harmless command word must not itself trigger a deny.
+        assert_eq!(unsafe_bash_command_word("X=1 git status"), None);
+        assert_eq!(unsafe_bash_command_word(">out.log git status"), None);
+        assert_eq!(unsafe_bash_command_word("true; git status"), None);
     }
 }
