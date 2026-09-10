@@ -118,15 +118,42 @@ const UNSAFE_COMMAND_WORDS: &[&str] = &[
 /// quoting and backslash escapes, splits on unquoted whitespace. It is not
 /// a POSIX shell parser and is not meant to be one — see `bash_candidates`.
 fn shell_tokens(command: &str) -> Vec<String> {
+    shell_tokens_scanned(command)
+        .into_iter()
+        .map(|token| token.text)
+        .collect()
+}
+
+/// One token as [`shell_tokens`] produces it, alongside whether any part of
+/// its content came from inside a quoted region (single or double) — see
+/// [`bash_candidates`] for why that matters.
+struct ScannedToken {
+    text: String,
+    quoted: bool,
+}
+
+/// The tokenizer [`shell_tokens`] exposes the plain text of. Kept as its
+/// own function, rather than folded directly into `shell_tokens`, so every
+/// other caller of `shell_tokens` (the command-word scan, its own tests)
+/// keeps working against `Vec<String>` unchanged; only [`bash_candidates`]
+/// needs the extra quote-provenance bit.
+fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut current_quoted = false;
     let mut in_single = false;
     let mut in_double = false;
     let mut chars = command.chars().peekable();
     while let Some(character) = chars.next() {
         match character {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current_quoted = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current_quoted = true;
+            }
             // A backslash-newline is a Bash line continuation: both
             // characters vanish, joining the following line onto this one
             // with nothing inserted between them (`c\<newline>d` becomes
@@ -143,14 +170,20 @@ fn shell_tokens(command: &str) -> Vec<String> {
             }
             character if character.is_whitespace() && !in_single && !in_double => {
                 if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
+                    tokens.push(ScannedToken {
+                        text: std::mem::take(&mut current),
+                        quoted: std::mem::take(&mut current_quoted),
+                    });
                 }
             }
             character => current.push(character),
         }
     }
     if !current.is_empty() {
-        tokens.push(current);
+        tokens.push(ScannedToken {
+            text: current,
+            quoted: current_quoted,
+        });
     }
     tokens
 }
@@ -504,27 +537,58 @@ fn split_redirections(token: &str) -> Vec<String> {
 /// containing it — so this deliberately over-collects candidates rather
 /// than under-collects: a false positive costs an annoying rephrase, a
 /// false negative is the hole this feature exists to close.
+///
+/// A quoted token gets one more pass beyond the plain-token extraction
+/// every token gets: `shell_tokens` strips quotes but does not re-split
+/// unquoted-looking whitespace *inside* what was a quoted region, since
+/// real Bash does not either (`"cd / && printf x > .bare/config"`
+/// tokenizes as one word, not nine, quotes and all). That is exactly right
+/// for running the command, but wrong for finding every path this scan
+/// needs to see: a multi-word command hidden inside a quoted argument —
+/// most commonly the string handed to an external interpreter's own
+/// `-c`/`-e` flag, which this scan does not and cannot enumerate by name
+/// (see the design note on [`UNSAFE_COMMAND_WORDS`]) — would otherwise
+/// present as one opaque, never-matching blob. Splitting a quoted token's
+/// content on whitespace too, and running each resulting word through the
+/// same extraction, finds the path without needing to know anything about
+/// what program the quoted string was headed for.
 fn bash_candidates(command: &str) -> Vec<String> {
     let mut candidates = Vec::new();
-    for token in shell_tokens(command) {
-        if SHELL_OPERATORS.contains(&token.as_str()) {
-            continue;
-        }
-        for part in split_redirections(&token) {
-            let value = if part.starts_with('-') {
-                part.split_once('=')
-                    .map(|(_, value)| value.to_string())
-                    .filter(|value| !value.is_empty())
-            } else {
-                None
-            };
-            candidates.push(part);
-            if let Some(value) = value {
-                candidates.push(value);
+    for token in shell_tokens_scanned(command) {
+        extract_candidates_from_word(&token.text, &mut candidates);
+        if token.quoted {
+            for word in token.text.split_whitespace() {
+                extract_candidates_from_word(word, &mut candidates);
             }
         }
     }
     candidates
+}
+
+/// The extraction one plain Bash word contributes to `candidates`: skip a
+/// recognized shell operator outright, otherwise split on every glued
+/// redirection operator (see [`split_redirections`]) and, for a part that
+/// looks like a long or short option with its value glued on, also yield
+/// the value half. Shared by [`bash_candidates`]'s per-token pass and its
+/// extra pass over a quoted token's whitespace-split words, so the two
+/// never drift in what counts as a candidate.
+fn extract_candidates_from_word(word: &str, candidates: &mut Vec<String>) {
+    if SHELL_OPERATORS.contains(&word) {
+        return;
+    }
+    for part in split_redirections(word) {
+        let value = if part.starts_with('-') {
+            part.split_once('=')
+                .map(|(_, value)| value.to_string())
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
+        candidates.push(part);
+        if let Some(value) = value {
+            candidates.push(value);
+        }
+    }
 }
 
 /// Extract every path an `apply_patch` payload names, or an error if the
@@ -1173,5 +1237,62 @@ mod tests {
     #[test]
     fn shell_tokens_joins_a_backslash_newline_line_continuation() {
         assert_eq!(shell_tokens("c\\\nd .."), vec!["cd", ".."]);
+    }
+
+    /// exec-advisor's finding while reviewing the fourth-round fix: a
+    /// quoted, multi-word argument (most commonly the string handed to an
+    /// external interpreter's own `-c`/`-e` flag, which this scan
+    /// deliberately does not enumerate by program name -- see
+    /// `UNSAFE_COMMAND_WORDS`'s design note) tokenizes as one word with
+    /// internal whitespace, not several, exactly like real Bash. Candidate
+    /// extraction has to look inside that word too, or a path glued into
+    /// the middle of it is invisible to every check downstream.
+    #[test]
+    fn bash_candidates_looks_inside_a_quoted_multi_word_argument() {
+        let candidates = bash_candidates(r#"sh -c "cd / && printf x > .bare/config""#);
+        for expected in ["sh", "-c", "cd", "printf", "x", ".bare/config"] {
+            assert!(
+                candidates.iter().any(|candidate| candidate == expected),
+                "expected {expected:?} among {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_denies_a_protected_path_hidden_inside_a_quoted_interpreter_argument() {
+        let (root, canonical_bare, canonical_git) = grove();
+        let payload = NormalizedPayload {
+            tool: Tool::Bash {
+                command: r#"sh -c "printf x > .bare/config""#.to_string(),
+            },
+            cwd: Some(root.path().to_path_buf()),
+        };
+        let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+        assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    #[test]
+    fn bash_candidates_still_allows_ordinary_quoted_arguments_with_no_hidden_path() {
+        // A quoted argument with internal whitespace but no `.`/`/`
+        // anywhere in it should not somehow start resolving to `.bare`
+        // once it is also whitespace-split; every legitimate quoted-
+        // multi-word case already covered by `decide` staying `Allow`
+        // elsewhere in this suite must keep doing so.
+        let (root, canonical_bare, canonical_git) = grove();
+        for command in [
+            "bash script.sh",
+            r#"git commit -m "fix the thing""#,
+            r#"grep -r "some pattern" src/"#,
+            r#"echo "hello world""#,
+        ] {
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().to_path_buf()),
+            };
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert_eq!(verdict, Verdict::Allow, "{command:?}: {verdict:?}");
+        }
     }
 }
