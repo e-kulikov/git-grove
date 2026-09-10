@@ -571,21 +571,33 @@ const ENV_NO_VALUE_SHORT_FLAGS: &str = "i0v";
 
 /// `env`'s own one-letter short options that take a value, either glued
 /// on (`-uFOO`) or as a separate following word (`-u FOO`) — see
-/// [`short_option_cluster_needs_separate_value`].
-const ENV_VALUE_SHORT_FLAGS: &str = "uS";
+/// [`short_option_cluster_needs_separate_value`]. Confirmed against the
+/// installed `env --help`: `-a`/`--argv0=ARG` (pass a different argv[0] to
+/// the command), `-u`/`--unset=NAME`, `-S`/`--split-string=S` are the
+/// three that require one, unlike `-C` (handled separately, see above).
+const ENV_VALUE_SHORT_FLAGS: &str = "auS";
 
-/// `env`'s own long options that take no value at all.
+/// `env`'s own long options that take no value at all — including the
+/// three signal-handling ones whose argument, per `env --help`'s own
+/// `[=SIG]` bracket notation, is optional and only ever glued on via `=`
+/// (`--block-signal=PIPE`), never a separate word, the same shape
+/// `--exec-path` has on `git` — so, like that one, they belong here, not
+/// in [`ENV_VALUE_LONG_OPTIONS`].
 const ENV_NO_VALUE_LONG_OPTIONS: &[&str] = &[
     "--ignore-environment",
     "--null",
     "--debug",
     "--help",
     "--version",
+    "--block-signal",
+    "--default-signal",
+    "--ignore-signal",
+    "--list-signal-handling",
 ];
 
-/// `env`'s own long options that take a value, either glued on via `=`
-/// (`--unset=FOO`) or as a separate following word (`--unset FOO`).
-const ENV_VALUE_LONG_OPTIONS: &[&str] = &["--unset", "--split-string"];
+/// `env`'s own long options that always take a value, either glued on via
+/// `=` (`--unset=FOO`) or as a separate following word (`--unset FOO`).
+const ENV_VALUE_LONG_OPTIONS: &[&str] = &["--argv0", "--unset", "--split-string"];
 
 /// `timeout`'s own one-letter short options that take no value at all
 /// (`-f`/`--foreground`, `-p`/`--preserve-status`, `-v`/`--verbose`).
@@ -2404,6 +2416,25 @@ mod tests {
         for command in ["env -zzz FOO cmd", "timeout --bogus 2 cmd"] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
+    }
+
+    /// exec-reviewer's own regression probe (`env -a fake git --version`
+    /// ran successfully, confirming `-a`/`--argv0=ARG` is a real,
+    /// documented `env` option this scan had missed) found it denied as
+    /// "unrecognized" by the fail-closed check above — safe, but an
+    /// unnecessary denial on a legitimate option. Confirmed against the
+    /// installed `env --help`: `-a` takes a mandatory value; the three
+    /// signal-handling long options take only an optional, always-glued
+    /// `=value` (the same shape `git --exec-path` has), never a separate
+    /// word.
+    #[test]
+    fn unsafe_bash_directory_flag_recognizes_env_argv0_and_signal_options() {
+        assert_eq!(unsafe_bash_directory_flag("env -a fake git status"), None);
+        assert_eq!(
+            unsafe_bash_directory_flag("env --block-signal=PIPE git status"),
+            None
+        );
+        assert!(unsafe_bash_directory_flag("env -a fake -C / git status").is_some());
     }
 
     /// `tar`/`make` are deliberately not scoped to leading options only
