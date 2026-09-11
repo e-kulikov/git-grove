@@ -849,7 +849,14 @@ fn long_option_needs_separate_value(
 /// *always* takes its value as a separate following word, rather than
 /// only glued onto the flag itself — the same question
 /// [`short_option_cluster_needs_separate_value`]/[`long_option_needs_separate_value`]
-/// answer for `env`/`timeout`. This only matters for
+/// answer for `env`/`timeout`. `--config-env` was added after
+/// `option_grammar_oracle::git_global_option_grammar_has_no_undetected_value_taking_flags`
+/// caught it missing on its very first run — confirmed directly
+/// (`git --config-env core.pager=cat ...` errors looking up an env var
+/// named after the value, so it is genuinely parsed as `-c`'s sibling,
+/// not left as literal text) — the exact class of drift this test exists
+/// to catch automatically instead of waiting for another exec-reviewer
+/// round to stumble onto it by hand. This only matters for
 /// [`resolve_directory_flag`]'s stop-at-first-non-option-token rule for
 /// `git`: without skipping the value too, `git -c alias.v=version -C / v`'s
 /// `alias.v=version` (the *value* of `-c`, not a subcommand) would wrongly
@@ -878,7 +885,11 @@ fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(command_word);
-    name == "git" && matches!(token, "-c" | "--git-dir" | "--work-tree" | "--namespace")
+    name == "git"
+        && matches!(
+            token,
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env"
+        )
 }
 
 /// Resolve one simple command's directory-changing exposure, starting at
@@ -2678,6 +2689,7 @@ mod tests {
         for command in [
             "git -c alias.v=version -C / v",
             "git --git-dir /somewhere -C / status",
+            "git --config-env core.pager=cat -C / status",
             "env -u FOO -C / pwd",
             "env -S 'a b' -C / pwd",
         ] {
@@ -3135,5 +3147,452 @@ mod tests {
         };
         let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
         assert!(matches!(verdict, Verdict::Deny(_)), "{verdict:?}");
+    }
+
+    /// Differential option-grammar harness for `env`/`timeout`/`git`,
+    /// checking this file's own option-consumption classifiers
+    /// (`short_option_cluster_needs_separate_value`,
+    /// `long_option_needs_separate_value`, `option_consumes_separate_value`)
+    /// against the real installed binaries, rather than relying solely on
+    /// hand-discovered edge cases the way the ten rounds before it did.
+    /// Design: `.superpowers/sdd/2026-09-11-option-grammar-oracle-design.md`
+    /// (exec-advisor, verified empirically against GNU coreutils 9.7).
+    ///
+    /// What this tests, and why: `resolve_directory_flag` does not answer
+    /// "does this command change directory" — it answers a token-index
+    /// question, "does option token `T` on program `P` consume the
+    /// *following word* as its own value". Every bug found in ten review
+    /// rounds was a wrong answer to exactly that question for one option.
+    /// It is a boolean, cheap to determine with a side-effect-free probe,
+    /// and — unlike the arbitrary-external-interpreter class this whole
+    /// guard already accepts as an unbounded residual — env/git/timeout's
+    /// option grammars are closed, documented, and testable exhaustively
+    /// against ground truth, not "any language in any external program".
+    ///
+    /// Bounded and deterministic, not a randomized fuzzer: the option
+    /// list is derived from each binary's own `--help`/usage text at test
+    /// time (not a hand-written table), which is what keeps this
+    /// protective against a future binary version growing a new flag — a
+    /// checked-in fixture could not do that, so none is kept. `env`/
+    /// `timeout` get the full two-probe marker oracle (the two programs
+    /// with the most historical bugs, and a uniform getopt-style grammar
+    /// that makes one generic probe shape work for every option); `git`
+    /// gets a drift detector over its own usage synopsis instead of a
+    /// full oracle, since its four modeled global options each need a
+    /// different, syntactically valid placeholder value (`-c` needs
+    /// `key=value` shape, `--work-tree` needs a real path, …) that does
+    /// not generalize the way `env`/`timeout`'s plain string arguments do
+    /// — those four are already covered by hand-verified regression tests
+    /// elsewhere in this file, confirmed against real git when written.
+    mod option_grammar_oracle {
+        use super::*;
+        use std::path::Path;
+        use std::process::Command;
+
+        /// Whether `binary`'s installed version identifies itself as GNU
+        /// coreutils — the only implementation this harness's
+        /// differential assertions are meaningful against (BSD/macOS
+        /// `env`/`timeout` have different option grammars entirely, and
+        /// asserting our GNU-modeled constants against them would just be
+        /// wrong, not protective). Skips rather than fails when this is
+        /// false or the binary cannot be probed at all.
+        fn is_gnu_coreutils(binary: &str) -> bool {
+            Command::new(binary)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .is_some_and(|output| String::from_utf8_lossy(&output.stdout).contains("coreutils"))
+        }
+
+        /// One option line parsed out of a GNU coreutils `--help` listing
+        /// — only the name matters here; whether it takes a value is
+        /// determined empirically by [`oracle_consumes_value`] instead of
+        /// trusted from the help text's own `=`/`[=…]` punctuation.
+        #[derive(Debug)]
+        struct HelpOption {
+            short: Option<char>,
+            long: String,
+        }
+
+        /// Parse every `  -x, --long[=VALUE]…` / `      --long=VALUE…`
+        /// option line out of `<binary> --help`'s own listing. This is
+        /// the mechanism that keeps the harness protective against a
+        /// future binary version growing a new flag: a checked-in list
+        /// cannot do that, a help-derived one grows a new case the moment
+        /// the binary does.
+        fn parse_help_options(binary: &str) -> Vec<HelpOption> {
+            let output = Command::new(binary)
+                .arg("--help")
+                .output()
+                .unwrap_or_else(|error| panic!("{binary} --help: {error}"));
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(parse_help_option_line)
+                .collect()
+        }
+
+        fn parse_help_option_line(line: &str) -> Option<HelpOption> {
+            // A real option line is indented (never the Usage:/blank/
+            // section-header lines); a continuation-description line is
+            // indented too, but — checked below — never starts with `-`.
+            if !line.starts_with("  ") {
+                return None;
+            }
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('-') {
+                return None;
+            }
+            let (short, after_short) = if trimmed.as_bytes().get(1) == Some(&b'-') {
+                (None, trimmed)
+            } else {
+                let short = trimmed[1..].chars().next()?;
+                let after = trimmed.get(2..)?.trim_start_matches(',').trim_start();
+                (Some(short), after)
+            };
+            let rest = after_short.strip_prefix("--")?;
+            let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let token = &rest[..token_end];
+            let long = token
+                .find(['=', '['])
+                .map_or(token, |index| &token[..index])
+                .to_string();
+            Some(HelpOption { short, long })
+        }
+
+        /// Ground truth for "did the marker actually run", by comparing
+        /// its stdout against `cwd`'s own canonical path — not exit
+        /// status alone, which is an unsound oracle (`env -u /bin/pwd`
+        /// exits `0` having consumed `/bin/pwd` as the variable name to
+        /// unset and then dumped the environment, never running it).
+        /// Spawns an existing on-disk binary (`/bin/pwd`) rather than
+        /// writing and immediately exec'ing a fresh marker script — that
+        /// would reproduce the `ETXTBSY` race this repo's own release
+        /// notes already document as a real, CI-load-reproducible flake.
+        fn marker_ran(mut command: Command, cwd: &Path) -> bool {
+            command.current_dir(cwd);
+            let Ok(output) = command.output() else {
+                return false;
+            };
+            let Ok(expected) = cwd.canonicalize() else {
+                return false;
+            };
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == expected.to_string_lossy()
+        }
+
+        /// The path to the marker binary every probe below execs as the
+        /// thing that either does or doesn't get reached — checked once,
+        /// since a machine without it (unlikely on anything GNU
+        /// coreutils runs on, but not impossible) makes every probe
+        /// vacuously "didn't run" rather than meaningfully "ran".
+        fn has_marker_binary() -> bool {
+            Path::new("/bin/pwd").exists()
+        }
+
+        /// Ground truth, via the two-probe marker oracle, for whether
+        /// `wrapper`'s option `flag` consumes a following word as its
+        /// own value. `tail_if_consumed`/`tail_if_not` are the tokens a
+        /// *well-formed* invocation needs after `flag` in each case —
+        /// `["FILLER", "/bin/pwd"]`/`["/bin/pwd"]` for `env` (nothing
+        /// else required); `["FILLER", "1", "/bin/pwd"]`/`["1",
+        /// "/bin/pwd"]` for `timeout`, whose grammar always needs exactly
+        /// one `DURATION` positional after its own options regardless of
+        /// what `flag` did with `FILLER`.
+        ///
+        /// `Some(true)`: only the "consumed" probe ran the marker.
+        /// `Some(false)`: only the "not consumed" probe ran the marker.
+        /// `None`: neither probe ran it — the option's real grammar
+        /// refuses to run *any* command in this shape at all (confirmed
+        /// for `env -0`: coreutils refuses combining `--null` with a
+        /// command to run, and for `--help`/`--version`, which print and
+        /// exit before ever reaching a command). This is a real, distinct
+        /// outcome, not a harness bug — callers must skip the assertion,
+        /// not fail on it.
+        fn oracle_consumes_value(
+            wrapper: &str,
+            flag: &str,
+            tail_if_consumed: &[&str],
+            tail_if_not: &[&str],
+        ) -> Option<bool> {
+            let consumed_dir = tempfile::tempdir().unwrap();
+            let mut consumed_command = Command::new(wrapper);
+            consumed_command.arg(flag).args(tail_if_consumed);
+            let consumed = marker_ran(consumed_command, consumed_dir.path());
+
+            let not_consumed_dir = tempfile::tempdir().unwrap();
+            let mut not_consumed_command = Command::new(wrapper);
+            not_consumed_command.arg(flag).args(tail_if_not);
+            let not_consumed = marker_ran(not_consumed_command, not_consumed_dir.path());
+
+            match (consumed, not_consumed) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                (false, false) => None,
+                (true, true) => panic!(
+                    "{wrapper} {flag}: both probes ran the marker — oracle assumption violated, the two invocations were not actually distinguishing anything"
+                ),
+            }
+        }
+
+        /// `env`'s own options this harness does not put through the
+        /// generic consumption oracle at all, each for a documented
+        /// reason: `-C`/`--chdir` needs no oracle, only an existence
+        /// check — this scan denies it outright on sight
+        /// (`resolve_directory_flag`'s `env` arm), there is no
+        /// "consumption" behavior to compare against. `-S`/`--split-string`
+        /// is also denied unconditionally regardless of its own
+        /// consumption grammar (`is_env_split_string_option`), and its
+        /// real behavior (re-parsing its value as a fresh command line)
+        /// does not fit this harness's marker-oracle shape cleanly either.
+        const ENV_OPTIONS_EXCLUDED_FROM_ORACLE: &[&str] = &["chdir", "split-string"];
+
+        #[test]
+        fn env_option_grammar_matches_real_env() {
+            if !is_gnu_coreutils("env") {
+                eprintln!(
+                    "skipping env_option_grammar_matches_real_env: `env` is not GNU coreutils"
+                );
+                return;
+            }
+            if !has_marker_binary() {
+                eprintln!(
+                    "skipping env_option_grammar_matches_real_env: no /bin/pwd marker binary"
+                );
+                return;
+            }
+            let options = parse_help_options("env");
+            assert!(!options.is_empty(), "env --help: parsed no options at all — the parser or the help text format has drifted");
+
+            for option in &options {
+                if ENV_OPTIONS_EXCLUDED_FROM_ORACLE.contains(&option.long.as_str()) {
+                    continue;
+                }
+
+                // Drift detector: every option the binary itself
+                // documents must be recognized by our own constants —
+                // this is what catches a future coreutils release
+                // growing a flag this scan has never heard of.
+                let long_flag = format!("--{}", option.long);
+                let recognized = ENV_NO_VALUE_LONG_OPTIONS.contains(&long_flag.as_str())
+                    || ENV_VALUE_LONG_OPTIONS.contains(&long_flag.as_str());
+                assert!(
+                    recognized,
+                    "env --help documents `{long_flag}`, which neither ENV_NO_VALUE_LONG_OPTIONS nor ENV_VALUE_LONG_OPTIONS recognizes in decision.rs — env's modeled option grammar is out of date"
+                );
+                if let Some(short) = option.short {
+                    assert!(
+                        ENV_NO_VALUE_SHORT_FLAGS.contains(short) || ENV_VALUE_SHORT_FLAGS.contains(short),
+                        "env --help documents `-{short}` (`{long_flag}`), which neither ENV_NO_VALUE_SHORT_FLAGS nor ENV_VALUE_SHORT_FLAGS recognizes in decision.rs — env's modeled option grammar is out of date"
+                    );
+                }
+
+                // Differential oracle: does the real binary agree with
+                // our classifiers on whether this option consumes a
+                // following word? Skipped (not failed) when the option's
+                // own grammar refuses to run anything at all in this
+                // probe shape (`--help`/`--version`/`-0` — see
+                // `oracle_consumes_value`'s own doc comment).
+                let long_truth = oracle_consumes_value(
+                    "env",
+                    &long_flag,
+                    &["FILLER", "/bin/pwd"],
+                    &["/bin/pwd"],
+                );
+                if let Some(truth) = long_truth {
+                    let parsed = long_option_needs_separate_value(
+                        &long_flag,
+                        ENV_NO_VALUE_LONG_OPTIONS,
+                        ENV_VALUE_LONG_OPTIONS,
+                    );
+                    assert_eq!(
+                        parsed,
+                        Some(truth),
+                        "env {long_flag}: real env {}, but long_option_needs_separate_value says {parsed:?}",
+                        if truth { "consumes a following word as its value" } else { "does not consume a following word" }
+                    );
+                }
+
+                if let Some(short) = option.short {
+                    let short_flag = format!("-{short}");
+                    let short_truth = oracle_consumes_value(
+                        "env",
+                        &short_flag,
+                        &["FILLER", "/bin/pwd"],
+                        &["/bin/pwd"],
+                    );
+                    if let Some(truth) = short_truth {
+                        let parsed = short_option_cluster_needs_separate_value(
+                            &short_flag,
+                            ENV_NO_VALUE_SHORT_FLAGS,
+                            ENV_VALUE_SHORT_FLAGS,
+                        );
+                        assert_eq!(
+                            parsed,
+                            Some(truth),
+                            "env {short_flag}: real env {}, but short_option_cluster_needs_separate_value says {parsed:?}",
+                            if truth { "consumes a following word as its value" } else { "does not consume a following word" }
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn timeout_option_grammar_matches_real_timeout() {
+            if !is_gnu_coreutils("timeout") {
+                eprintln!("skipping timeout_option_grammar_matches_real_timeout: `timeout` is not GNU coreutils");
+                return;
+            }
+            if !has_marker_binary() {
+                eprintln!("skipping timeout_option_grammar_matches_real_timeout: no /bin/pwd marker binary");
+                return;
+            }
+            let options = parse_help_options("timeout");
+            assert!(!options.is_empty(), "timeout --help: parsed no options at all — the parser or the help text format has drifted");
+
+            let tail_if_consumed: &[&str] = &["FILLER", "1", "/bin/pwd"];
+            let tail_if_not: &[&str] = &["1", "/bin/pwd"];
+
+            for option in &options {
+                let long_flag = format!("--{}", option.long);
+                let recognized = TIMEOUT_NO_VALUE_LONG_OPTIONS.contains(&long_flag.as_str())
+                    || TIMEOUT_VALUE_LONG_OPTIONS.contains(&long_flag.as_str());
+                assert!(
+                    recognized,
+                    "timeout --help documents `{long_flag}`, which neither TIMEOUT_NO_VALUE_LONG_OPTIONS nor TIMEOUT_VALUE_LONG_OPTIONS recognizes in decision.rs — timeout's modeled option grammar is out of date"
+                );
+                if let Some(short) = option.short {
+                    assert!(
+                        TIMEOUT_NO_VALUE_SHORT_FLAGS.contains(short)
+                            || TIMEOUT_VALUE_SHORT_FLAGS.contains(short),
+                        "timeout --help documents `-{short}` (`{long_flag}`), which neither TIMEOUT_NO_VALUE_SHORT_FLAGS nor TIMEOUT_VALUE_SHORT_FLAGS recognizes in decision.rs — timeout's modeled option grammar is out of date"
+                    );
+                }
+
+                let long_truth =
+                    oracle_consumes_value("timeout", &long_flag, tail_if_consumed, tail_if_not);
+                if let Some(truth) = long_truth {
+                    let parsed = long_option_needs_separate_value(
+                        &long_flag,
+                        TIMEOUT_NO_VALUE_LONG_OPTIONS,
+                        TIMEOUT_VALUE_LONG_OPTIONS,
+                    );
+                    assert_eq!(
+                        parsed,
+                        Some(truth),
+                        "timeout {long_flag}: real timeout {}, but long_option_needs_separate_value says {parsed:?}",
+                        if truth { "consumes a following word as its value" } else { "does not consume a following word" }
+                    );
+                }
+
+                if let Some(short) = option.short {
+                    let short_flag = format!("-{short}");
+                    let short_truth = oracle_consumes_value(
+                        "timeout",
+                        &short_flag,
+                        tail_if_consumed,
+                        tail_if_not,
+                    );
+                    if let Some(truth) = short_truth {
+                        let parsed = short_option_cluster_needs_separate_value(
+                            &short_flag,
+                            TIMEOUT_NO_VALUE_SHORT_FLAGS,
+                            TIMEOUT_VALUE_SHORT_FLAGS,
+                        );
+                        assert_eq!(
+                            parsed,
+                            Some(truth),
+                            "timeout {short_flag}: real timeout {}, but short_option_cluster_needs_separate_value says {parsed:?}",
+                            if truth { "consumes a following word as its value" } else { "does not consume a following word" }
+                        );
+                    }
+                }
+            }
+        }
+
+        /// `git`'s own global-option grammar is not uniform getopt style
+        /// the way `env`/`timeout`'s is: each of the four options this
+        /// scan models needs a differently-shaped, syntactically valid
+        /// placeholder value to probe against (`-c` needs `key=value`,
+        /// `--work-tree`/`--git-dir` need a real path, …), so a single
+        /// generic marker-oracle shape does not generalize here the way
+        /// it does for the other two. Those four are covered by
+        /// hand-verified regression tests elsewhere in this file
+        /// (`unsafe_bash_directory_flag_still_finds_short_c_past_a_separate_value_option`,
+        /// `unsafe_bash_directory_flag_does_not_swallow_c_after_bare_exec_path`),
+        /// each confirmed against real git when written.
+        ///
+        /// What this test adds instead: a drift detector over git's own
+        /// usage synopsis (`git --help`'s first lines, the same
+        /// `[-c <name>=<value>]`-shaped listing `git`'s own error
+        /// messages print), catching a *new* value-taking global option a
+        /// future git version might add that `option_consumes_separate_value`
+        /// does not yet know about — the same protective goal the
+        /// env/timeout oracles serve, achieved differently for a grammar
+        /// that resists a single generic probe.
+        #[test]
+        fn git_global_option_grammar_has_no_undetected_value_taking_flags() {
+            let Ok(output) = Command::new("git").arg("--help").output() else {
+                eprintln!("skipping git_global_option_grammar_has_no_undetected_value_taking_flags: git not runnable");
+                return;
+            };
+            let text = String::from_utf8_lossy(&output.stdout);
+            // git's own usage synopsis, wherever it appears in --help's
+            // output, listing each global option in [-x] / [-x <val>] /
+            // [--name[=<val>]] form on one or more `usage: git ...` lines.
+            let synopsis: String = text
+                .lines()
+                .skip_while(|line| !line.trim_start().starts_with("usage: git"))
+                .take_while(|line| {
+                    line.trim_start().starts_with("usage: git") || line.starts_with("           ")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if synopsis.is_empty() {
+                eprintln!("skipping git_global_option_grammar_has_no_undetected_value_taking_flags: could not locate git's usage synopsis in --help output");
+                return;
+            }
+
+            // git's synopsis always glues a long option's value on with
+            // `=`, never a space (`--work-tree=<path>`, not `--work-tree
+            // <path>`) — confirmed directly (`git --namespace foo status`
+            // runs normally, `git --git-dir /tmp` consumes `/tmp` as its
+            // value) that these mandatory, `=`-shown options still accept
+            // a *separate* word too, exactly the shape
+            // `option_consumes_separate_value` models. So the marker to
+            // look for is a bare `=` immediately after the option name —
+            // `--exec-path[=<path>]` (optional, glued only) and a bare
+            // `--name` with nothing after (no value at all) must both be
+            // skipped, only `--name=<value>` (mandatory) flagged. Scanned
+            // per whitespace-split word (not the option's own bracket
+            // depth, which does not reliably delimit with simple
+            // trimming) since `split_whitespace` already isolates each
+            // option's own text with no embedded spaces to worry about.
+            for word in synopsis.split_whitespace() {
+                let Some(dashes_at) = word.find("--") else {
+                    continue;
+                };
+                let after_dashes = &word[dashes_at + 2..];
+                let name_end = after_dashes
+                    .find(|character: char| {
+                        !(character.is_ascii_alphanumeric() || character == '-')
+                    })
+                    .unwrap_or(after_dashes.len());
+                if name_end == 0 {
+                    continue;
+                }
+                let name = &after_dashes[..name_end];
+                let mandatory_value = after_dashes[name_end..].starts_with('=');
+                if !mandatory_value {
+                    continue;
+                }
+                let flag = format!("--{name}");
+                assert!(
+                    option_consumes_separate_value("git", &flag),
+                    "git --help's usage synopsis documents `{flag}=<value>` as a mandatory value — option_consumes_separate_value does not yet recognize it. Confirm its real grammar (glued-only like --exec-path, or truly mandatory and separate-word-capable like -c/--git-dir) and update accordingly"
+                );
+            }
+        }
     }
 }
