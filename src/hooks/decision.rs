@@ -711,6 +711,44 @@ fn is_short_c_flag(token: &str) -> bool {
         .is_some_and(|rest| rest.contains('C'))
 }
 
+/// The `env`-specific, precise variant of [`is_short_c_flag`]: walks a
+/// short-option cluster letter by letter against `env`'s own known
+/// no-value/value-taking sets, rather than matching any token containing
+/// an uppercase `C` anywhere. `is_short_c_flag`'s broader match is a
+/// deliberate trade for `git`/`make`/`tar`, whose full short-option
+/// grammars this scan does not otherwise model at all — but `env`'s own
+/// grammar is already fully classified elsewhere in this file
+/// ([`ENV_NO_VALUE_SHORT_FLAGS`]/[`ENV_VALUE_SHORT_FLAGS`]), so reusing
+/// the broad heuristic here cost real precision for nothing:
+/// `-uCOLORTERM` (`-u`'s own glued value, a real environment variable
+/// name that merely happens to start with `C`) was wrongly denied as a
+/// directory-changing flag. A no-value letter before `C` is transparent
+/// (keep scanning); a *different* value-taking letter before `C`
+/// consumes the rest of the token as its own value, so a `C` beyond that
+/// point is never a real flag position; `C` itself, once reached, is
+/// always the match — bare, or with the rest of the token glued on as
+/// its own value (`-C`, `-Cdir`, `-iC/path`).
+fn is_env_short_c_flag(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix('-') else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with('-') {
+        return false;
+    }
+    for letter in rest.chars() {
+        if letter == 'C' {
+            return true;
+        }
+        if ENV_VALUE_SHORT_FLAGS.contains(letter) {
+            return false;
+        }
+        if !ENV_NO_VALUE_SHORT_FLAGS.contains(letter) {
+            return false;
+        }
+    }
+    false
+}
+
 /// Programs that transparently re-exec their remaining arguments as another
 /// command, without altering how any later program's own flags are parsed
 /// — scheduling and process-group wrappers, not shells or interpreters. A
@@ -1032,7 +1070,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 next += 1;
                 break;
             }
-            if is_short_c_flag(token) {
+            if is_env_short_c_flag(token) {
                 return Some(format!(
                     "a directory-changing `-C` flag on `{command_word}`"
                 ));
@@ -2586,6 +2624,32 @@ mod tests {
             "nice -n 10 git -C / status",
             "nice --adjustment 10 git -C / status",
             "nice nohup git -C / status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's own discovery: `is_short_c_flag`'s broad "any
+    /// token containing uppercase C" match — the right trade for
+    /// `git`/`make`/`tar`, whose full short-option grammars this scan
+    /// does not model — cost real precision when reused for `env`, whose
+    /// grammar already *is* fully classified elsewhere in this file.
+    /// `-uCOLORTERM` is `-u`'s own glued value (a real environment
+    /// variable name), not a `-C` flag at all, and was wrongly denied;
+    /// `is_env_short_c_flag` must still catch every genuinely live form.
+    #[test]
+    fn unsafe_bash_directory_flag_does_not_mistake_a_value_taking_flags_glued_value_for_c() {
+        for command in [
+            "env -uCOLORTERM sh -c 'true'",
+            "env -uC sh -c 'true'",
+            "env -aColorTerm sh -c 'true'",
+        ] {
+            assert_eq!(unsafe_bash_directory_flag(command), None, "{command:?}");
+        }
+        for command in [
+            "env -C / git status",
+            "env -iC/ touch somewhere",
+            "env -C.. touch somewhere",
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
