@@ -1006,6 +1006,13 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 next += 1;
                 break;
             }
+            if let Some(bare) = redirection_prefix(token) {
+                next += 1;
+                if bare {
+                    next += 1;
+                }
+                continue;
+            }
             if !token.starts_with('-') {
                 break;
             }
@@ -1025,6 +1032,13 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             if token == "--" {
                 next += 1;
                 break;
+            }
+            if let Some(bare) = redirection_prefix(token) {
+                next += 1;
+                if bare {
+                    next += 1;
+                }
+                continue;
             }
             if !token.starts_with('-') {
                 break;
@@ -1070,6 +1084,13 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 next += 1;
                 break;
             }
+            if let Some(bare) = redirection_prefix(token) {
+                next += 1;
+                if bare {
+                    next += 1;
+                }
+                continue;
+            }
             if is_env_short_c_flag(token) {
                 return Some(format!(
                     "a directory-changing `-C` flag on `{command_word}`"
@@ -1109,6 +1130,19 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 if needs_value {
                     next += 1;
                 }
+                continue;
+            }
+            if token == "-" {
+                // A lone `-` is `env`'s own documented shorthand for
+                // `-i` (confirmed against `env --help`: "A mere - implies
+                // -i"), not a bundle with zero letters in it —
+                // `short_option_cluster_needs_separate_value` correctly
+                // treats an empty cluster as unrecognized in general (a
+                // bare `-` means something different, or nothing at all,
+                // for most other programs), so this needs its own
+                // no-value case rather than teaching that shared
+                // classifier a rule that is specific to `env`.
+                next += 1;
                 continue;
             }
             if token.starts_with('-') {
@@ -1169,6 +1203,12 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
     while let Some(token) = rest.next() {
         if token == "--" {
             break;
+        }
+        if let Some(bare) = redirection_prefix(token) {
+            if bare {
+                rest.next();
+            }
+            continue;
         }
         if is_short_c_flag(token) {
             return Some(format!(
@@ -2587,6 +2627,39 @@ mod tests {
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
+    }
+
+    /// exec-reviewer's own discovery: a Bash redirection interposed
+    /// between a command word and its own arguments (`git 2>/dev/null -C
+    /// / status`) is consumed entirely by Bash itself before the program
+    /// ever sees it — it is not a positional argument and never the
+    /// program's subcommand — but every loop here that walks a command's
+    /// own arguments treated an unrecognized, non-`-`-prefixed token
+    /// (which `2>/dev/null` looks exactly like) as the boundary to stop
+    /// at, missing a real `-C` right after it. Affects all four wrapper
+    /// arms identically: `git`/`make`/`tar`'s own `stop_at_first_positional`
+    /// scan, `nice`/`nohup`/`setsid`'s leading-flag skip, `timeout`'s, and
+    /// `env`'s.
+    #[test]
+    fn unsafe_bash_directory_flag_treats_a_mid_command_redirection_as_transparent() {
+        for command in [
+            "git 2>/dev/null -C / status",
+            "nice 2>/dev/null git -C / status",
+            "timeout 2>/dev/null 2 git -C / status",
+            "env 2>/dev/null -C / git status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's own discovery: a lone `-` is `env`'s own
+    /// documented shorthand for `-i` (`env --help`: "A mere - implies
+    /// -i"), confirmed directly (`env - git --version` runs normally) --
+    /// not an unrecognized, zero-letter option bundle.
+    #[test]
+    fn unsafe_bash_directory_flag_treats_envs_lone_dash_as_a_no_value_flag() {
+        assert_eq!(unsafe_bash_directory_flag("env - git --version"), None);
+        assert!(unsafe_bash_directory_flag("env - git -C / status").is_some());
     }
 
     /// exec-reviewer's sixth-round finding on the scoped `-C` check: a
