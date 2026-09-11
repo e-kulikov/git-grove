@@ -668,6 +668,21 @@ const WRAPPABLE_PROGRAM_NAMES: &[&str] = &[
 /// quoted token's own text, unlike a plain "mentioned anywhere" match,
 /// which — un-narrowed the same way — denied ordinary prose outright; see
 /// the call site in [`unsafe_bash_construct`].
+///
+/// One narrow, accepted residual remains, structurally impossible to
+/// close with this same single signal: quoted prose that itself
+/// describes a command *example*, in exactly this shape (`git commit -m
+/// "see git -C docs"`), is indistinguishable from quoted prose that *is*
+/// one (`bash -c 'sudo git -C / status'`) — both are an unrecognized
+/// leading word, a tracked name, then a `-`-prefixed token, with no
+/// further signal in either to tell them apart short of parsing English.
+/// Per the standing instruction for any construct this scan cannot
+/// positively verify as safe — deny by default, rather than silently
+/// guess — the documentation-example case is deliberately left on the
+/// "denied" side of that line rather than chased with a further
+/// heuristic; splitting such a commit message into its own tool call
+/// costs an annoying rephrase, exactly the accepted trade this file
+/// makes everywhere a fully general check is infeasible.
 fn mentions_a_wrappable_program(
     tokens: &[String],
     command_word_index: usize,
