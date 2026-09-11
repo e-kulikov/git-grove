@@ -1029,6 +1029,11 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 continue;
             }
             if !token.starts_with('-') {
+                if looks_like_unrecognized_prefix(token) {
+                    return Some(format!(
+                        "an assignment or redirection prefix (`{token}`) whose grammar is not fully recognized"
+                    ));
+                }
                 break;
             }
             let consumes_next_word = WRAPPER_OPTIONS_WITH_SEPARATE_VALUE.contains(&token);
@@ -1056,6 +1061,11 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 continue;
             }
             if !token.starts_with('-') {
+                if looks_like_unrecognized_prefix(token) {
+                    return Some(format!(
+                        "an assignment or redirection prefix (`{token}`) whose grammar is not fully recognized"
+                    ));
+                }
                 break;
             }
             let needs_value = if token.starts_with("--") {
@@ -1186,6 +1196,11 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 next += 1;
                 continue;
             }
+            if looks_like_unrecognized_prefix(token) {
+                return Some(format!(
+                    "an assignment or redirection prefix (`{token}`) whose grammar is not fully recognized"
+                ));
+            }
             break;
         }
         return resolve_directory_flag(tokens, next);
@@ -1245,6 +1260,11 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 continue;
             }
             if !token.starts_with('-') {
+                if looks_like_unrecognized_prefix(token) {
+                    return Some(format!(
+                        "an assignment or redirection prefix (`{token}`) whose grammar is not fully recognized"
+                    ));
+                }
                 break;
             }
         }
@@ -2728,6 +2748,33 @@ mod tests {
             "nice -n 2>/dev/null 10 git -C / status",
             "timeout -k 2>/dev/null 5 2 git -C / status",
             "timeout -f 2>/dev/null 2 git -C / status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's own discovery: a descriptor-duplication redirect
+    /// like `2>&1` is deliberately *not* recognized by `redirection_prefix`
+    /// (its target starts with `&`, one of the combined-stream forms that
+    /// function fails closed on rather than fully parses — see its own
+    /// doc comment) — but every loop's "not `-`-prefixed, therefore this
+    /// must be the exec target/subcommand" boundary check treated it as a
+    /// legitimate positional anyway, once `redirection_prefix` said "not a
+    /// redirection I understand". `git 2>&1 -C / status` (and the
+    /// equivalent through each of the other three wrapper arms) reached
+    /// this exact gap. `looks_like_unrecognized_prefix` already exists to
+    /// fail closed on precisely this shape elsewhere in this file
+    /// (`command_word_index_in_segment`'s leading-prefix case); consulting
+    /// it here too, before treating an unrecognized non-flag token as a
+    /// safe boundary, denies rather than silently guesses.
+    #[test]
+    fn unsafe_bash_directory_flag_denies_an_unrecognized_redirection_shape_rather_than_treating_it_as_the_target(
+    ) {
+        for command in [
+            "git 2>&1 -C / status",
+            "nice 2>&1 git -C / status",
+            "timeout 2>&1 2 git -C / status",
+            "env 2>&1 -C / git status",
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
