@@ -329,20 +329,18 @@ fn unsafe_bash_construct(command: &str) -> Option<String> {
         // `unsafe_bash_directory_flag` alone always recurses into quoted
         // content, unlike the rest of this recursion below: it only
         // denies on an exact match against a small, specific vocabulary
-        // (`--chdir`/`--directory`, or `-C` on one of four well-known
-        // programs), so it carries essentially none of the false-positive
-        // risk `looks_like_shell_code` exists to gate the broader
-        // character/command-word recursion against — with one exception:
-        // its own universal fallback (`mentions_a_wrappable_program`) is
-        // exactly the kind of broad, low-precision check that risk exists
-        // to guard against (`"run git later"` inside an ordinary quoted
-        // commit message would otherwise deny it, treating the quoted
-        // text as if it were `run`'s own command line whose "arguments"
-        // happen to mention `git`), so it is passed `false` here via
-        // `unsafe_bash_directory_flag_scoped` — unlike the exact-match
-        // checks this call still applies unconditionally, that fallback
-        // only makes sense against the real, executing top-level command.
-        if let Some(reason) = unsafe_bash_directory_flag_scoped(&token.text, false) {
+        // (`--chdir`/`--directory`, `-C` on one of four well-known
+        // programs, or its own universal fallback,
+        // `mentions_a_wrappable_program`, requiring a tracked program name
+        // to sit directly in front of a flag-shaped token — see that
+        // function's own doc comment for why that is precise enough not
+        // to need the same evidence-based gating `looks_like_shell_code`
+        // exists for the broader character/command-word recursion below,
+        // and why it must run here at all: `bash -c 'sudo git -C /
+        // status'` reaches this exact recursion, with no operator or
+        // dispatch-word evidence anywhere in the quoted text for
+        // `looks_like_shell_code` to catch it by.
+        if let Some(reason) = unsafe_bash_directory_flag(&token.text) {
             return Some(reason);
         }
         if looks_like_shell_code(&token.text) {
@@ -651,30 +649,43 @@ const WRAPPABLE_PROGRAM_NAMES: &[&str] = &[
 /// a fresh, suspicious mention in `sh`'s own arguments and always deny.
 /// Returns the first matching name found, for the denial message.
 ///
-/// This is deliberately coarse — an exact-token match, not a substring or
-/// containment check, so `"run git later"` (one glued multi-word token
-/// once quoted, since quoting keeps its internal whitespace out of the
-/// tokenizer's split) does not match, but a standalone quoted word like
-/// `"git"` still does, indistinguishable at this point from a bare one.
-/// Over-matching here costs an occasional unnecessary denial; under-
-/// matching costs the exact silent-fallthrough-to-`Allow` this fallback
-/// exists to close, so the trade is deliberate — the same one this whole
-/// file makes everywhere a fully general check is infeasible.
-fn mentions_a_wrappable_program(tokens: &[String], command_word_index: usize) -> Option<&str> {
-    tokens
-        .get(command_word_index + 1..)
-        .into_iter()
-        .flatten()
-        .find_map(|token| {
-            let name = Path::new(token.as_str())
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(token.as_str());
-            WRAPPABLE_PROGRAM_NAMES
-                .iter()
-                .find(|&&candidate| candidate == name)
-                .copied()
-        })
+/// This requires the matched name to be immediately followed by another
+/// token that itself starts with `-` — an actual flag, not just any
+/// following word. That is deliberate, not merely a false-positive
+/// dampener: `git`'s own `-C` (and every other flag this whole file
+/// cares about finding) is only ever live in exactly that position,
+/// directly after the program name, before its own subcommand — the same
+/// structural fact [`resolve_directory_flag`]'s `stop_at_first_positional`
+/// rule already relies on for `git` specifically. `"run git later"`
+/// (`git` followed by an ordinary word, no flag) and `"please tar this
+/// directory"`/`"make it nice"` (same shape) do not match; `sudo git -C /
+/// status`, `xargs -I{} env FOO=bar git -C / status`, and
+/// `mysteriouswrapper git -C / status` (each: the tracked name directly
+/// followed by a `-`-prefixed token) all still do. This is precise enough
+/// — confirmed by `bash -c 'sudo git -C / status'` (a real, previously-
+/// missed bypass: the *only* recursion into quoted content unconditional
+/// enough to reach it) that it is safe to apply even when scanning a
+/// quoted token's own text, unlike a plain "mentioned anywhere" match,
+/// which — un-narrowed the same way — denied ordinary prose outright; see
+/// the call site in [`unsafe_bash_construct`].
+fn mentions_a_wrappable_program(
+    tokens: &[String],
+    command_word_index: usize,
+) -> Option<&'static str> {
+    let rest = tokens.get(command_word_index + 1..)?;
+    rest.windows(2).find_map(|pair| {
+        if !pair[1].starts_with('-') {
+            return None;
+        }
+        let name = Path::new(pair[0].as_str())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(pair[0].as_str());
+        WRAPPABLE_PROGRAM_NAMES
+            .iter()
+            .find(|&&candidate| candidate == name)
+            .copied()
+    })
 }
 
 /// Whether `token` is `-C` itself, `-C` with its value glued directly onto
@@ -900,16 +911,6 @@ fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
 /// wrapper whose own flags ran out with no command word following it has
 /// nothing left to resolve).
 ///
-/// `apply_universal_fallback` gates only the last bullet's
-/// [`mentions_a_wrappable_program`] check, and must be `false` whenever
-/// `tokens` came from a quoted token's own text rather than the real,
-/// executing top-level command — see that function's own doc comment for
-/// why: without this, `git commit -m "run git later"` (ordinary prose,
-/// re-tokenized as its own freestanding "command line" the same way an
-/// interpreter's `-c` argument would be, purely out of caution) would be
-/// denied outright, since `run` looks like an unrecognized program whose
-/// "arguments" happen to mention `git`.
-///
 /// - A [`TRANSPARENT_WRAPPER_PROGRAMS`] name: skip its own leading flags
 ///   (a bare flag, one with a separate value from
 ///   [`WRAPPER_OPTIONS_WITH_SEPARATE_VALUE`], or a literal `--`, which
@@ -952,11 +953,7 @@ fn option_consumes_separate_value(command_word: &str, token: &str) -> bool {
 ///   `-C` after a non-option argument already went by (`tar -cf out.tar
 ///   file1 -C dir2 file2`), so no subcommand-like boundary is assumed for
 ///   either.
-fn resolve_directory_flag(
-    tokens: &[String],
-    index: usize,
-    apply_universal_fallback: bool,
-) -> Option<String> {
+fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
     let command_word = tokens.get(index)?;
     let name = Path::new(command_word.as_str())
         .file_name()
@@ -980,7 +977,7 @@ fn resolve_directory_flag(
                 next += 1;
             }
         }
-        return resolve_directory_flag(tokens, next, apply_universal_fallback);
+        return resolve_directory_flag(tokens, next);
     }
 
     if name == "timeout" {
@@ -1024,7 +1021,7 @@ fn resolve_directory_flag(
         if next < tokens.len() {
             next += 1;
         }
-        return resolve_directory_flag(tokens, next, apply_universal_fallback);
+        return resolve_directory_flag(tokens, next);
     }
 
     if name == "env" {
@@ -1098,7 +1095,7 @@ fn resolve_directory_flag(
             }
             break;
         }
-        return resolve_directory_flag(tokens, next, apply_universal_fallback);
+        return resolve_directory_flag(tokens, next);
     }
 
     if !names_directory_changing_program(command_word) {
@@ -1122,12 +1119,10 @@ fn resolve_directory_flag(
         // this same segment; if so, this scan cannot positively verify
         // the unrecognized command does not transparently hand it a live
         // `-C` (or worse), so it denies rather than guesses `None`.
-        if apply_universal_fallback {
-            if let Some(mentioned) = mentions_a_wrappable_program(tokens, index) {
-                return Some(format!(
-                    "an unrecognized program (`{command_word}`) whose arguments mention `{mentioned}`, which this scan cannot confirm is not being wrapped or exec'd"
-                ));
-            }
+        if let Some(mentioned) = mentions_a_wrappable_program(tokens, index) {
+            return Some(format!(
+                "an unrecognized program (`{command_word}`) whose arguments mention `{mentioned}`, which this scan cannot confirm is not being wrapped or exec'd"
+            ));
         }
         return None;
     }
@@ -1160,26 +1155,14 @@ fn resolve_directory_flag(
 /// [`resolve_directory_flag`], starting from each simple command's own
 /// word — a live directory-changing `-C` on that command word itself, on
 /// any program it transparently execs through [`TRANSPARENT_WRAPPER_PROGRAMS`]
-/// or `env`, or in `env`'s own leading options. Applies
-/// [`mentions_a_wrappable_program`]'s universal fallback — see
-/// [`unsafe_bash_directory_flag_scoped`] for the variant used when
-/// recursing into a quoted token's own text, which must not.
+/// or `env`, or in `env`'s own leading options, or (via
+/// [`mentions_a_wrappable_program`]) on an unrecognized program's own
+/// arguments. Used both directly on the real, executing top-level
+/// command and, in [`unsafe_bash_construct`], recursively on a quoted
+/// token's own text — [`mentions_a_wrappable_program`]'s own doc comment
+/// covers why that fallback's immediately-followed-by-a-flag requirement
+/// is precise enough to be safe in both places.
 fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
-    unsafe_bash_directory_flag_scoped(command, true)
-}
-
-/// The shared implementation behind [`unsafe_bash_directory_flag`] and its
-/// quoted-content-recursion call site in [`unsafe_bash_construct`].
-/// `apply_universal_fallback` must be `true` only for the real, executing
-/// top-level command — see [`resolve_directory_flag`]'s own doc comment
-/// for why passing `true` when `command` is actually a quoted token's
-/// inner text, conservatively re-tokenized as if it might be its own
-/// command line, denies ordinary prose (`git commit -m "run git later"`)
-/// outright.
-fn unsafe_bash_directory_flag_scoped(
-    command: &str,
-    apply_universal_fallback: bool,
-) -> Option<String> {
     for token in shell_tokens(command) {
         let name = token
             .split_once('=')
@@ -1199,9 +1182,7 @@ fn unsafe_bash_directory_flag_scoped(
                 ));
             }
         };
-        if let Some(reason) =
-            resolve_directory_flag(&tokens, command_word_index, apply_universal_fallback)
-        {
+        if let Some(reason) = resolve_directory_flag(&tokens, command_word_index) {
             return Some(reason);
         }
     }
@@ -2859,13 +2840,14 @@ mod tests {
         assert_eq!(unsafe_bash_directory_flag("nice sh -c 'true'"), None);
     }
 
-    /// The universal fallback must not apply when `unsafe_bash_directory_flag`
-    /// is invoked recursively on a *quoted token's own text* — treated
-    /// conservatively as if it might be its own freestanding command line
-    /// the way an interpreter's `-c` argument would be — since that would
-    /// deny ordinary prose. `"run git later"` inside a commit message is
-    /// exactly this shape (first word `run`, unrecognized; a later bare
-    /// word `git`) and must stay allowed end-to-end through `decide`.
+    /// The universal fallback's flag-adjacency requirement
+    /// ([`mentions_a_wrappable_program`]) must keep ordinary prose
+    /// allowed even though the fallback now runs unconditionally,
+    /// including when `unsafe_bash_directory_flag` recurses into a quoted
+    /// token's own text. `"run git later"` inside a commit message is
+    /// exactly the shape that requirement excludes (a tracked name
+    /// followed by an ordinary word, not a flag) and must stay allowed
+    /// end-to-end through `decide`.
     #[test]
     fn decide_allows_ordinary_quoted_prose_that_mentions_a_tracked_program_name() {
         let (root, canonical_bare, canonical_git) = grove();
@@ -2883,6 +2865,33 @@ mod tests {
             let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
             assert!(
                 matches!(verdict, Verdict::Allow),
+                "{command:?}: {verdict:?}"
+            );
+        }
+    }
+
+    /// exec-reviewer's own discovery: the universal fallback, when it
+    /// only applied outside quoted-content recursion, missed a real
+    /// bypass — `bash -c 'sudo git -C / status'` reaches
+    /// `unsafe_bash_directory_flag`'s recursion into the quoted `-c`
+    /// argument with no operator or dispatch-word evidence anywhere in
+    /// it for `looks_like_shell_code` to gate a broader recursion on, so
+    /// the fallback (with the old, unconditionally-disabled-when-quoted
+    /// behavior) never ran there at all. Confirmed this must deny
+    /// end-to-end through `decide`, the same as the unquoted form.
+    #[test]
+    fn decide_denies_an_unrecognized_wrapper_hidden_inside_a_quoted_interpreter_argument() {
+        let (root, canonical_bare, canonical_git) = grove();
+        for command in ["sudo git -C / status", "bash -c 'sudo git -C / status'"] {
+            let payload = NormalizedPayload {
+                tool: Tool::Bash {
+                    command: command.to_string(),
+                },
+                cwd: Some(root.path().to_path_buf()),
+            };
+            let verdict = decide(&payload, &canonical_bare, &canonical_git, root.path());
+            assert!(
+                matches!(verdict, Verdict::Deny(_)),
                 "{command:?}: {verdict:?}"
             );
         }
