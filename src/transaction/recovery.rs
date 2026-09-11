@@ -65,18 +65,46 @@ pub fn inspect_region(root_path: &Path) -> Result<RecoveryRegion> {
     validate_candidate_metadata(root_path, name)?;
     let root = HeldDirectory::open(root_path)?;
     let transaction = HeldDirectory::open(&root_path.join(name))?;
-    let current = read_optional(&transaction, JOURNAL_CURRENT)?
-        .map(|bytes| Journal::parse_strict(&bytes))
+    let current_bytes = read_optional(&transaction, JOURNAL_CURRENT)?;
+    let new_bytes = read_optional(&transaction, JOURNAL_NEW)?;
+    let current = current_bytes
+        .as_deref()
+        .map(Journal::parse_strict)
         .transpose()?;
-    let new = read_optional(&transaction, JOURNAL_NEW)?
-        .map(|bytes| Journal::parse_strict(&bytes))
+    let new = new_bytes
+        .as_deref()
+        .map(Journal::parse_strict)
         .transpose()
         .ok()
         .flatten();
-    let selected = match (current, new) {
-        (Some(current), Some(next)) if current.validate_next(&next).is_ok() => next,
-        (Some(current), _) => current,
-        (None, Some(initial)) if initial.generation == 1 => initial,
+    let selected = match (
+        &current,
+        &new,
+        current_bytes.as_deref(),
+        new_bytes.as_deref(),
+    ) {
+        (Some(current), Some(next), Some(current_bytes), Some(new_bytes)) => {
+            // Same reasoning as `select_journal`: reject a schema-1-shaped
+            // `next` following a schema-2-native `current` outright (no
+            // code path ever regresses a journal back to the old shape),
+            // then prefer the schema-1-aware comparison over the ordinary
+            // `validate_next` on the upgraded pair whenever it applies --
+            // see `Journal::is_legacy_shaped`/`Journal::validate_legacy_pair`.
+            let impossible_direction =
+                Journal::is_legacy_shaped(new_bytes) && !Journal::is_legacy_shaped(current_bytes);
+            let next_is_legal = !impossible_direction
+                && match Journal::validate_legacy_pair(current_bytes, new_bytes) {
+                    Some(result) => result.is_ok(),
+                    None => current.validate_next(next).is_ok(),
+                };
+            if next_is_legal {
+                next.clone()
+            } else {
+                current.clone()
+            }
+        }
+        (Some(current), ..) => current.clone(),
+        (None, Some(initial), ..) if initial.generation == 1 => initial.clone(),
         _ => {
             return Err(GroveError::needs_decision(
                 "no valid adoption journal generation can be selected",
@@ -270,12 +298,61 @@ fn select_journal(transaction: &HeldDirectory) -> Result<Journal> {
                 None => Ok(current),
                 Some(new_bytes) => match Journal::parse_strict(&new_bytes) {
                     Ok(next) => {
-                        current.validate_next(&next).map_err(|error| {
-                            GroveError::needs_decision(
+                        // A schema-1-shaped `next` can never legitimately
+                        // follow a schema-2-native `current`: no code path
+                        // ever regresses a journal back to the old shape.
+                        // Reject that combination outright rather than
+                        // falling through to the ordinary `validate_next`
+                        // below, which -- comparing a genuine native
+                        // `current` against an upgraded, guide-erased
+                        // `next` -- cannot see a forged mutation confined
+                        // to the discarded region either. See
+                        // `Journal::is_legacy_shaped`.
+                        if Journal::is_legacy_shaped(&new_bytes)
+                            && !Journal::is_legacy_shaped(&current_bytes)
+                        {
+                            return Err(GroveError::needs_decision(
                                 "journal.json.new is not the unique legal next generation",
                             )
-                            .with_detail(error.to_string())
-                        })?;
+                            .with_detail(
+                                "a schema-1-shaped next generation cannot legitimately follow \
+                                 a schema-2 current generation",
+                            ));
+                        }
+                        // When both raw generations are schema-1, validate
+                        // them directly rather than trusting `validate_next`
+                        // on the two already-upgraded journals: the
+                        // guide-removal upgrade drops one operation from
+                        // both sides, so a generation whose only real
+                        // change is confined there is invisible to
+                        // `validate_next` -- but so is an *illegal* one
+                        // hidden there alongside an unrelated, otherwise
+                        // legal retained-operation change, which
+                        // `validate_next` alone would wrongly accept. See
+                        // `Journal::validate_legacy_pair`. Neither raw
+                        // stream parsing as schema-1 (an ordinary schema-2
+                        // pair, or a schema-1 current legitimately
+                        // advancing to a schema-2 next under today's
+                        // engine) falls through to the schema-2 check as
+                        // always.
+                        match Journal::validate_legacy_pair(&current_bytes, &new_bytes) {
+                            Some(result) => {
+                                result.map_err(|error| {
+                                    GroveError::needs_decision(
+                                        "journal.json.new is not the unique legal next generation",
+                                    )
+                                    .with_detail(error.to_string())
+                                })?;
+                            }
+                            None => {
+                                current.validate_next(&next).map_err(|error| {
+                                    GroveError::needs_decision(
+                                        "journal.json.new is not the unique legal next generation",
+                                    )
+                                    .with_detail(error.to_string())
+                                })?;
+                            }
+                        }
                         promote_new(transaction)?;
                         Ok(next)
                     }

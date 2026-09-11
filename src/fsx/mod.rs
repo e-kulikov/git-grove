@@ -128,13 +128,48 @@ where
 fn write_atomic_with_strategy(path: &Path, contents: &[u8], strategy: TempStrategy) -> Result<()> {
     let (parent, destination) = split_path(path)?;
     let directory = File::open(parent).map_err(|error| io(parent, "open directory", error))?;
-    let mut temporary = create_temporary(&directory, parent, strategy)?;
+    write_atomic_in_with_strategy(&directory, parent, path, destination, contents, strategy)
+}
+
+/// Same atomic replace-by-rename discipline as [`write_atomic`], but against
+/// an already-open parent directory handle and a bare destination file
+/// name, rather than re-opening a path by name. A caller that must not
+/// follow a symlinked parent directory (setup's config writes) validates
+/// and opens that directory itself with `O_NOFOLLOW` and calls this
+/// directly, so nothing here re-resolves a path after that validation.
+pub fn write_atomic_in(
+    directory: &File,
+    parent_for_errors: &Path,
+    full_path_for_errors: &Path,
+    destination: &OsStr,
+    contents: &[u8],
+) -> Result<()> {
+    write_atomic_in_with_strategy(
+        directory,
+        parent_for_errors,
+        full_path_for_errors,
+        destination,
+        contents,
+        TempStrategy::Auto,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_atomic_in_with_strategy(
+    directory: &File,
+    parent: &Path,
+    path: &Path,
+    destination: &OsStr,
+    contents: &[u8],
+    strategy: TempStrategy,
+) -> Result<()> {
+    let mut temporary = create_temporary(directory, parent, strategy)?;
 
     if let Err(error) = temporary.file.write_all(contents) {
         return Err(retain_temporary(
             io(path, "write temporary file", error),
             &temporary,
-            &directory,
+            directory,
             parent,
         ));
     }
@@ -142,26 +177,26 @@ fn write_atomic_with_strategy(path: &Path, contents: &[u8], strategy: TempStrate
         return Err(retain_temporary(
             io(path, "fsync temporary file", error),
             &temporary,
-            &directory,
+            directory,
             parent,
         ));
     }
 
     let temporary_name = match &temporary.name {
         Some(name) => name.clone(),
-        None => link_temporary_file(&temporary.file, &directory, parent)?,
+        None => link_temporary_file(&temporary.file, directory, parent)?,
     };
-    if let Err(error) = renameat(&directory, &temporary_name, &directory, destination) {
+    if let Err(error) = renameat(directory, &temporary_name, directory, destination) {
         temporary.name = Some(temporary_name);
         return Err(retain_temporary(
             io(path, "rename into place", error),
             &temporary,
-            &directory,
+            directory,
             parent,
         ));
     }
 
-    fsync_directory(&directory, parent)
+    fsync_directory(directory, parent)
 }
 
 pub fn symlink_relative(link: &Path, target: &str) -> Result<()> {

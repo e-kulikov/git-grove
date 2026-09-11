@@ -21,6 +21,21 @@ fn main() -> ExitCode {
     render(run(cli))
 }
 
+/// The canonicalized absolute path to this binary, which is what an
+/// installed hook command has to name. Resolved once per command that needs
+/// it.
+fn hook_executable() -> Result<String> {
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|error| {
+            GroveError::failure(format!("cannot resolve the current executable: {error}"))
+        })?;
+    executable
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| GroveError::failure("the current executable's path is not valid UTF-8"))
+}
+
 fn render(result: Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::from(ExitClass::Ok.code()),
@@ -34,8 +49,16 @@ fn render(result: Result<()>) -> ExitCode {
 fn run(cli: cli::Cli) -> Result<()> {
     let cli::Cli {
         ignore_unsupported,
+        skill,
         command,
     } = cli;
+    let command = match (skill, command) {
+        (true, _) => return git_grove::skill::write(&mut std::io::stdout()),
+        (false, Some(command)) => command,
+        (false, None) => {
+            return Err(GroveError::usage("a subcommand is required"));
+        }
+    };
     match command {
         cli::Command::Clone {
             url,
@@ -113,7 +136,22 @@ fn run(cli: cli::Cli) -> Result<()> {
             )?;
             let metadata = grove::metadata::read(&runner, &grove)?;
             grove::metadata::ensure_supported(&metadata)?;
-            commands::add::run(&runner, &grove, mode).map(|_| ())
+            let path = commands::add::run(&runner, &grove, mode)?;
+            // A binary that cannot resolve its own path cannot write a hook
+            // command that would run, but that must not stop a worktree from
+            // being created: this reports it and provisions nothing.
+            let (executable, unresolved) = match hook_executable() {
+                Ok(executable) => (Some(executable), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            commands::add::provision_hooks(
+                &runner,
+                &grove,
+                &path,
+                executable.as_deref(),
+                unresolved.as_deref(),
+            );
+            Ok(())
         }
         cli::Command::List { porcelain } => {
             let runner = git::runner::RealGit::new();
@@ -251,6 +289,45 @@ fn run(cli: cli::Cli) -> Result<()> {
                 }
             }
         }
+        cli::Command::Setup { agent, worktree } => {
+            let runner = git::runner::RealGit::new();
+            let findings = policy::env::scan_os(std::env::vars_os());
+            let mut interaction = policy::SystemInteraction;
+            policy::gate(&runner, &findings, ignore_unsupported, &mut interaction)?;
+            let cwd = std::env::current_dir().map_err(|error| {
+                GroveError::failure(format!("cannot read the current directory: {error}"))
+            })?;
+            let grove = grove::discover::Grove::discover(&cwd)?;
+            git_grove::transaction::recovery::ensure_none(&grove.root)?;
+            let _lock = fsx::lock::GroveLock::acquire_path(
+                &grove.bare_dir(),
+                fsx::lock::LockMode::Exclusive,
+                "git grove setup",
+            )?;
+            let metadata = grove::metadata::read(&runner, &grove)?;
+            grove::metadata::ensure_supported(&metadata)?;
+            let worktree_root = commands::setup::resolve_worktree(
+                &runner,
+                &grove,
+                &metadata,
+                worktree.as_deref(),
+                &cwd,
+            )?;
+            let executable = hook_executable()?;
+            let message =
+                commands::setup::run(&runner, &grove, &worktree_root, agent, &executable)?;
+            std::io::Write::write_all(&mut std::io::stdout().lock(), message.as_bytes())
+                .map_err(|error| GroveError::failure(format!("cannot write stdout: {error}")))
+        }
+        cli::Command::HookGuard { protocol, event } => {
+            let git_grove::hooks::Event::PreToolUse = event;
+            commands::hook_guard::run(
+                protocol,
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+                std::env::current_dir(),
+            )
+        }
         cli::Command::Completion { shell } => {
             let mut command = cli::Cli::command();
             clap_complete::generate(
@@ -261,5 +338,26 @@ fn run(cli: cli::Cli) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real argv never reaches this arm: bare invocation and
+    /// `--ignore-unsupported` alone are both expanded by `normalize` into an
+    /// explicit `list`, and every other flag-only shape is `--skill`, which
+    /// the sibling arm intercepts first. Constructed directly to prove the
+    /// defensive branch is a usage error, not a panic, if that ever changes.
+    #[test]
+    fn no_skill_and_no_command_is_a_usage_error_not_a_panic() {
+        let cli = cli::Cli {
+            ignore_unsupported: false,
+            skill: false,
+            command: None,
+        };
+        let error = run(cli).unwrap_err();
+        assert_eq!(error.class, ExitClass::Usage);
     }
 }

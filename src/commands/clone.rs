@@ -3,14 +3,12 @@ use super::init::{
     retain_partial_for, state_conflict, GuardedRunner, RecoveryState,
 };
 use crate::error::{GroveError, Result};
-use crate::fsx;
 use crate::git::config::{
     config_key, config_values, configure_upstreams, escaped, list_local_heads, remote_head_branch,
     required, set_config, trim_one_line, validate_refspec_destinations,
 };
 use crate::git::query;
 use crate::git::runner::{GitRunner, Invocation};
-use crate::grove::agents_md::{self, Facts};
 use crate::grove::discover::Grove;
 use crate::grove::layout;
 use crate::grove::metadata::{self, Metadata, PublishState, FORMAT_VERSION};
@@ -471,34 +469,6 @@ fn run_transaction(
             publish_name: None,
         },
     )?;
-    let facts = Facts {
-        remote: Some(verdict.remote_name.as_bytes().to_vec().into()),
-        default_branch: selected.as_bytes().to_vec().into(),
-        published: true,
-        narrowed: verdict.narrowed,
-    };
-    if !fsx::write_atomic_if_absent(
-        &root.anchored_path.join("AGENTS.md"),
-        agents_md::render(&facts).as_bytes(),
-    )? {
-        return Err(state_conflict(
-            format!(
-                "{} already exists",
-                escaped_path(&root.named_path.join("AGENTS.md"))
-            ),
-            "the foreign entry was preserved",
-        ));
-    }
-    if !fsx::symlink_relative_if_absent(&root.anchored_path.join("CLAUDE.md"), "AGENTS.md")? {
-        return Err(state_conflict(
-            format!(
-                "{} already exists",
-                escaped_path(&root.named_path.join("CLAUDE.md"))
-            ),
-            "the foreign entry was preserved",
-        ));
-    }
-
     let validated =
         layout::validate_worktree_path_at(&root.file, &root.named_path, &relative_worktree)
             .map_err(post_mutation_layout_error)?;

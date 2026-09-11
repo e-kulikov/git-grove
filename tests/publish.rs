@@ -1131,24 +1131,6 @@ fn never_leaves_a_probe_ref_behind_on_any_exit_path() {
 }
 
 #[test]
-fn publish_never_rewrites_the_generated_guide_but_reports_it_as_stale() {
-    let sandbox = Sandbox::new();
-    let origin = sandbox.empty_origin("origin");
-    let root = grove_with_a_commit(&sandbox, "g", "main");
-    let guide = root.join("AGENTS.md");
-    let before = std::fs::read(&guide).unwrap();
-
-    sandbox
-        .grove_in(&root, &["publish", origin.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("not published"))
-        .stdout(predicates::str::contains("does not rewrite it"));
-
-    assert_eq!(std::fs::read(&guide).unwrap(), before);
-}
-
-#[test]
 fn a_cloned_grove_is_refused_with_a_decision_rather_than_a_torn_receipt() {
     let sandbox = Sandbox::new();
     let origin = sandbox.bare_origin("origin");

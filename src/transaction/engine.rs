@@ -235,14 +235,6 @@ mod tests {
         }
     }
 
-    fn content() -> ContentProof {
-        ContentProof {
-            bytes: RawBytes::from_bytes(b""),
-            sha256: sha256(b""),
-            mode: 0o644,
-        }
-    }
-
     fn journal() -> Journal {
         let blob = placeholder_blob();
         Journal {
@@ -286,7 +278,6 @@ mod tests {
                 generated: GeneratedEvidence {
                     payload_pointer: generated_file(),
                     default_pointer: None,
-                    guide: content(),
                 },
                 expected_final: FinalEvidence {
                     worktrees: vec![],
@@ -297,7 +288,6 @@ mod tests {
                     refs: vec![],
                     pointer_files: vec![],
                     metadata: vec![],
-                    guide: content(),
                 },
             },
             operations: vec![OperationRecord {

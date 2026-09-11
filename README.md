@@ -21,28 +21,28 @@ With [mise](https://mise.jdx.dev/dev-tools/backends/github.html) and GitHub as
 the backend:
 
 ```sh
-mise use -g 'github:e-kulikov/git-grove@0.5.0'
+mise use -g 'github:e-kulikov/git-grove@0.6.0'
 ```
 
 For declarative mise configuration:
 
 ```toml
 [tools]
-"github:e-kulikov/git-grove" = { version = "0.5.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
+"github:e-kulikov/git-grove" = { version = "0.6.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
 ```
 
-The GitHub backend can install this only after the `v0.5.0` release and its
+The GitHub backend can install this only after the `v0.6.0` release and its
 assets have been published. The release workflow produces an attestation and
 `SHA256SUMS`; mise can lock the published checksum with `mise lock`.
 
 For a direct installation, download
-`git-grove_0.5.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
+`git-grove_0.6.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
 verify the archive, then install its binary:
 
 ```sh
 sha256sum --check SHA256SUMS
-tar -xzf git-grove_0.5.0_linux_x86_64.tar.gz
-install -m 0755 git-grove_0.5.0_linux_x86_64/git-grove ~/.local/bin/git-grove
+tar -xzf git-grove_0.6.0_linux_x86_64.tar.gz
+install -m 0755 git-grove_0.6.0_linux_x86_64/git-grove ~/.local/bin/git-grove
 ```
 
 The archive also contains the man page and generated Bash, Zsh, and Fish
@@ -100,8 +100,6 @@ named `detached-<short-oid>`.
 project/
 ├── .bare/       bare Git repository and shared administration
 ├── .git         pointer containing: gitdir: ./.bare
-├── AGENTS.md    generated repository facts and 0.4 command guide
-├── CLAUDE.md    relative link to AGENTS.md
 ├── main/        worktree
 └── feature/     another worktree
 ```
@@ -124,8 +122,6 @@ default, the resulting tree is:
 ordinary-project/
 ├── .bare/
 ├── .git
-├── AGENTS.md
-├── CLAUDE.md
 ├── main/         generated default worktree
 └── topic/        adopted payload, including staged and untracked state
 ```
@@ -289,9 +285,6 @@ Publish is explicit and narrow, by design:
   or a different remote name than the receipt records is refused with exit
   status `2`, naming both values. Comparison is exact and byte for byte:
   `https://host/r.git` and `https://host/r` are different URLs.
-- Publishing does not rewrite `AGENTS.md`. When the generated guide still says
-  the grove is not published, the run says so and names the file, leaving the
-  edit to you.
 
 ## Safety and exit status
 
@@ -312,6 +305,86 @@ usage error, refused unsupported context, or a provider CLI older than the
 declared minimum. `list --porcelain` emits the versioned, NUL-delimited
 `git-grove-list-v1` protocol for automation; `sync`, `adopt`, and `publish`
 have no porcelain output.
+
+## Agent integration
+
+Through 0.4, `clone`/`init`/`adopt` generated `AGENTS.md` and a `CLAUDE.md` symlink once, at
+creation time, and never touched them again. That guide could not track the tool it described:
+this grove's own root guide, generated at 0.1.0, still documented only two of the current eight
+commands. **As of this release, git-grove no longer generates either file, with no deprecation
+window.** It never reads, writes, rewrites, or deletes an existing `AGENTS.md`/`CLAUDE.md` —
+a hand-maintained or already-generated copy is left exactly as it is, indefinitely.
+
+Two replacements:
+
+- `git grove --skill` prints one generic, version-free document describing the grove layout,
+  invariants, and command surface to stdout, before any policy or Git work. It reflects the
+  installed binary's own command surface, so it cannot drift out of date the way a
+  once-generated file did.
+- `git grove setup --agent <claude|codex|copilot>` writes a project-local hook into one worktree
+  that denies any Edit/Write/Bash tool call (and, for `codex` specifically, its `apply_patch`
+  tool) whose target resolves under `.bare` or the root `.git` pointer file — replacing the old
+  guide's one advisory sentence ("never edit `.bare`") with real enforcement.
+
+  `claude` and `copilot` converge on `<worktree>/.claude/settings.local.json`; run either once,
+  not both. `codex` writes `<worktree>/.codex/config.toml`, with the hook defined inline as TOML
+  and `features.hooks = true` alongside it; no separate hooks file is used. Every write is a
+  merge at those keys alone: unrelated settings, other hook events, hook groups someone else
+  wrote, and — in TOML — comments and formatting are all preserved, and a rerun converges
+  instead of appending. These files are per-worktree and kept out of `git status` through the
+  grove's own `.bare/info/exclude` — never tracked or committed. An exact tracked collision at
+  the target path is refused rather than merged. `setup` writes no wrapper, alias, launcher
+  flag, or global setting, and never bypasses an agent's own trust model:
+
+  - Claude Code and an interactive Copilot CLI session enforce the shared file directly.
+    Measured: Copilot CLI 1.0.80 does not fire this local hook source under non-interactive
+    `copilot -p` — re-verify against your installed version before relying on this in
+    automation.
+  - **Codex hook enforcement does not work in a grove today. Do not rely on
+    `setup --agent codex` for protection.** Codex resolves its project root by walking up for
+    its own `project_root_markers` (default `.git`), and a grove root carries git-grove's own
+    `.git` pointer file, so Codex resolves the *grove root* as the project and never reads the
+    worktree's `.codex/` at all. The file `setup` writes is the exact shape measured working
+    (`/hooks` reporting Installed 1 / Active 1, and a live write into the bare repository
+    denied) in a grove built without that pointer file; making it work in a real grove requires
+    renaming git-grove's own grove-root signature away from `.git`, which is a separate change
+    that has not landed. Until it does, `setup --agent codex` writes a correct but inert config.
+    Independently of that, Codex also requires an interactive trust review — open `/hooks` in an
+    interactive `codex` session and trust the command — before it enforces any hook, and
+    `codex exec` is not protected until that review is complete.
+
+  **What the guard proves, and what it can't.** The Bash check statically analyzes the command
+  line itself and denies anything it cannot fully account for — a directory change, `eval`/`exec`
+  and the other dispatch or reserved words, a subshell, command/process substitution, a variable
+  inside a path-looking argument, and a handful of directory-changing flags, including inside
+  quoted content handed to another program. That is real, meaningful protection against every one
+  of those constructs. It cannot prove what an *external interpreter* invoked with a computed
+  string will do with it once it runs (`python3 -c '...'`, `perl -e '...'`, and so on for any
+  interpreter that accepts one): a payload written in a language this guard does not parse, that
+  both avoids every Bash-shaped signal it looks for and still reaches protected metadata, is not
+  something static analysis of the outer Bash command line can rule out. Closing that class needs
+  a different mechanism entirely — OS-level sandboxing (Landlock, seccomp, or similar) enforced on
+  the process actually performing the write — which this hook does not attempt.
+
+  `setup`'s own output names the exact next step for the agent you configured, including the
+  Codex warning above; it never runs or approves those steps itself.
+
+  **Which worktree.** Run from inside a worktree and that worktree is configured. Run from
+  anywhere else in the grove — the grove root, or any intermediate directory — and the worktree
+  holding the grove's recorded default branch is configured instead. `--worktree <name>`
+  overrides both, naming a worktree by its path relative to the grove root (`feature/auth`); it
+  must already exist. A `--worktree` value naming no worktree of this grove is a usage error
+  (`64`); a grove that records no default branch, or whose default branch is checked out
+  nowhere, needs a decision (`2`), and the message names the fix.
+
+  **New worktrees inherit it.** Running `setup --agent <x>` also records `<x>` in the grove's own
+  `grove.hookAgent` key, and `git grove add` then configures every recorded agent in each
+  worktree it creates, with the same tracked-collision refusal and the same exclude entry.
+  This is opt-in and not retroactive: a grove whose owner never ran `setup` records nothing, and
+  `add` behaves exactly as it always did. Provisioning never fails worktree creation — a problem
+  is a loud stderr warning naming the remedy, because a worktree nobody protected is still
+  better than no worktree. Undo the policy with
+  `git config --file <grove>/.bare/config --unset-all grove.hookAgent`.
 
 ## Completions and manual
 
@@ -340,10 +413,10 @@ mise exec -- cargo fmt --all -- --check
 mise exec -- cargo test --all-targets --locked
 mise exec -- cargo clippy --all-targets --locked -- -D warnings
 mise exec -- cargo build --release --locked --target x86_64-unknown-linux-musl
-scripts/package-release.sh 0.5.0 \
+scripts/package-release.sh 0.6.0 \
   target/x86_64-unknown-linux-musl/release/git-grove dist
 ```
 
 Release tags must be strict `vX.Y.Z` and match the package version exactly.
-For 0.5.0 the uploaded files are
-`git-grove_0.5.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
+For 0.6.0 the uploaded files are
+`git-grove_0.6.0_linux_x86_64.tar.gz` and `SHA256SUMS`.

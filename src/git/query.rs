@@ -806,6 +806,64 @@ pub fn branch_upstream(
     }))
 }
 
+/// The working tree containing `cwd`, via `git rev-parse --show-toplevel`.
+/// `setup --agent` uses this (not `Grove::discover`, which walks up to the
+/// *grove root* regardless of which worktree it started from) to refuse
+/// running from outside any working tree at all — a plain git error here —
+/// distinctly from running from the grove root itself, which is a valid
+/// working tree by this check but not a worktree `setup` should configure;
+/// the caller compares the canonical result against the discovered grove's
+/// own root to catch that second case.
+pub fn worktree_toplevel(runner: &dyn GitRunner, cwd: &Path) -> Result<PathBuf> {
+    let output = runner.run(
+        Invocation::new()
+            .cwd(cwd)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["rev-parse", "--show-toplevel"]),
+    )?;
+    if !output.ok() {
+        return Err(GroveError::usage("not inside a Git working tree")
+            .with_detail(output.stderr.as_slice().escape_bytes().to_string()));
+    }
+    let path = one_line(output.stdout, "working tree top level")?;
+    let path = PathBuf::from(OsString::from_vec(path.into()));
+    path.canonicalize()
+        .map_err(|error| GroveError::failure(format!("cannot resolve {}: {error}", path.display())))
+}
+
+/// Whether `relative` (worktree-relative) is a tracked path in the working
+/// tree at `worktree_root`, via `git ls-files --error-unmatch`. Exit 0
+/// means tracked; exit 1 means untracked or absent; anything else is a
+/// spawn/protocol failure. `setup --agent` refuses to write its hook config
+/// over an exact tracked path — merging safely at the JSON level would
+/// still create a tracked repository diff, which the feature's local,
+/// unshared requirement forbids.
+pub fn is_tracked(runner: &dyn GitRunner, worktree_root: &Path, relative: &Path) -> Result<bool> {
+    let output = runner.run(Invocation::new().cwd(worktree_root).args([
+        OsStr::new("ls-files"),
+        OsStr::new("--error-unmatch"),
+        OsStr::new("--"),
+        relative.as_os_str(),
+    ]))?;
+    match output.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => Err(failure("ls-files --error-unmatch", &output)),
+    }
+}
+
+fn one_line(mut bytes: Vec<u8>, what: &str) -> Result<BString> {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err(GroveError::failure(format!(
+            "git returned an invalid {what}"
+        )));
+    }
+    Ok(BString::from(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,5 +1319,67 @@ mod tests {
             assert_eq!(error.class, ExitClass::Failure, "accepted {raw:?}");
             assert!(error.message.contains("bare pseudo-worktree"));
         }
+    }
+
+    #[test]
+    fn worktree_toplevel_resolves_a_canonical_path_from_show_toplevel() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        let fake = RecordingFake::new();
+        fake.push_response(output(
+            0,
+            format!("{}\n", canonical.display()).as_bytes(),
+            b"",
+        ));
+
+        let resolved = worktree_toplevel(&fake, dir.path()).unwrap();
+
+        assert_eq!(resolved, canonical);
+        assert_eq!(
+            fake.calls()[0].argv_for_test(),
+            vec!["rev-parse", "--show-toplevel"]
+        );
+    }
+
+    #[test]
+    fn worktree_toplevel_is_a_usage_error_outside_any_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = RecordingFake::new();
+        fake.push_response(output(128, b"", b"fatal: not a git repository"));
+
+        let error = worktree_toplevel(&fake, dir.path()).unwrap_err();
+
+        assert_eq!(error.class, ExitClass::Usage);
+    }
+
+    #[test]
+    fn is_tracked_maps_exit_codes_to_tracked_untracked_and_failure() {
+        for (status, expected) in [(0, Some(true)), (1, Some(false))] {
+            let fake = RecordingFake::new();
+            fake.push_response(output(status, b"", b""));
+            assert_eq!(
+                is_tracked(
+                    &fake,
+                    Path::new("/w"),
+                    Path::new(".claude/settings.local.json")
+                )
+                .unwrap(),
+                expected.unwrap()
+            );
+            assert_eq!(
+                fake.calls()[0].argv_for_test(),
+                vec![
+                    "ls-files",
+                    "--error-unmatch",
+                    "--",
+                    ".claude/settings.local.json"
+                ]
+            );
+        }
+
+        let fake = RecordingFake::new();
+        fake.push_response(output(129, b"", b"fatal: bad flag"));
+        let error = is_tracked(&fake, Path::new("/w"), Path::new("x")).unwrap_err();
+        assert_eq!(error.class, ExitClass::Failure);
     }
 }

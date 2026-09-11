@@ -563,24 +563,6 @@ fn every_checkpoint_has_state_derived_continue_and_abort_outcomes() {
 #[test]
 fn recovery_refuses_manual_edits_to_generated_state() {
     let sandbox = Sandbox::new();
-    let guide_root = flat_repository(&sandbox, "edited-guide");
-    injected(&sandbox, &guide_root, "error", 40);
-    std::fs::write(guide_root.join("AGENTS.md"), b"owner edit\n").unwrap();
-    sandbox
-        .grove_in(
-            sandbox.root(),
-            &["adopt", "--abort", guide_root.to_str().unwrap()],
-        )
-        .assert()
-        .code(2)
-        .stderr(predicates::str::contains(
-            "neither its exact before nor after",
-        ));
-    assert_eq!(
-        std::fs::read(guide_root.join("AGENTS.md")).unwrap(),
-        b"owner edit\n"
-    );
-
     let default_root = flat_repository(&sandbox, "edited-default");
     sandbox.git(&default_root, &["branch", "topic"]);
     sandbox.git(&default_root, &["switch", "--quiet", "topic"]);

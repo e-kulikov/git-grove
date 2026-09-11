@@ -22,11 +22,8 @@ fn builds_a_working_grove_from_a_local_origin() {
         std::fs::read(root.join(".git")).unwrap(),
         b"gitdir: ./.bare\n"
     );
-    assert!(root.join("AGENTS.md").is_file());
-    assert_eq!(
-        std::fs::read_link(root.join("CLAUDE.md")).unwrap(),
-        Path::new("AGENTS.md")
-    );
+    assert!(!root.join("AGENTS.md").exists());
+    assert!(!root.join("CLAUDE.md").exists());
     assert!(root.join("main").is_dir(), "first worktree missing");
 
     let refspec = sandbox.git(
@@ -106,9 +103,8 @@ fn honours_a_renamed_remote() {
         ],
     );
     assert_eq!(refspec.stdout, b"+refs/heads/*:refs/remotes/upstream/*\n");
-    assert!(std::fs::read_to_string(root.join("AGENTS.md"))
-        .unwrap()
-        .contains("upstream/"));
+    assert!(!root.join("AGENTS.md").exists());
+    assert!(!root.join("CLAUDE.md").exists());
 }
 
 #[test]
