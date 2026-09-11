@@ -1021,13 +1021,6 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 next += 1;
                 break;
             }
-            if let Some(bare) = redirection_prefix(token) {
-                next += 1;
-                if bare {
-                    next += 1;
-                }
-                continue;
-            }
             if !token.starts_with('-') {
                 if looks_like_unrecognized_prefix(token) {
                     return Some(format!(
@@ -1039,7 +1032,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             let consumes_next_word = WRAPPER_OPTIONS_WITH_SEPARATE_VALUE.contains(&token);
             next += 1;
             if consumes_next_word {
-                next = skip_redirections(tokens, next) + 1;
+                next += 1;
             }
         }
         return resolve_directory_flag(tokens, next);
@@ -1052,13 +1045,6 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             if token == "--" {
                 next += 1;
                 break;
-            }
-            if let Some(bare) = redirection_prefix(token) {
-                next += 1;
-                if bare {
-                    next += 1;
-                }
-                continue;
             }
             if !token.starts_with('-') {
                 if looks_like_unrecognized_prefix(token) {
@@ -1088,19 +1074,13 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             };
             next += 1;
             if needs_value {
-                next = skip_redirections(tokens, next) + 1;
+                next += 1;
             }
         }
         // The mandatory DURATION positional, between timeout's own options
         // and the command it execs — skipped unconditionally, unlike a
         // wrapper's optional flags, since timeout's own grammar always has
-        // exactly one here whenever a command follows at all. A
-        // redirection could stand in this exact position too
-        // (`timeout 2>/dev/null 2 git ...` already skipped the leading
-        // redirect above and landed here on the real duration, but
-        // `timeout -f 2>/dev/null 2 git ...` needs it skipped right here,
-        // between `-f` and the duration).
-        next = skip_redirections(tokens, next);
+        // exactly one here whenever a command follows at all.
         if next < tokens.len() {
             next += 1;
         }
@@ -1114,13 +1094,6 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             if token == "--" {
                 next += 1;
                 break;
-            }
-            if let Some(bare) = redirection_prefix(token) {
-                next += 1;
-                if bare {
-                    next += 1;
-                }
-                continue;
             }
             if is_env_short_c_flag(token) {
                 return Some(format!(
@@ -1159,7 +1132,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 };
                 next += 1;
                 if needs_value {
-                    next = skip_redirections(tokens, next) + 1;
+                    next += 1;
                 }
                 continue;
             }
@@ -1188,7 +1161,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 };
                 next += 1;
                 if needs_value {
-                    next = skip_redirections(tokens, next) + 1;
+                    next += 1;
                 }
                 continue;
             }
@@ -1241,13 +1214,6 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
         if token == "--" {
             break;
         }
-        if let Some(bare) = redirection_prefix(token) {
-            next += 1;
-            if bare {
-                next += 1;
-            }
-            continue;
-        }
         if is_short_c_flag(token) {
             return Some(format!(
                 "a directory-changing `-C` flag on `{command_word}`"
@@ -1256,7 +1222,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
         next += 1;
         if stop_at_first_positional {
             if option_consumes_separate_value(command_word, token) {
-                next = skip_redirections(tokens, next) + 1;
+                next += 1;
                 continue;
             }
             if !token.starts_with('-') {
@@ -1275,8 +1241,11 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
 /// Whether `command` contains one of [`UNSAFE_DIRECTORY_FLAGS`] (bare or
 /// with a glued `=value`) anywhere among its plain tokens, or — via
 /// [`resolve_directory_flag`], starting from each simple command's own
-/// word — a live directory-changing `-C` on that command word itself, on
-/// any program it transparently execs through [`TRANSPARENT_WRAPPER_PROGRAMS`]
+/// word, resolved from [`effective_argv`] rather than a plain
+/// whitespace-only tokenization so that no Bash redirection needs
+/// recognizing or skipping again downstream, in any position or shape —
+/// a live directory-changing `-C` on that command word itself, on any
+/// program it transparently execs through [`TRANSPARENT_WRAPPER_PROGRAMS`]
 /// or `env`, or in `env`'s own leading options, or (via
 /// [`mentions_a_wrappable_program`]) on an unrecognized program's own
 /// arguments. Used both directly on the real, executing top-level
@@ -1294,7 +1263,7 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
         }
     }
     for segment in split_bash_segments(command) {
-        let tokens = shell_tokens(&segment);
+        let tokens = effective_argv(&segment);
         let command_word_index = match command_word_index_in_segment(&tokens) {
             Ok(Some(index)) => index,
             Ok(None) => continue,
@@ -1311,22 +1280,26 @@ fn unsafe_bash_directory_flag(command: &str) -> Option<String> {
     None
 }
 
-/// Find the command word of one simple command (a [`split_bash_segments`]
-/// slice, already tokenized), returning its index into `tokens` — skipping
-/// past assignment words and prefix redirections exactly like
-/// [`unsafe_command_word_in_segment`] does, since this helper answers the
-/// same question ("which token is the real command word") for
+/// Find the command word of one simple command — a [`split_bash_segments`]
+/// slice, already tokenized via [`effective_argv`] (so any Bash
+/// redirection has already been stripped out entirely; this function
+/// itself no longer needs to know redirections exist at all) — returning
+/// its index into `tokens`, skipping past leading assignment words.
+/// Answers the same question ("which token is the real command word") as
+/// [`unsafe_command_word_in_segment`], for
 /// [`unsafe_bash_directory_flag`]'s narrower, per-program `-C` check.
 ///
 /// `Ok(None)` if the segment has no tokens at all past its own leading
-/// assignments/redirections (genuinely nothing left to check). `Err` —
-/// not folded into `Ok(None)` — if its first non-prefix token is an
-/// unrecognized assignment/redirection prefix (see
-/// [`looks_like_unrecognized_prefix`]), carrying that token back to the
-/// caller to deny with: at the *top level*, this case is also separately
-/// denied by `unsafe_bash_command_word`/`unsafe_command_word_in_segment`,
-/// but `unsafe_bash_directory_flag` recurses into quoted content on its
-/// own, unconditionally, unlike that construct-level scan (gated by
+/// assignments (genuinely nothing left to check). `Err` — not folded into
+/// `Ok(None)` — if its first non-assignment token is an unrecognized
+/// prefix (see [`looks_like_unrecognized_prefix`]; with redirections
+/// already gone, what remains of that shape is an assignment-like token
+/// this scan does not fully parse, `alias.x=!git` for instance), carrying
+/// that token back to the caller to deny with: at the *top level*, this
+/// case is also separately denied by
+/// `unsafe_bash_command_word`/`unsafe_command_word_in_segment`, but
+/// `unsafe_bash_directory_flag` recurses into quoted content on its own,
+/// unconditionally, unlike that construct-level scan (gated by
 /// [`looks_like_shell_code`]) — so a quoted string whose own evidence
 /// doesn't trip that gate (`"alias.x=!git -C / status"`, no operator or
 /// evidence word in `looks_like_shell_code`'s narrower vocabulary) would
@@ -1342,13 +1315,6 @@ fn command_word_index_in_segment(tokens: &[String]) -> Result<Option<usize>, &st
         let token = tokens[index].as_str();
         if is_assignment_word(token) {
             index += 1;
-            continue;
-        }
-        if let Some(bare) = redirection_prefix(token) {
-            index += 1;
-            if bare {
-                index += 1;
-            }
             continue;
         }
         if looks_like_unrecognized_prefix(token) {
@@ -1602,39 +1568,6 @@ fn redirection_prefix(token: &str) -> Option<bool> {
     None
 }
 
-/// Advance `index` past any number of consecutive Bash redirections
-/// starting there (each recognized by [`redirection_prefix`], consuming
-/// its own separate target too when bare), returning the position of the
-/// first token that is not one. A real, positional redirection can
-/// appear anywhere in a simple command's own argument list, not only
-/// where a caller happens to be expecting one — Bash strips every one of
-/// them out of the program's actual argv before it ever runs, wherever
-/// they land — so this must be applied at *every* point in
-/// [`resolve_directory_flag`] where a caller is about to treat "the next
-/// token" as something specific (a value-taking flag's own separate
-/// value, `timeout`'s mandatory `DURATION` positional), not only where a
-/// loop is freely scanning forward for its next flag (which already
-/// checks [`redirection_prefix`] as its own first branch, independent of
-/// this function). Skipping a flag's own value with a bare `next += 1`
-/// instead of this, when a redirection could stand in that exact
-/// position (`env -u 2>/dev/null FOO -C / cmd`), silently counts the
-/// redirection itself as the value and lands one token short on the
-/// *real* value — `FOO` here — mistaking it for the command's own exec
-/// target instead of the argument it actually is, and missing the live
-/// `-C` right after it.
-fn skip_redirections(tokens: &[String], mut index: usize) -> usize {
-    while let Some(token) = tokens.get(index) {
-        let Some(bare) = redirection_prefix(token) else {
-            break;
-        };
-        index += 1;
-        if bare {
-            index += 1;
-        }
-    }
-    index
-}
-
 /// Whether `token` looks like it is attempting to be an assignment or
 /// redirection prefix — starts (after an optional digit file-descriptor
 /// prefix) with `<` or `>`, or contains an unquoted `=` that is not its
@@ -1676,6 +1609,90 @@ fn find_redirection(token: &str) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// The words a token contributes to the real argv a wrapped program
+/// actually receives, once every Bash redirection glued directly onto it
+/// is accounted for — reusing the exact same redirection recognizer
+/// `bash_candidates`'s own path-candidate scan already uses
+/// ([`find_redirection`]), not a second one, per the standing instruction
+/// that a single preprocessing pass over this recognizer should replace
+/// the reactive, one-shape/one-position-at-a-time pattern several rounds
+/// of `resolve_directory_flag` fixes fell into. Bash's own tokenizer
+/// always splits on a bare `>`/`<` regardless of surrounding whitespace,
+/// unlike this file's simplified, whitespace-only tokenizer (`echo
+/// x>file` really is the three tokens `echo`, `x`, `>file` to Bash, but
+/// one opaque token `x>file` here) — this recovers that split, but drops
+/// the half [`split_redirections`] keeps (a redirect's own
+/// *target*, since path candidates matter for a different question —
+/// "could this text reach a protected path" — from this one — "what will
+/// the wrapped program's own argv actually contain", and a Bash redirect
+/// target is never part of the program's argv at all, real or
+/// otherwise).
+///
+/// Once the first redirection operator is found, everything from there
+/// up to the *next* one (or the token's end) is that operator's own
+/// target and is dropped entirely, regardless of what characters it
+/// contains — this incidentally also drops every combined-stream/
+/// duplication form (`>&`, `<&`, `n>&m` such as `2>&1`) without needing
+/// to spell each one out as its own case: whatever non-operator text
+/// immediately follows `>`/`<` is consumed as "the target", and a
+/// duplication form's own operand (`&1`) is exactly that shape already.
+fn argv_words_in_token(token: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut position = 0;
+    loop {
+        let remaining = &token[position..];
+        let Some((offset, length)) = find_redirection(remaining) else {
+            if !remaining.is_empty() {
+                words.push(remaining.to_string());
+            }
+            return words;
+        };
+        let before = &remaining[..offset];
+        if !before.is_empty() && !before.bytes().all(|byte| byte.is_ascii_digit()) {
+            words.push(before.to_string());
+        }
+        let target_start = position + offset + length;
+        let after_operator = &token[target_start..];
+        let target_len = find_redirection(after_operator)
+            .map_or(after_operator.len(), |(next_offset, _)| next_offset);
+        position = target_start + target_len;
+        if position >= token.len() {
+            return words;
+        }
+    }
+}
+
+/// Build the token stream a wrapper/option-boundary resolution should
+/// actually parse against, for one [`split_bash_segments`] slice: every
+/// Bash redirection this scan can find ([`argv_words_in_token`]) stripped
+/// out entirely, once, upfront — in place of the reactive pattern of
+/// skipping one redirect shape at a time at each individual value-
+/// consuming site in [`resolve_directory_flag`], which took several
+/// rounds to fully close and still left an unrecognized-shape gap each
+/// time a new one was found. Every downstream loop in
+/// `resolve_directory_flag` now parses purely from this cleaned stream
+/// and never has to think about a redirection appearing mid-command
+/// again, at any position or in any shape, because it is structurally
+/// gone before that code ever runs — not because each call site
+/// remembers to skip it.
+///
+/// Only an *unquoted* token is run through `argv_words_in_token` — a
+/// quoted one (`"a>b"`) is never Bash's own redirect syntax at all, real
+/// or otherwise, so it is kept whole, verbatim, regardless of what
+/// characters it contains.
+fn effective_argv(segment: &str) -> Vec<String> {
+    shell_tokens_scanned(segment)
+        .into_iter()
+        .flat_map(|token| {
+            if token.quoted {
+                vec![token.text]
+            } else {
+                argv_words_in_token(&token.text)
+            }
+        })
+        .collect()
 }
 
 /// Split one shell token on every redirection operator it contains,
@@ -2706,78 +2723,87 @@ mod tests {
         }
     }
 
-    /// exec-reviewer's own discovery: a Bash redirection interposed
-    /// between a command word and its own arguments (`git 2>/dev/null -C
-    /// / status`) is consumed entirely by Bash itself before the program
-    /// ever sees it — it is not a positional argument and never the
-    /// program's subcommand — but every loop here that walks a command's
-    /// own arguments treated an unrecognized, non-`-`-prefixed token
-    /// (which `2>/dev/null` looks exactly like) as the boundary to stop
-    /// at, missing a real `-C` right after it. Affects all four wrapper
-    /// arms identically: `git`/`make`/`tar`'s own `stop_at_first_positional`
-    /// scan, `nice`/`nohup`/`setsid`'s leading-flag skip, `timeout`'s, and
-    /// `env`'s.
+    /// exec-reviewer's own multi-round discovery: a Bash redirection can
+    /// stand in *any* position within a wrapper/option-boundary scan —
+    /// glued right after the command word (`git 2>/dev/null -C / status`,
+    /// consumed entirely by Bash before the program ever sees it, never
+    /// a real positional or subcommand), standing in for a value-taking
+    /// flag's own separate value (`env -u 2>/dev/null FOO -C / git
+    /// status`, which used to be silently counted as `-u`'s value,
+    /// landing one token short on the real value `FOO`), or in a shape
+    /// this scan's narrower `redirection_prefix` never fully parses at
+    /// all (`2>&1`, a descriptor-duplication form) — and each position
+    /// took its own round to close one at a time with a reactive,
+    /// per-call-site `skip_redirections`. That pattern is now replaced
+    /// entirely by [`effective_argv`]'s single, upfront pass: every
+    /// redirection in any of Bash's own forms is stripped out of the
+    /// token stream before any of these loops ever runs, so none of them
+    /// has to recognize or skip one at all, in any position or shape,
+    /// ever again.
     #[test]
-    fn unsafe_bash_directory_flag_treats_a_mid_command_redirection_as_transparent() {
+    fn unsafe_bash_directory_flag_is_unaffected_by_a_redirection_in_any_position_or_shape() {
         for command in [
             "git 2>/dev/null -C / status",
             "nice 2>/dev/null git -C / status",
             "timeout 2>/dev/null 2 git -C / status",
             "env 2>/dev/null -C / git status",
-        ] {
-            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
-        }
-    }
-
-    /// exec-reviewer's own follow-up discovery, deeper than the mid-
-    /// command case above: a redirection standing exactly in the
-    /// position a value-taking flag's own *separate value* would occupy
-    /// (`env -u 2>/dev/null FOO -C / git status`) was silently counted as
-    /// that value by a bare `next += 1`, landing one token short on the
-    /// real value (`FOO`) and mistaking it for the command's own exec
-    /// target — never reaching the live `-C` right after it. Affects
-    /// every value-taking-flag site across all four wrapper arms: `git`'s
-    /// `-c`/`--git-dir` (the general loop), `nice`'s `-n`, `timeout`'s
-    /// `-k`/`-s` (and its own mandatory `DURATION` skip), and `env`'s
-    /// `-u`/`-a`/`--unset`/etc.
-    #[test]
-    fn unsafe_bash_directory_flag_skips_a_redirection_standing_in_for_a_flags_own_value() {
-        for command in [
             "env -u 2>/dev/null FOO -C / git status",
             "git -c 2>/dev/null alias.v=version -C / v",
             "nice -n 2>/dev/null 10 git -C / status",
             "timeout -k 2>/dev/null 5 2 git -C / status",
             "timeout -f 2>/dev/null 2 git -C / status",
+            "git 2>&1 -C / status",
+            "nice 2>&1 git -C / status",
+            "timeout 2>&1 2 git -C / status",
+            "env 2>&1 -C / git status",
+            "env -u 2>&1 FOO -C / git status",
+            "git -c 2>&1 alias.v=version -C / v",
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
     }
 
-    /// exec-reviewer's own discovery: a descriptor-duplication redirect
-    /// like `2>&1` is deliberately *not* recognized by `redirection_prefix`
-    /// (its target starts with `&`, one of the combined-stream forms that
-    /// function fails closed on rather than fully parses — see its own
-    /// doc comment) — but every loop's "not `-`-prefixed, therefore this
-    /// must be the exec target/subcommand" boundary check treated it as a
-    /// legitimate positional anyway, once `redirection_prefix` said "not a
-    /// redirection I understand". `git 2>&1 -C / status` (and the
-    /// equivalent through each of the other three wrapper arms) reached
-    /// this exact gap. `looks_like_unrecognized_prefix` already exists to
-    /// fail closed on precisely this shape elsewhere in this file
-    /// (`command_word_index_in_segment`'s leading-prefix case); consulting
-    /// it here too, before treating an unrecognized non-flag token as a
-    /// safe boundary, denies rather than silently guesses.
+    /// Direct unit coverage for [`argv_words_in_token`], the primitive
+    /// [`effective_argv`] is built on: a word before a redirect survives,
+    /// a redirect's own target never does (regardless of what characters
+    /// it contains — including another `>`/`<`, another word this scan
+    /// deliberately does not try to recover, and a combined-stream form
+    /// like `2>&1`'s `&1`), a leading all-digit word glued right onto the
+    /// operator is the file-descriptor number and is dropped rather than
+    /// kept as a word, and a token with no redirection at all survives
+    /// whole.
     #[test]
-    fn unsafe_bash_directory_flag_denies_an_unrecognized_redirection_shape_rather_than_treating_it_as_the_target(
-    ) {
-        for command in [
-            "git 2>&1 -C / status",
-            "nice 2>&1 git -C / status",
-            "timeout 2>&1 2 git -C / status",
-            "env 2>&1 -C / git status",
-        ] {
-            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
-        }
+    fn argv_words_in_token_keeps_only_the_words_a_redirect_does_not_consume() {
+        assert_eq!(argv_words_in_token("plain"), vec!["plain".to_string()]);
+        assert_eq!(argv_words_in_token("x>file"), vec!["x".to_string()]);
+        assert_eq!(
+            argv_words_in_token("1>file"),
+            Vec::<String>::new(),
+            "a bare digit glued to the operator is the fd number, not a word"
+        );
+        assert_eq!(
+            argv_words_in_token("2>&1"),
+            Vec::<String>::new(),
+            "the duplication form's own &1 is consumed as the target too"
+        );
+        assert_eq!(
+            argv_words_in_token(">out<in"),
+            Vec::<String>::new(),
+            "chained redirects with nothing real between them contribute no words"
+        );
+    }
+
+    /// Direct unit coverage for [`effective_argv`]: a quoted token is
+    /// kept whole and verbatim even if it contains `>`/`<` characters
+    /// (never Bash's own redirect syntax once quoted), while an unquoted
+    /// one is run through [`argv_words_in_token`] the same way a real
+    /// Bash tokenizer would split it.
+    #[test]
+    fn effective_argv_keeps_quoted_redirect_looking_text_but_strips_a_real_one() {
+        assert_eq!(
+            effective_argv(r#"echo "a>b" 2>/dev/null -C"#),
+            vec!["echo".to_string(), "a>b".to_string(), "-C".to_string()]
+        );
     }
 
     /// exec-reviewer's own discovery: a lone `-` is `env`'s own
