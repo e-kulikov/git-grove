@@ -954,6 +954,26 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                     "a directory-changing `-C` flag on `{command_word}`"
                 ));
             }
+            if is_env_split_string_option(token) {
+                // `env -S`/`--split-string` re-parses its own value as a
+                // fresh command line (confirmed directly: `env -S 'echo
+                // x'` runs `echo x`) — the same kind of "hand a computed
+                // string to be reparsed as code" construct `eval`/`exec`
+                // already deny outright, not one this scan tries to
+                // safely resolve. A *quoted* value is already caught by
+                // the separate, unconditional recursion into quoted
+                // tokens elsewhere in this file, but `-S`'s value can just
+                // as easily be built with escaped spaces instead of real
+                // quote characters (`env -S git\ -C\ /\ status`), which
+                // carries no quoted-token marker for that recursion to
+                // ever see — so denying here, unconditionally, is the
+                // only way to close this without re-deriving "is this
+                // token secretly a whole command line" for every possible
+                // quoting permutation.
+                return Some(format!(
+                    "env's `-S`/`--split-string` on `{command_word}`, which re-parses its value as a new command line this scan cannot safely inspect"
+                ));
+            }
             if token.starts_with("--") {
                 let Some(needs_value) = long_option_needs_separate_value(
                     token,
@@ -1270,6 +1290,42 @@ fn is_assignment_word(token: &str) -> bool {
 /// line; the unquoted form has no such recursion to fall back on).
 fn looks_like_env_assignment(token: &str) -> bool {
     token.contains('=')
+}
+
+/// Whether `token` is `env`'s own `-S`/`--split-string` option, in any of
+/// its forms: the bare long option or `--split-string=value`; bare `-S`;
+/// `-S` with a glued value (`-Svalue`); or `-S` bundled with other short
+/// flags in the same getopt cluster, whether before it (`-iS`, `-iSvalue`)
+/// or, per [`short_option_cluster_needs_separate_value`]'s own rule that
+/// only the *last* letter in a cluster may carry a value, never after
+/// (`-Si` is not this option — `-i` is the value-taking position there,
+/// and it takes none, so that shape is unrecognized and handled by the
+/// ordinary fail-closed path instead). Deliberately does not attempt to
+/// extract the value itself — see the call site in [`resolve_directory_flag`]
+/// for why this option is denied outright rather than inspected.
+fn is_env_split_string_option(token: &str) -> bool {
+    if token == "--split-string" || token.starts_with("--split-string=") {
+        return true;
+    }
+    let Some(rest) = token.strip_prefix('-') else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with('-') {
+        return false;
+    }
+    for letter in rest.chars() {
+        if letter == 'S' {
+            return true;
+        }
+        if !ENV_NO_VALUE_SHORT_FLAGS.contains(letter) {
+            // Either a different value-taking flag (`-u`/`-a`) that
+            // consumes the rest of the cluster as its own value before an
+            // `S` could appear, or a letter this scan does not recognize
+            // at all — either way, not this option.
+            return false;
+        }
+    }
+    false
 }
 
 /// Whether `token` is a redirection operator this scan fully understands,
@@ -2584,6 +2640,34 @@ mod tests {
             None
         );
         assert!(unsafe_bash_directory_flag("env -a fake -C / git status").is_some());
+    }
+
+    /// exec-reviewer's own discovery: `env -S`/`--split-string` re-parses
+    /// its own value as a fresh command line (confirmed directly: `env -S
+    /// 'echo x'` runs `echo x`), the same kind of construct `eval`/`exec`
+    /// are already denied outright for rather than resolved. A *quoted*
+    /// value is also independently caught by this file's separate
+    /// recursion into quoted tokens, but `-S`'s value can just as easily
+    /// be built with escaped spaces instead of real quote characters
+    /// (`env -S git\ -C\ /\ status`), which carries no quoted-token marker
+    /// for that recursion to see at all — a real, unquoted-command miss
+    /// this dedicated check closes by denying `-S` unconditionally,
+    /// in any of its forms (bare long, glued long `=value`, bare short,
+    /// glued short, or clustered with another flag ahead of it).
+    /// `-uS FOO` is deliberately *not* one of these forms: per getopt's
+    /// own last-letter-takes-the-value rule, that is `-u` with the value
+    /// `S` glued on, not `-u` followed by a `-S` flag.
+    #[test]
+    fn unsafe_bash_directory_flag_denies_env_split_string_unconditionally() {
+        for command in [
+            r"env -S git\ -C\ /\ status",
+            "env -S 'echo hi'",
+            r#"env --split-string="echo hi" true"#,
+            r#"env -iS "echo hi" true"#,
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+        assert_eq!(unsafe_bash_directory_flag("env -uS FOO true"), None);
     }
 
     /// `tar`/`make` are deliberately not scoped to leading options only
