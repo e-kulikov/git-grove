@@ -1034,7 +1034,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             let consumes_next_word = WRAPPER_OPTIONS_WITH_SEPARATE_VALUE.contains(&token);
             next += 1;
             if consumes_next_word {
-                next += 1;
+                next = skip_redirections(tokens, next) + 1;
             }
         }
         return resolve_directory_flag(tokens, next);
@@ -1078,13 +1078,19 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
             };
             next += 1;
             if needs_value {
-                next += 1;
+                next = skip_redirections(tokens, next) + 1;
             }
         }
         // The mandatory DURATION positional, between timeout's own options
         // and the command it execs — skipped unconditionally, unlike a
         // wrapper's optional flags, since timeout's own grammar always has
-        // exactly one here whenever a command follows at all.
+        // exactly one here whenever a command follows at all. A
+        // redirection could stand in this exact position too
+        // (`timeout 2>/dev/null 2 git ...` already skipped the leading
+        // redirect above and landed here on the real duration, but
+        // `timeout -f 2>/dev/null 2 git ...` needs it skipped right here,
+        // between `-f` and the duration).
+        next = skip_redirections(tokens, next);
         if next < tokens.len() {
             next += 1;
         }
@@ -1143,7 +1149,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 };
                 next += 1;
                 if needs_value {
-                    next += 1;
+                    next = skip_redirections(tokens, next) + 1;
                 }
                 continue;
             }
@@ -1172,7 +1178,7 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 };
                 next += 1;
                 if needs_value {
-                    next += 1;
+                    next = skip_redirections(tokens, next) + 1;
                 }
                 continue;
             }
@@ -1214,14 +1220,16 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
         return None;
     }
     let stop_at_first_positional = name == "git";
-    let mut rest = tokens[index + 1..].iter();
-    while let Some(token) = rest.next() {
+    let mut next = index + 1;
+    while next < tokens.len() {
+        let token = tokens[next].as_str();
         if token == "--" {
             break;
         }
         if let Some(bare) = redirection_prefix(token) {
+            next += 1;
             if bare {
-                rest.next();
+                next += 1;
             }
             continue;
         }
@@ -1230,9 +1238,10 @@ fn resolve_directory_flag(tokens: &[String], index: usize) -> Option<String> {
                 "a directory-changing `-C` flag on `{command_word}`"
             ));
         }
+        next += 1;
         if stop_at_first_positional {
             if option_consumes_separate_value(command_word, token) {
-                rest.next();
+                next = skip_redirections(tokens, next) + 1;
                 continue;
             }
             if !token.starts_with('-') {
@@ -1571,6 +1580,39 @@ fn redirection_prefix(token: &str) -> Option<bool> {
         }
     }
     None
+}
+
+/// Advance `index` past any number of consecutive Bash redirections
+/// starting there (each recognized by [`redirection_prefix`], consuming
+/// its own separate target too when bare), returning the position of the
+/// first token that is not one. A real, positional redirection can
+/// appear anywhere in a simple command's own argument list, not only
+/// where a caller happens to be expecting one — Bash strips every one of
+/// them out of the program's actual argv before it ever runs, wherever
+/// they land — so this must be applied at *every* point in
+/// [`resolve_directory_flag`] where a caller is about to treat "the next
+/// token" as something specific (a value-taking flag's own separate
+/// value, `timeout`'s mandatory `DURATION` positional), not only where a
+/// loop is freely scanning forward for its next flag (which already
+/// checks [`redirection_prefix`] as its own first branch, independent of
+/// this function). Skipping a flag's own value with a bare `next += 1`
+/// instead of this, when a redirection could stand in that exact
+/// position (`env -u 2>/dev/null FOO -C / cmd`), silently counts the
+/// redirection itself as the value and lands one token short on the
+/// *real* value — `FOO` here — mistaking it for the command's own exec
+/// target instead of the argument it actually is, and missing the live
+/// `-C` right after it.
+fn skip_redirections(tokens: &[String], mut index: usize) -> usize {
+    while let Some(token) = tokens.get(index) {
+        let Some(bare) = redirection_prefix(token) else {
+            break;
+        };
+        index += 1;
+        if bare {
+            index += 1;
+        }
+    }
+    index
 }
 
 /// Whether `token` looks like it is attempting to be an assignment or
@@ -2662,6 +2704,30 @@ mod tests {
             "nice 2>/dev/null git -C / status",
             "timeout 2>/dev/null 2 git -C / status",
             "env 2>/dev/null -C / git status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
+    }
+
+    /// exec-reviewer's own follow-up discovery, deeper than the mid-
+    /// command case above: a redirection standing exactly in the
+    /// position a value-taking flag's own *separate value* would occupy
+    /// (`env -u 2>/dev/null FOO -C / git status`) was silently counted as
+    /// that value by a bare `next += 1`, landing one token short on the
+    /// real value (`FOO`) and mistaking it for the command's own exec
+    /// target — never reaching the live `-C` right after it. Affects
+    /// every value-taking-flag site across all four wrapper arms: `git`'s
+    /// `-c`/`--git-dir` (the general loop), `nice`'s `-n`, `timeout`'s
+    /// `-k`/`-s` (and its own mandatory `DURATION` skip), and `env`'s
+    /// `-u`/`-a`/`--unset`/etc.
+    #[test]
+    fn unsafe_bash_directory_flag_skips_a_redirection_standing_in_for_a_flags_own_value() {
+        for command in [
+            "env -u 2>/dev/null FOO -C / git status",
+            "git -c 2>/dev/null alias.v=version -C / v",
+            "nice -n 2>/dev/null 10 git -C / status",
+            "timeout -k 2>/dev/null 5 2 git -C / status",
+            "timeout -f 2>/dev/null 2 git -C / status",
         ] {
             assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
         }
