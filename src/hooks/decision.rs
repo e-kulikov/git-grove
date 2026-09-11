@@ -134,10 +134,22 @@ fn shell_tokens(command: &str) -> Vec<String> {
 
 /// One token as [`shell_tokens`] produces it, alongside whether any part of
 /// its content came from inside a quoted region (single or double) — see
-/// [`bash_candidates`] for why that matters.
+/// [`bash_candidates`] for why that matters — and, separately, exactly
+/// *which* bytes of `text` came from inside a quoted region or an escaping
+/// backslash, in `quoted_mask` (one entry per byte of `text`, a multi-byte
+/// character's bytes all sharing that character's single quoted-or-not
+/// verdict). The whole-token `quoted` flag is true the moment *any* part of
+/// the token was quoted, which is exactly what deciding "is this whole
+/// token worth recursing into as nested command text" needs — but it is
+/// too coarse for deciding whether one specific character inside a *mixed*
+/// token (`>"/dev/null"`: a bare, real redirect operator glued directly to
+/// a quoted target, with no space between them, which Bash tokenizes as
+/// this same single word) is itself quoted; `quoted_mask` answers that
+/// finer question. See [`find_unquoted_redirection`].
 struct ScannedToken {
     text: String,
     quoted: bool,
+    quoted_mask: Vec<bool>,
 }
 
 /// The tokenizer [`shell_tokens`] exposes the plain text of. Kept as its
@@ -148,10 +160,22 @@ struct ScannedToken {
 fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut current_mask = Vec::new();
     let mut current_quoted = false;
     let mut in_single = false;
     let mut in_double = false;
     let mut chars = command.chars().peekable();
+    // Pushes `character` onto `current`, marking every byte of its UTF-8
+    // encoding with the same quoted-or-not verdict in `current_mask` — a
+    // backslash-escaped character counts as quoted here for exactly the
+    // reason it counts as quoted in `current_quoted`: Bash treats `\>` as a
+    // literal `>`, never as a real redirect operator, the same as `">"`.
+    fn push(current: &mut String, current_mask: &mut Vec<bool>, character: char, quoted: bool) {
+        let start = current.len();
+        current.push(character);
+        current_mask.resize(current.len(), quoted);
+        debug_assert_eq!(current_mask.len() - start, character.len_utf8());
+    }
     while let Some(character) = chars.next() {
         match character {
             '\'' if !in_double => {
@@ -173,7 +197,7 @@ fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
             }
             '\\' if !in_single => {
                 if let Some(next) = chars.next() {
-                    current.push(next);
+                    push(&mut current, &mut current_mask, next, true);
                 }
             }
             character if character.is_whitespace() && !in_single && !in_double => {
@@ -181,16 +205,23 @@ fn shell_tokens_scanned(command: &str) -> Vec<ScannedToken> {
                     tokens.push(ScannedToken {
                         text: std::mem::take(&mut current),
                         quoted: std::mem::take(&mut current_quoted),
+                        quoted_mask: std::mem::take(&mut current_mask),
                     });
                 }
             }
-            character => current.push(character),
+            character => push(
+                &mut current,
+                &mut current_mask,
+                character,
+                in_single || in_double,
+            ),
         }
     }
     if !current.is_empty() {
         tokens.push(ScannedToken {
             text: current,
             quoted: current_quoted,
+            quoted_mask: current_mask,
         });
     }
     tokens
@@ -1601,11 +1632,28 @@ fn looks_like_unrecognized_prefix(token: &str) -> bool {
 /// so a byte-index split on them can never land inside a multi-byte UTF-8
 /// sequence.
 fn find_redirection(token: &str) -> Option<(usize, usize)> {
+    find_redirection_impl(token, None)
+}
+
+/// Same search as [`find_redirection`], but skips any `>`/`<` byte that
+/// `mask` marks as quoted or backslash-escaped — Bash never treats either
+/// as a real redirect operator, only as a literal character, regardless of
+/// what any other, unquoted part of the same token looks like. `mask` must
+/// have one entry per byte of `token` (as [`ScannedToken::quoted_mask`]
+/// does for `ScannedToken::text`); a multi-byte character's operator bytes
+/// (`>`/`<` are always single-byte ASCII, so this only ever matters for
+/// `mask`'s own length bookkeeping) share one verdict.
+fn find_unquoted_redirection(token: &str, mask: &[bool]) -> Option<(usize, usize)> {
+    find_redirection_impl(token, Some(mask))
+}
+
+fn find_redirection_impl(token: &str, mask: Option<&[bool]>) -> Option<(usize, usize)> {
     let bytes = token.as_bytes();
     for (index, &byte) in bytes.iter().enumerate() {
-        if byte == b'>' || byte == b'<' {
-            let doubled = bytes.get(index + 1) == Some(&byte);
-            return Some((index, if doubled { 2 } else { 1 }));
+        if (byte == b'>' || byte == b'<') && !mask.is_some_and(|mask| mask[index]) {
+            let next_is_same_unquoted =
+                bytes.get(index + 1) == Some(&byte) && !mask.is_some_and(|mask| mask[index + 1]);
+            return Some((index, if next_is_same_unquoted { 2 } else { 1 }));
         }
     }
     None
@@ -1638,12 +1686,13 @@ fn find_redirection(token: &str) -> Option<(usize, usize)> {
 /// to spell each one out as its own case: whatever non-operator text
 /// immediately follows `>`/`<` is consumed as "the target", and a
 /// duplication form's own operand (`&1`) is exactly that shape already.
-fn argv_words_in_token(token: &str) -> Vec<String> {
+fn argv_words_in_token(token: &str, mask: &[bool]) -> Vec<String> {
     let mut words = Vec::new();
     let mut position = 0;
     loop {
         let remaining = &token[position..];
-        let Some((offset, length)) = find_redirection(remaining) else {
+        let remaining_mask = &mask[position..];
+        let Some((offset, length)) = find_unquoted_redirection(remaining, remaining_mask) else {
             if !remaining.is_empty() {
                 words.push(remaining.to_string());
             }
@@ -1655,7 +1704,8 @@ fn argv_words_in_token(token: &str) -> Vec<String> {
         }
         let target_start = position + offset + length;
         let after_operator = &token[target_start..];
-        let target_len = find_redirection(after_operator)
+        let after_operator_mask = &mask[target_start..];
+        let target_len = find_unquoted_redirection(after_operator, after_operator_mask)
             .map_or(after_operator.len(), |(next_offset, _)| next_offset);
         position = target_start + target_len;
         if position >= token.len() {
@@ -1678,20 +1728,25 @@ fn argv_words_in_token(token: &str) -> Vec<String> {
 /// gone before that code ever runs — not because each call site
 /// remembers to skip it.
 ///
-/// Only an *unquoted* token is run through `argv_words_in_token` — a
-/// quoted one (`"a>b"`) is never Bash's own redirect syntax at all, real
-/// or otherwise, so it is kept whole, verbatim, regardless of what
-/// characters it contains.
+/// Every token is run through `argv_words_in_token`, quote-mask and all,
+/// rather than being skipped whole whenever *any* part of it was quoted —
+/// a whole-token quoted/unquoted split cannot represent a single glued
+/// word that is genuinely mixed, like `>"/dev/null"` (a bare, real,
+/// unquoted redirect operator immediately followed by a quoted target with
+/// no space, which Bash tokenizes as one word); treating the presence of
+/// *any* quote anywhere in that word as reason to keep the whole thing
+/// verbatim would leave the real operator unstripped and never recognized,
+/// silently hiding whatever flag came after it. Passing the byte-level
+/// mask through instead lets `argv_words_in_token` make that call per
+/// character: a token that turns out to be quoted throughout still comes
+/// back as one untouched word, since `find_unquoted_redirection` finds no
+/// operator to split on, and a fully unquoted token behaves exactly as
+/// before — this subsumes both of the previous whole-token cases as the
+/// two ends of what is really one continuous, per-byte question.
 fn effective_argv(segment: &str) -> Vec<String> {
     shell_tokens_scanned(segment)
         .into_iter()
-        .flat_map(|token| {
-            if token.quoted {
-                vec![token.text]
-            } else {
-                argv_words_in_token(&token.text)
-            }
-        })
+        .flat_map(|token| argv_words_in_token(&token.text, &token.quoted_mask))
         .collect()
 }
 
@@ -2763,6 +2818,12 @@ mod tests {
         }
     }
 
+    /// A token with no quoting at all, for tests exercising
+    /// [`argv_words_in_token`] directly against plain, unquoted text.
+    fn unquoted_mask(token: &str) -> Vec<bool> {
+        vec![false; token.len()]
+    }
+
     /// Direct unit coverage for [`argv_words_in_token`], the primitive
     /// [`effective_argv`] is built on: a word before a redirect survives,
     /// a redirect's own target never does (regardless of what characters
@@ -2774,36 +2835,77 @@ mod tests {
     /// whole.
     #[test]
     fn argv_words_in_token_keeps_only_the_words_a_redirect_does_not_consume() {
-        assert_eq!(argv_words_in_token("plain"), vec!["plain".to_string()]);
-        assert_eq!(argv_words_in_token("x>file"), vec!["x".to_string()]);
         assert_eq!(
-            argv_words_in_token("1>file"),
+            argv_words_in_token("plain", &unquoted_mask("plain")),
+            vec!["plain".to_string()]
+        );
+        assert_eq!(
+            argv_words_in_token("x>file", &unquoted_mask("x>file")),
+            vec!["x".to_string()]
+        );
+        assert_eq!(
+            argv_words_in_token("1>file", &unquoted_mask("1>file")),
             Vec::<String>::new(),
             "a bare digit glued to the operator is the fd number, not a word"
         );
         assert_eq!(
-            argv_words_in_token("2>&1"),
+            argv_words_in_token("2>&1", &unquoted_mask("2>&1")),
             Vec::<String>::new(),
             "the duplication form's own &1 is consumed as the target too"
         );
         assert_eq!(
-            argv_words_in_token(">out<in"),
+            argv_words_in_token(">out<in", &unquoted_mask(">out<in")),
             Vec::<String>::new(),
             "chained redirects with nothing real between them contribute no words"
         );
     }
 
-    /// Direct unit coverage for [`effective_argv`]: a quoted token is
-    /// kept whole and verbatim even if it contains `>`/`<` characters
-    /// (never Bash's own redirect syntax once quoted), while an unquoted
-    /// one is run through [`argv_words_in_token`] the same way a real
-    /// Bash tokenizer would split it.
+    /// Direct unit coverage for [`effective_argv`]: a fully quoted token
+    /// is kept whole and verbatim even if it contains `>`/`<` characters
+    /// (never Bash's own redirect syntax once quoted), an unquoted one is
+    /// run through [`argv_words_in_token`] the same way a real Bash
+    /// tokenizer would split it, and — the case a whole-token quoted flag
+    /// cannot represent — a single word that is genuinely *mixed*, a bare
+    /// unquoted operator glued directly onto a quoted target with no
+    /// space (`>"/dev/null"`, which Bash tokenizes as one word, real
+    /// operator and all), still has that real operator recognized and
+    /// stripped rather than being kept whole just because the word also
+    /// contains a quote somewhere.
     #[test]
     fn effective_argv_keeps_quoted_redirect_looking_text_but_strips_a_real_one() {
         assert_eq!(
             effective_argv(r#"echo "a>b" 2>/dev/null -C"#),
             vec!["echo".to_string(), "a>b".to_string(), "-C".to_string()]
         );
+        assert_eq!(
+            effective_argv(r#"env -u >"/dev/null" FOO -C / git status"#),
+            vec![
+                "env".to_string(),
+                "-u".to_string(),
+                "FOO".to_string(),
+                "-C".to_string(),
+                "/".to_string(),
+                "git".to_string(),
+                "status".to_string(),
+            ],
+            "a bare, unquoted redirect operator glued to a quoted target is still a real \
+             redirect and must not be hidden by the word's own trailing quotes"
+        );
+    }
+
+    /// exec-reviewer's mixed-quote-token discovery, confirmed against real
+    /// Bash (`env -u >"/dev/null" FOO -C / /usr/bin/pwd` really does
+    /// redirect stdout to `/dev/null` and run `env -C / /usr/bin/pwd` —
+    /// i.e. a real directory change): the token immediately after `-u` is
+    /// `>"/dev/null"`, a bare unquoted `>` glued directly to a quoted
+    /// target with no space between them. A whole-token "any quote inside
+    /// it means treat the whole word as quoted, verbatim" rule cannot
+    /// represent this — it hid the real redirect, shifted every token
+    /// after it by one position, and made `resolve_directory_flag` miss
+    /// `env`'s own `-C` entirely.
+    #[test]
+    fn unsafe_bash_directory_flag_sees_through_a_redirect_operator_glued_to_a_quoted_target() {
+        assert!(unsafe_bash_directory_flag(r#"env -u >"/dev/null" FOO -C / git status"#).is_some());
     }
 
     /// exec-reviewer's own discovery: a lone `-` is `env`'s own
