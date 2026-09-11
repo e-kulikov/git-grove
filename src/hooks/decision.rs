@@ -1413,13 +1413,20 @@ fn split_bash_segments(command: &str) -> Vec<String> {
             // `unsafe_command_word_in_segment` a truncated token
             // (`>`/`<` alone) it would then wrongly treat as fully
             // recognized, exactly defeating the fail-closed check that
-            // token was supposed to trigger.
+            // token was supposed to trigger. "At the start of a fresh
+            // word" means `current` is empty *or* ends in whitespace, not
+            // only empty outright — `&>` starts a fresh word exactly the
+            // same way whether it opens the whole segment (`&>out cmd`)
+            // or comes after an earlier word and a space (`cmd &>out`);
+            // requiring `current` to be entirely empty missed every case
+            // but the former, splitting `cmd &>out` on the bare `&` as if
+            // it were the background-job operator instead.
             '&' | '|'
                 if !in_single
                     && !in_double
                     && (current.ends_with(['>', '<'])
                         || (character == '&'
-                            && current.is_empty()
+                            && current.chars().last().is_none_or(char::is_whitespace)
                             && chars.peek() == Some(&'>'))) =>
             {
                 current.push(character);
@@ -1627,33 +1634,57 @@ fn looks_like_unrecognized_prefix(token: &str) -> bool {
         .any(|(_, character)| character == '=')
 }
 
-/// Find the earliest unquoted redirection operator (`>`, `>>`, `<`, `<<`)
-/// inside `token`, returning its byte offset and length. `>`/`<` are ASCII,
-/// so a byte-index split on them can never land inside a multi-byte UTF-8
+/// Every spelling of a Bash redirection operator this scan recognizes, as
+/// its literal ASCII bytes, longest first so a greedy per-position match
+/// always finds the longest one actually present rather than stopping at
+/// a shorter prefix of it (`<<<` must never be read as a bare `<<`
+/// followed by a separate `<`, and `>|`/`<>`/`>&`/`<&`/`&>` — operators
+/// combining two *different* characters, not one character doubled —
+/// must be read as the one atomic operator they are, not as a bare `>`/
+/// `<` followed by a literal `|`/`&` glued onto the target). Every one of
+/// these is a real, distinct Bash redirection form (`man bash`,
+/// REDIRECTION): `<<<` (herestring), `<<-` (heredoc, strips leading
+/// tabs), `&>>` (append both streams), `<<`/`>>` (heredoc/append), `<&`/
+/// `>&` (duplicate a descriptor), `<>` (open read-write), `>|` (clobber
+/// override), `&>` (redirect both streams), and the bare `<`/`>`.
+const REDIRECTION_OPERATORS: &[&[u8]] = &[
+    b"<<<", b"<<-", b"&>>", b"<<", b">>", b"<&", b">&", b"<>", b">|", b"&>", b"<", b">",
+];
+
+/// Find the earliest unquoted redirection operator inside `token`,
+/// returning its byte offset and length. Every operator byte is ASCII, so
+/// a byte-index split on one can never land inside a multi-byte UTF-8
 /// sequence.
 fn find_redirection(token: &str) -> Option<(usize, usize)> {
     find_redirection_impl(token, None)
 }
 
-/// Same search as [`find_redirection`], but skips any `>`/`<` byte that
-/// `mask` marks as quoted or backslash-escaped — Bash never treats either
-/// as a real redirect operator, only as a literal character, regardless of
-/// what any other, unquoted part of the same token looks like. `mask` must
-/// have one entry per byte of `token` (as [`ScannedToken::quoted_mask`]
-/// does for `ScannedToken::text`); a multi-byte character's operator bytes
-/// (`>`/`<` are always single-byte ASCII, so this only ever matters for
-/// `mask`'s own length bookkeeping) share one verdict.
+/// Same search as [`find_redirection`], but skips any operator any of
+/// whose bytes `mask` marks as quoted or backslash-escaped — Bash never
+/// treats a quoted or escaped operator character as a real redirect
+/// operator, only as a literal character, regardless of what any other,
+/// unquoted part of the same token looks like. `mask` must have one entry
+/// per byte of `token` (as [`ScannedToken::quoted_mask`] does for
+/// `ScannedToken::text`).
 fn find_unquoted_redirection(token: &str, mask: &[bool]) -> Option<(usize, usize)> {
     find_redirection_impl(token, Some(mask))
 }
 
 fn find_redirection_impl(token: &str, mask: Option<&[bool]>) -> Option<(usize, usize)> {
     let bytes = token.as_bytes();
-    for (index, &byte) in bytes.iter().enumerate() {
-        if (byte == b'>' || byte == b'<') && !mask.is_some_and(|mask| mask[index]) {
-            let next_is_same_unquoted =
-                bytes.get(index + 1) == Some(&byte) && !mask.is_some_and(|mask| mask[index + 1]);
-            return Some((index, if next_is_same_unquoted { 2 } else { 1 }));
+    for index in 0..bytes.len() {
+        if !matches!(bytes[index], b'<' | b'>' | b'&') {
+            continue;
+        }
+        for operator in REDIRECTION_OPERATORS {
+            let end = index + operator.len();
+            if end > bytes.len() || &bytes[index..end] != *operator {
+                continue;
+            }
+            if mask.is_some_and(|mask| mask[index..end].iter().any(|&quoted| quoted)) {
+                continue;
+            }
+            return Some((index, operator.len()));
         }
     }
     None
@@ -2970,6 +3001,36 @@ mod tests {
     #[test]
     fn unsafe_bash_directory_flag_sees_through_a_redirect_with_a_separate_word_target() {
         assert!(unsafe_bash_directory_flag("env -u 2> /dev/null FOO -C / git status").is_some());
+    }
+
+    /// exec-reviewer's third same-round discovery, confirmed against real
+    /// Bash (`env -u >| /dev/null FOO -C / /usr/bin/pwd` really overrides
+    /// noclobber and redirects stdout to `/dev/null`, running
+    /// `env -u FOO -C / /usr/bin/pwd` -- a real directory change): the
+    /// clobber-override operator `>|` combines two *different* characters,
+    /// unlike the doubled forms (`>>`, `<<`) the redirect recognizer used
+    /// to special-case. Reading it as a bare `>` glued to a literal `|`
+    /// target treated `|` as ordinary glued content instead of recognizing
+    /// the two-byte operator as a whole, so the real separate-word target
+    /// after it was never flagged as dangling and sailed through as an
+    /// ordinary word. The recognizer now matches a table of every Bash
+    /// redirection operator spelling (`<<<`, `<<-`, `&>>`, `<<`, `>>`,
+    /// `<&`, `>&`, `<>`, `>|`, `&>`, plus the bare `<`/`>`) rather than
+    /// only same-character doubling, so this and every other two- and
+    /// three-character form are each read as the one atomic operator they
+    /// are.
+    #[test]
+    fn unsafe_bash_directory_flag_recognizes_every_bash_redirection_operator_spelling() {
+        for command in [
+            "env -u >| /dev/null FOO -C / git status",
+            "env -u <> /dev/null FOO -C / git status",
+            "env -u <&0 FOO -C / git status",
+            "env -u &> /dev/null FOO -C / git status",
+            "env -u &>> /dev/null FOO -C / git status",
+            "env -u <<< word FOO -C / git status",
+        ] {
+            assert!(unsafe_bash_directory_flag(command).is_some(), "{command:?}");
+        }
     }
 
     /// exec-reviewer's own discovery: a lone `-` is `env`'s own
