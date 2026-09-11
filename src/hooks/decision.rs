@@ -1686,7 +1686,17 @@ fn find_redirection_impl(token: &str, mask: Option<&[bool]>) -> Option<(usize, u
 /// to spell each one out as its own case: whatever non-operator text
 /// immediately follows `>`/`<` is consumed as "the target", and a
 /// duplication form's own operand (`&1`) is exactly that shape already.
-fn argv_words_in_token(token: &str, mask: &[bool]) -> Vec<String> {
+///
+/// The second return value is whether the token ends in a *dangling*
+/// operator — one with nothing at all glued after it within this same
+/// token (`2>` as its own whole token, rather than `2>file`). Bash's
+/// redirection target does not have to be glued to its operator at all;
+/// `cmd 2> file` is exactly as real a redirect as `cmd 2>file`, just with
+/// the target as its own separate word. A dangling operator's target is
+/// therefore the *entire next token*, unconditionally, however that next
+/// token itself looks — [`effective_argv`], which sees the whole token
+/// stream, is what actually drops it.
+fn argv_words_in_token(token: &str, mask: &[bool]) -> (Vec<String>, bool) {
     let mut words = Vec::new();
     let mut position = 0;
     loop {
@@ -1696,7 +1706,7 @@ fn argv_words_in_token(token: &str, mask: &[bool]) -> Vec<String> {
             if !remaining.is_empty() {
                 words.push(remaining.to_string());
             }
-            return words;
+            return (words, false);
         };
         let before = &remaining[..offset];
         if !before.is_empty() && !before.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -1704,12 +1714,15 @@ fn argv_words_in_token(token: &str, mask: &[bool]) -> Vec<String> {
         }
         let target_start = position + offset + length;
         let after_operator = &token[target_start..];
+        if after_operator.is_empty() {
+            return (words, true);
+        }
         let after_operator_mask = &mask[target_start..];
         let target_len = find_unquoted_redirection(after_operator, after_operator_mask)
             .map_or(after_operator.len(), |(next_offset, _)| next_offset);
         position = target_start + target_len;
         if position >= token.len() {
-            return words;
+            return (words, false);
         }
     }
 }
@@ -1743,11 +1756,26 @@ fn argv_words_in_token(token: &str, mask: &[bool]) -> Vec<String> {
 /// operator to split on, and a fully unquoted token behaves exactly as
 /// before — this subsumes both of the previous whole-token cases as the
 /// two ends of what is really one continuous, per-byte question.
+///
+/// State also carries *across* tokens, not only within one: when a token
+/// ends in a dangling operator (`argv_words_in_token`'s second return
+/// value), the entire next token is that redirect's separate-word target
+/// (`cmd 2> file`, not glued as `cmd 2>file`) and is dropped whole here,
+/// unconditionally — regardless of what it itself looks like, even if it
+/// would otherwise have been read as a flag or another operator.
 fn effective_argv(segment: &str) -> Vec<String> {
-    shell_tokens_scanned(segment)
-        .into_iter()
-        .flat_map(|token| argv_words_in_token(&token.text, &token.quoted_mask))
-        .collect()
+    let mut words = Vec::new();
+    let mut awaiting_separate_target = false;
+    for token in shell_tokens_scanned(segment) {
+        if awaiting_separate_target {
+            awaiting_separate_target = false;
+            continue;
+        }
+        let (mut token_words, dangling) = argv_words_in_token(&token.text, &token.quoted_mask);
+        words.append(&mut token_words);
+        awaiting_separate_target = dangling;
+    }
+    words
 }
 
 /// Split one shell token on every redirection operator it contains,
@@ -2831,32 +2859,39 @@ mod tests {
     /// deliberately does not try to recover, and a combined-stream form
     /// like `2>&1`'s `&1`), a leading all-digit word glued right onto the
     /// operator is the file-descriptor number and is dropped rather than
-    /// kept as a word, and a token with no redirection at all survives
-    /// whole.
+    /// kept as a word, a token with no redirection at all survives whole,
+    /// and a trailing operator with nothing glued after it within the same
+    /// token (`2>` alone) reports itself as dangling so its caller knows
+    /// the target is the entire next, separate token instead.
     #[test]
     fn argv_words_in_token_keeps_only_the_words_a_redirect_does_not_consume() {
         assert_eq!(
             argv_words_in_token("plain", &unquoted_mask("plain")),
-            vec!["plain".to_string()]
+            (vec!["plain".to_string()], false)
         );
         assert_eq!(
             argv_words_in_token("x>file", &unquoted_mask("x>file")),
-            vec!["x".to_string()]
+            (vec!["x".to_string()], false)
         );
         assert_eq!(
             argv_words_in_token("1>file", &unquoted_mask("1>file")),
-            Vec::<String>::new(),
+            (Vec::<String>::new(), false),
             "a bare digit glued to the operator is the fd number, not a word"
         );
         assert_eq!(
             argv_words_in_token("2>&1", &unquoted_mask("2>&1")),
-            Vec::<String>::new(),
+            (Vec::<String>::new(), false),
             "the duplication form's own &1 is consumed as the target too"
         );
         assert_eq!(
             argv_words_in_token(">out<in", &unquoted_mask(">out<in")),
-            Vec::<String>::new(),
+            (Vec::<String>::new(), false),
             "chained redirects with nothing real between them contribute no words"
+        );
+        assert_eq!(
+            argv_words_in_token("2>", &unquoted_mask("2>")),
+            (Vec::<String>::new(), true),
+            "an operator with nothing glued after it is dangling: its target is separate"
         );
     }
 
@@ -2891,6 +2926,20 @@ mod tests {
             "a bare, unquoted redirect operator glued to a quoted target is still a real \
              redirect and must not be hidden by the word's own trailing quotes"
         );
+        assert_eq!(
+            effective_argv("env -u 2> /dev/null FOO -C / git status"),
+            vec![
+                "env".to_string(),
+                "-u".to_string(),
+                "FOO".to_string(),
+                "-C".to_string(),
+                "/".to_string(),
+                "git".to_string(),
+                "status".to_string(),
+            ],
+            "a redirect's target does not have to be glued to its operator at all -- \
+             the entire next, separate token is the target and must be dropped whole"
+        );
     }
 
     /// exec-reviewer's mixed-quote-token discovery, confirmed against real
@@ -2906,6 +2955,21 @@ mod tests {
     #[test]
     fn unsafe_bash_directory_flag_sees_through_a_redirect_operator_glued_to_a_quoted_target() {
         assert!(unsafe_bash_directory_flag(r#"env -u >"/dev/null" FOO -C / git status"#).is_some());
+    }
+
+    /// exec-reviewer's second same-round discovery, confirmed against real
+    /// Bash (`env -u 2> /dev/null FOO -C / /usr/bin/pwd` really does
+    /// redirect fd 2 to `/dev/null` and run `env -u FOO -C / /usr/bin/pwd`
+    /// -- a real directory change): a redirect operator with nothing
+    /// glued after it within its own token (`2>` as a whole token) has its
+    /// target as the entire *next*, separate token (`/dev/null`), exactly
+    /// as real a redirect as the glued form `2>/dev/null`. Treating only
+    /// glued targets as real left this separate-word form's target sitting
+    /// in the effective argv as an ordinary word, shifting every token
+    /// after it and hiding `env`'s own `-C`.
+    #[test]
+    fn unsafe_bash_directory_flag_sees_through_a_redirect_with_a_separate_word_target() {
+        assert!(unsafe_bash_directory_flag("env -u 2> /dev/null FOO -C / git status").is_some());
     }
 
     /// exec-reviewer's own discovery: a lone `-` is `env`'s own
