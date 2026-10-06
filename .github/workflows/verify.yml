@@ -12,6 +12,31 @@ env:
   MSRV_TOOLCHAIN: "1.85.1"
 
 jobs:
+  scripts:
+    name: scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check and test the release scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/*.sh
+          shellcheck scripts/*.sh
+          scripts/test-release-scripts.sh
+
+      # release-please derives the version bump and changelog from commit subjects.
+      - name: Check commit messages
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/check-conventional-commits.sh "origin/${{ github.base_ref }}..HEAD"
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest

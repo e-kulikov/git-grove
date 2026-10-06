@@ -1,19 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <X.Y.Z> <git-grove-binary> <destination>" >&2
+if [[ $# -ne 4 ]]; then
+  echo "usage: $0 <X.Y.Z> <target-triple> <git-grove-binary> <destination>" >&2
   exit 64
 fi
 
 version=$1
-binary=$2
-destination=$3
+target=$2
+binary=$3
+destination=$4
 
 if [[ ! $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "release version must be strict X.Y.Z: $version" >&2
   exit 64
 fi
+case "$target" in
+  x86_64-unknown-linux-musl) arch=x86_64 ;;
+  aarch64-unknown-linux-musl) arch=aarch64 ;;
+  *)
+    echo "unsupported target: $target" >&2
+    exit 64
+    ;;
+esac
 if [[ ! -f $binary || ! -x $binary ]]; then
   echo "release binary must be an executable regular file: $binary" >&2
   exit 1
@@ -26,7 +35,7 @@ if [[ ! $source_date_epoch =~ ^[0-9]+$ ]]; then
   exit 64
 fi
 
-stage_name="git-grove_${version}_linux_x86_64"
+stage_name="git-grove_${version}_linux_${arch}"
 archive_name="$stage_name.tar.gz"
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/git-grove-release.XXXXXX")
 trap 'rm -rf -- "$tmp_dir"' EXIT
@@ -61,8 +70,5 @@ LC_ALL=C tar \
 
 install -d -m 0755 "$destination"
 install -m 0644 "$tmp_dir/$archive_name" "$destination/$archive_name"
-(
-  cd -- "$destination"
-  sha256sum "$archive_name" >SHA256SUMS.tmp
-  mv -f -- SHA256SUMS.tmp SHA256SUMS
-)
+# Checksums are computed once over every target's archive by the publish job.
+printf '%s\n' "$destination/$archive_name"
