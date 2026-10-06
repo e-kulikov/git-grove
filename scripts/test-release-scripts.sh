@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tests for the release helper scripts; needs only bash, git, tar and gzip.
+# Tests for the release and commit-hygiene scripts; needs bash, git, tar, gzip and committed.
 set -euo pipefail
 
 repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -53,14 +53,39 @@ grep -q '2023-11-14' <<<"$verbose" || fail "timestamps are not pinned"
 aarch=$("$repo/scripts/package-release.sh" 1.2.3 aarch64-unknown-linux-musl "$temp/git-grove" "$temp/out4")
 [[ $(basename "$aarch") == git-grove_1.2.3_linux_aarch64.tar.gz ]] || fail "aarch64 name"
 
-# --- check-conventional-commits.sh in a scratch repository
+# --- check-commit-range.sh and committed.toml, in a scratch repository
 git init -q "$temp/repo"
 git -C "$temp/repo" config user.email t@example.invalid
 git -C "$temp/repo" config user.name T
-git -C "$temp/repo" commit -q --allow-empty -m "chore: start"
-git -C "$temp/repo" commit -q --allow-empty -m "feat(publish)!: breaking change"
-(cd "$temp/repo" && "$repo/scripts/check-conventional-commits.sh" HEAD) || fail "valid subjects rejected"
-git -C "$temp/repo" commit -q --allow-empty -m "Fix the thing"
-(cd "$temp/repo" && "$repo/scripts/check-conventional-commits.sh" HEAD 2>/dev/null) && fail "invalid subject accepted"
+cp "$repo/committed.toml" "$temp/repo/committed.toml"
+commit() { git -C "$temp/repo" commit -q --allow-empty -m "$1"; }
+check() { (cd "$temp/repo" && "$repo/scripts/check-commit-range.sh" "$1"); }
+commit "chore: start"
+commit "feat(publish)!: breaking change"
+commit "ci: lowercase subjects longer than fifty characters are this repository's style"
+commit "revert: undo a change"
+check HEAD || fail "valid subjects rejected"
+git -C "$temp/repo" checkout -q -b side
+commit "fix: on a side branch"
+git -C "$temp/repo" checkout -q -
+git -C "$temp/repo" merge -q --no-ff -m "Merge branch 'side'" side
+check HEAD || fail "merge commit was judged"
+commit "Fix the thing"
+check HEAD 2>/dev/null && fail "unconventional subject accepted"
+git -C "$temp/repo" reset -q --hard HEAD~1
+commit "wip: half done"
+check HEAD 2>/dev/null && fail "unknown type accepted"
+git -C "$temp/repo" reset -q --hard HEAD~1
+
+# --- install-git-hooks.sh and the commit-msg hook
+hooks="$temp/repo/.git/hooks"
+(cd "$temp/repo" && "$repo/scripts/install-git-hooks.sh" >/dev/null) || fail "hook install"
+cmp "$repo/scripts/git-hooks/commit-msg" "$hooks/commit-msg" || fail "installed hook differs"
+(cd "$temp/repo" && "$repo/scripts/install-git-hooks.sh" >/dev/null) || fail "hook reinstall is not idempotent"
+git -C "$temp/repo" commit -q --allow-empty -m "feat: accepted by the hook" || fail "hook rejected a good message"
+git -C "$temp/repo" commit -q --allow-empty -m "Not conventional" 2>/dev/null && fail "hook accepted a bad message"
+printf '#!/bin/sh\nexit 0\n' >"$hooks/commit-msg"
+(cd "$temp/repo" && "$repo/scripts/install-git-hooks.sh" 2>/dev/null) && fail "foreign hook overwritten"
+grep -q 'exit 0' "$hooks/commit-msg" || fail "foreign hook was modified"
 
 echo "release script tests passed"

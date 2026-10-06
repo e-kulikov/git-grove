@@ -1,0 +1,12 @@
+# Conventional Commits, as read by release-please (see README, "Commit messages").
+# `committed` defaults to style = "none" and to a capitalised, 50-column subject,
+# neither of which matches this repository's history, so they are overridden here.
+style = "conventional"
+allowed_types = ["feat", "fix", "docs", "refactor", "test", "build", "ci", "chore", "perf", "style", "revert"]
+subject_capitalized = false
+subject_length = 150
+line_length = 120
+# The imperative-mood check is a heuristic with false positives; it is not part of the spec.
+imperative_subject = false
+# Pull requests are merged with merge commits, which are allowed (and not style-checked).
+merge_commit = true

@@ -415,7 +415,8 @@ mise install
 mise exec -- cargo fmt --all -- --check
 mise exec -- cargo test --all-targets --locked
 mise exec -- cargo clippy --all-targets --locked -- -D warnings
-bash -n scripts/*.sh && shellcheck scripts/*.sh
+bash -n scripts/*.sh scripts/git-hooks/commit-msg
+shellcheck scripts/*.sh scripts/git-hooks/commit-msg
 scripts/test-release-scripts.sh
 mise exec -- cargo build --release --locked --target x86_64-unknown-linux-musl
 scripts/package-release.sh 0.6.0 x86_64-unknown-linux-musl \
@@ -427,8 +428,21 @@ scripts/package-release.sh 0.6.0 x86_64-unknown-linux-musl \
 Commit subjects must follow [Conventional Commits](https://www.conventionalcommits.org/)
 (`feat:`, `fix:`, `docs:`, `chore:`, and so on; `!` or a `BREAKING CHANGE:`
 footer marks a breaking change). release-please reads them to choose the next
-version and write the changelog, and pull requests are checked with
-`scripts/check-conventional-commits.sh`. Merge commits are exempt.
+version and write the changelog. The rules are in `committed.toml` and are
+enforced by [committed](https://github.com/crate-ci/committed): pull requests
+are checked in CI, and merge commits are exempt.
+
+To catch a bad message before the commit is made, install the `commit-msg` hook
+once per clone:
+
+```sh
+mise install                     # provides committed (pinned in mise.toml)
+scripts/install-git-hooks.sh
+```
+
+The installer writes to the repository's shared hooks directory
+(`git rev-parse --git-common-dir`), so in a git-grove it covers every worktree.
+It is safe to re-run and refuses to overwrite a different `commit-msg` hook.
 
 ### Releases
 

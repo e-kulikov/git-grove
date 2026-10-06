@@ -21,21 +21,27 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install committed
+        uses: jdx/mise-action@v5
+        with:
+          install_args: aqua:crate-ci/committed
+
       - name: Check and test the release scripts
         shell: bash
         run: |
           set -euo pipefail
-          bash -n scripts/*.sh
-          shellcheck scripts/*.sh
+          bash -n scripts/*.sh scripts/git-hooks/commit-msg
+          shellcheck scripts/*.sh scripts/git-hooks/commit-msg
           scripts/test-release-scripts.sh
 
-      # release-please derives the version bump and changelog from commit subjects.
+      # release-please derives the version bump and changelog from commit subjects;
+      # the rules live in committed.toml.
       - name: Check commit messages
         if: github.event_name == 'pull_request'
         shell: bash
         run: |
           set -euo pipefail
-          scripts/check-conventional-commits.sh "origin/${{ github.base_ref }}..HEAD"
+          scripts/check-commit-range.sh "origin/${{ github.base_ref }}..HEAD"
 
   fmt:
     name: fmt
