@@ -64,6 +64,50 @@ pub fn run(runner: &dyn GitRunner, grove: &Grove, mode: AddMode) -> Result<PathB
     }
 }
 
+/// Configure, in the worktree `run` just created at `path`, the agent hooks
+/// the grove's own policy records — the same checks and the same two writes
+/// `git grove setup --agent` performs, so a tracked collision is refused
+/// here too and every file written is excluded from `git status`.
+///
+/// Provisioning is opt-in and, for anyone who has never run
+/// `git grove setup`, invisible: a grove that records no agent makes this
+/// one `git config --get-all` read and nothing else.
+///
+/// It never fails worktree creation, and returns nothing to fail with. The
+/// checkout already exists by the time this runs, and a worktree with no
+/// hook config is still a usable worktree — just an unprotected one, which
+/// is said out loud on stderr rather than hidden behind a nonzero exit.
+///
+/// `executable` is the canonicalized absolute path to this binary. Pass
+/// `None`, with `unresolved` naming the reason, when the caller could not
+/// resolve it: a binary that cannot name itself cannot write a hook command
+/// that would run, and that is a warning, not a reason to refuse a
+/// worktree.
+pub fn provision_hooks(
+    runner: &dyn GitRunner,
+    grove: &Grove,
+    path: &Path,
+    executable: Option<&str>,
+    unresolved: Option<&str>,
+) {
+    let Some(executable) = executable else {
+        if let Some(reason) = unresolved {
+            eprintln!(
+                "git-grove: warning: {reason}; configured no agent hooks in {}",
+                escaped(path.as_os_str().as_bytes())
+            );
+        }
+        return;
+    };
+    let provisioned = crate::commands::setup::provision(runner, grove, path, executable);
+    for line in provisioned.configured {
+        println!("{line}");
+    }
+    for warning in provisioned.warnings {
+        eprintln!("git-grove: warning: {warning}");
+    }
+}
+
 fn detached(
     runner: &dyn GitRunner,
     grove: &Grove,
@@ -445,6 +489,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn provisioning_an_unresolvable_executable_writes_nothing() {
+        let (root, grove) = grove();
+        let worktree = root.path().join("topic");
+        std::fs::create_dir(&worktree).unwrap();
+        let fake = RecordingFake::new();
+        provision_hooks(&fake, &grove, &worktree, None, Some("cannot resolve"));
+        assert!(fake.calls().is_empty(), "the policy is never even read");
+        assert!(!worktree.join(".claude").exists());
+    }
+
+    #[test]
+    fn provisioning_an_empty_policy_writes_nothing() {
+        let (root, grove) = grove();
+        let worktree = root.path().join("topic");
+        std::fs::create_dir(&worktree).unwrap();
+        let fake = RecordingFake::new();
+        fake.push_response(output(1, b""));
+        provision_hooks(&fake, &grove, &worktree, Some("/abs/git-grove"), None);
+        assert_eq!(fake.calls().len(), 1, "one --get-all read and nothing more");
+        assert!(!worktree.join(".claude").exists());
+        assert!(!worktree.join(".codex").exists());
+    }
+
+    #[test]
+    fn provisioning_a_recorded_policy_configures_the_new_worktree() {
+        let (root, grove) = grove();
+        std::fs::create_dir_all(grove.bare_dir().join("info")).unwrap();
+        let worktree = root.path().join("topic");
+        std::fs::create_dir(&worktree).unwrap();
+        let fake = RecordingFake::new();
+        fake.push_response(output(0, b"codex\0"));
+        fake.push_response(output(1, b""));
+        provision_hooks(&fake, &grove, &worktree, Some("/abs/git-grove"), None);
+        assert!(worktree.join(".codex/config.toml").is_file());
+        assert!(!worktree.join(".claude").exists());
     }
 
     #[test]

@@ -1,8 +1,6 @@
 use crate::error::{GroveError, Result};
-use crate::fsx;
 use crate::fsx::held::{open_directory_at, FileIdentity as DirectoryIdentity, HeldDirectory};
 use crate::git::runner::{GitOutput, GitRunner, Invocation};
-use crate::grove::agents_md::{self, Facts};
 use crate::grove::discover::Grove;
 use crate::grove::layout;
 use crate::grove::metadata::{self, Metadata, PublishState, FORMAT_VERSION};
@@ -385,37 +383,6 @@ fn run_transaction(
         },
     )?;
 
-    let facts = Facts {
-        remote: None,
-        default_branch: actual_branch.clone(),
-        published: false,
-        narrowed: false,
-    };
-    let agents = root.anchored_path.join("AGENTS.md");
-    root.validate()?;
-    bare.validate()?;
-    let created = fsx::write_atomic_if_absent(&agents, agents_md::render(&facts).as_bytes())?;
-    if !created {
-        return Err(state_conflict(
-            format!(
-                "{} already exists",
-                escaped_path(&root.named_path.join("AGENTS.md"))
-            ),
-            "the existing entry was preserved",
-        ));
-    }
-
-    let claude = root.anchored_path.join("CLAUDE.md");
-    let created = fsx::symlink_relative_if_absent(&claude, "AGENTS.md")?;
-    if !created {
-        return Err(state_conflict(
-            format!(
-                "{} already exists",
-                escaped_path(&root.named_path.join("CLAUDE.md"))
-            ),
-            "the existing entry was preserved",
-        ));
-    }
     root.validate()?;
     bare.validate()?;
 

@@ -9,7 +9,7 @@ fn reports_its_version() {
         .grove(&["--version"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("git-grove 0.5.0"));
+        .stdout(predicates::str::contains("git-grove 0.6.0"));
 }
 
 #[test]
@@ -86,7 +86,9 @@ fn tend_dispatches_identically_to_sync() {
 #[test]
 fn emits_all_lifecycle_commands_and_public_aliases_in_runtime_completion() {
     let sandbox = Sandbox::new();
-    for shell in ["zsh", "bash", "fish"] {
+    // fish renders a long flag as `-l skill`, not the literal token `--skill`
+    // bash/zsh both use; assert the flag name itself, present in all three.
+    for (shell, skill_flag) in [("zsh", "--skill"), ("bash", "--skill"), ("fish", "skill")] {
         sandbox
             .grove(&["completion", shell])
             .assert()
@@ -96,7 +98,8 @@ fn emits_all_lifecycle_commands_and_public_aliases_in_runtime_completion() {
             .stdout(predicates::str::contains("adopt"))
             .stdout(predicates::str::contains("transplant").not())
             .stdout(predicates::str::contains("publish"))
-            .stdout(predicates::str::contains("propagate"));
+            .stdout(predicates::str::contains("propagate"))
+            .stdout(predicates::str::contains(skill_flag));
     }
 }
 

@@ -3,7 +3,6 @@ use super::AdoptArgs;
 use crate::error::{GroveError, Result};
 use crate::fsx::held::{FileSystem, HeldDirectory, RealFileSystem, ValidatedRelativePath};
 use crate::git::runner::{GitOutput, GitRunner, Invocation};
-use crate::grove::agents_md::{self, Facts};
 use crate::grove::discover::Grove;
 use crate::grove::layout;
 use crate::grove::metadata::{self, Metadata, PublishState, FORMAT_VERSION};
@@ -16,7 +15,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-const PHASES: usize = 9;
+const PHASES: usize = 8;
 
 pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
     let plan = preflight::plan(runner, args, cwd)?;
@@ -57,13 +56,11 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
             "the predicted payload administrative directory already exists",
         ));
     }
-    let guide = guide(&plan);
     let immutable = immutable_plan(
         &plan,
         &payload_relative,
         default_relative.as_deref(),
         &payload_pointer,
-        &guide,
     )?;
     let mut journal = Journal {
         schema: JOURNAL_SCHEMA,
@@ -99,7 +96,6 @@ pub fn run(runner: &dyn GitRunner, args: &AdoptArgs, cwd: &Path) -> Result<()> {
         &payload_relative,
         default_relative.as_deref(),
         &payload_pointer,
-        &guide,
     );
     if let Err(error) = result {
         if !transaction.path().exists() {
@@ -148,7 +144,6 @@ pub(super) fn resume(
                 .map(raw_path)
                 .transpose()?;
             let pointer = payload_pointer(recovered.root.path(), &payload)?;
-            let guide = recovered.journal.plan.generated.guide.bytes.decode();
             let result = execute(
                 runner,
                 &recovered.root,
@@ -158,7 +153,6 @@ pub(super) fn resume(
                 &payload,
                 default.as_deref(),
                 &pointer,
-                &guide,
             );
             if let Err(error) = &result {
                 reconcile_after_signal(error, &recovered.transaction, &recovered.journal)?;
@@ -316,8 +310,7 @@ fn phase_is_before(
             Some(path) => Ok(!path_exists(&root.join(raw_path(path)?))?),
             None => Ok(true),
         },
-        7 => Ok(!path_exists(&root.join("AGENTS.md"))? && !path_exists(&root.join("CLAUDE.md"))?),
-        8 => {
+        7 => {
             if !path_exists(&admin.join("locked"))? {
                 return Ok(false);
             }
@@ -373,9 +366,7 @@ fn phase_is_after(
             Some(path) => Ok(path_exists(&root.join(raw_path(path)?).join(".git"))?),
             None => Ok(true),
         },
-        7 => Ok(std::fs::read(root.join("AGENTS.md")).ok().as_deref()
-            == Some(plan.generated.guide.bytes.decode().as_slice())),
-        8 => {
+        7 => {
             if path_exists(&admin.join("locked"))? {
                 return Ok(false);
             }
@@ -410,8 +401,7 @@ fn reverse_phase(
     let pointer = payload_pointer(root, &payload_relative)?;
     let admin = pointer_admin(&pointer)?;
     match index {
-        8 => relock_generated_worktrees(runner, plan, root, &bare),
-        7 => remove_generated_guide(plan, root),
+        7 => relock_generated_worktrees(runner, plan, root, &bare),
         6 => remove_default_worktree(runner, plan, root, &bare),
         5 => restore_private_state(runner, plan, &bare, &admin),
         4 => stage_installed_payload(plan, root, transaction, &payload, &staging),
@@ -443,28 +433,6 @@ fn relock_generated_worktrees(
         lock_if_unlocked(runner, bare, &root.join(raw_path(default)?), &reason)?;
     }
     Ok(())
-}
-
-fn remove_generated_guide(plan: &ImmutablePlan, root: &Path) -> Result<()> {
-    let agents = root.join("AGENTS.md");
-    if std::fs::read(&agents).map_err(|error| {
-        GroveError::needs_decision(format!("cannot verify generated AGENTS.md: {error}"))
-    })? != plan.generated.guide.bytes.decode()
-    {
-        return Err(GroveError::needs_decision(
-            "generated AGENTS.md was modified; refusing rollback",
-        ));
-    }
-    let claude = root.join("CLAUDE.md");
-    if std::fs::read_link(&claude).ok().as_deref() != Some(Path::new("AGENTS.md")) {
-        return Err(GroveError::needs_decision(
-            "generated CLAUDE.md link was modified; refusing rollback",
-        ));
-    }
-    std::fs::remove_file(&claude)
-        .and_then(|_| std::fs::remove_file(&agents))
-        .map_err(|error| GroveError::failure(format!("cannot remove generated guide: {error}")))?;
-    sync_dir(root)
 }
 
 fn remove_default_worktree(
@@ -781,7 +749,6 @@ fn execute(
     payload_relative: &Path,
     default_relative: Option<&Path>,
     predicted_pointer: &[u8],
-    guide: &[u8],
 ) -> Result<()> {
     let immutable = journal.plan.clone();
     let plan = &immutable;
@@ -861,17 +828,13 @@ fn execute(
     }
 
     if pending(journal, 7) {
-        install_metadata(runner, plan, root, guide)?;
-        finish_phase(journal, 7, transaction, checkpoints)?;
-    }
-
-    if pending(journal, 8) {
+        install_metadata(runner, plan, root)?;
         verify_payload_snapshots(runner, plan, &payload_path)?;
         unlock_if_locked(runner, &bare, &payload_path)?;
         if let Some(default) = default_relative {
             unlock_if_locked(runner, &bare, &root.join(default))?;
         }
-        finish_phase(journal, 8, transaction, checkpoints)?;
+        finish_phase(journal, 7, transaction, checkpoints)?;
     }
     let mut committed = journal.clone();
     committed.generation += 1;
@@ -887,7 +850,6 @@ fn immutable_plan(
     payload: &Path,
     default: Option<&Path>,
     pointer: &[u8],
-    guide: &[u8],
 ) -> Result<ImmutablePlan> {
     let root_mount = plan.root.original_identity().mount_id;
     let pointer_path = payload.join(".git");
@@ -896,11 +858,6 @@ fn immutable_plan(
             path: ValidatedBytePath::new(&pointer_path)?,
         },
         identity: created_file(pointer, 0o644, root_mount),
-    };
-    let guide = ContentProof {
-        bytes: RawBytes::from_bytes(guide),
-        sha256: sha256(guide),
-        mode: 0o644,
     };
     let mut worktrees = vec![WorktreeProof {
         path: RawBytes::from_bytes(plan.root.path().join(payload).as_os_str().as_bytes()),
@@ -925,7 +882,6 @@ fn immutable_plan(
         generated: GeneratedEvidence {
             payload_pointer: pointer_proof.clone(),
             default_pointer: None,
-            guide: guide.clone(),
         },
         expected_final: FinalEvidence {
             worktrees,
@@ -948,7 +904,6 @@ fn immutable_plan(
                 .collect(),
             pointer_files: vec![pointer_proof],
             metadata: Vec::new(),
-            guide,
         },
     })
 }
@@ -1281,12 +1236,7 @@ fn install_default_worktree(
     Ok(())
 }
 
-fn install_metadata(
-    runner: &dyn GitRunner,
-    plan: &ImmutablePlan,
-    root: &Path,
-    guide: &[u8],
-) -> Result<()> {
+fn install_metadata(runner: &dyn GitRunner, plan: &ImmutablePlan, root: &Path) -> Result<()> {
     let grove = Grove {
         root: root.to_path_buf(),
     };
@@ -1313,18 +1263,7 @@ fn install_metadata(
             publish_owner: None,
             publish_name: None,
         },
-    )?;
-    if crate::fsx::write_atomic_if_absent(&root.join("AGENTS.md"), guide)? {
-        // The helper durably installed the planned bytes.
-    } else if std::fs::read(root.join("AGENTS.md")).map_err(|error| {
-        GroveError::failure(format!("cannot verify generated AGENTS.md: {error}"))
-    })? != guide
-    {
-        return Err(GroveError::needs_decision(
-            "the generated AGENTS.md was changed during adoption",
-        ));
-    }
-    crate::fsx::symlink_relative(&root.join("CLAUDE.md"), "AGENTS.md")
+    )
 }
 
 fn payload_top_level(plan: &ImmutablePlan) -> Result<Vec<OsString>> {
@@ -1485,20 +1424,6 @@ fn pointer_admin(pointer: &[u8]) -> Result<PathBuf> {
         .and_then(|bytes| bytes.strip_suffix(b"\n"))
         .ok_or_else(|| GroveError::needs_decision("Git generated a malformed payload pointer"))?;
     Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
-}
-
-fn guide(plan: &AdoptPlan) -> Vec<u8> {
-    agents_md::render(&Facts {
-        remote: plan
-            .decisions
-            .selected_remote
-            .as_ref()
-            .map(|value| BString::from(value.decode())),
-        default_branch: BString::from(plan.decisions.default_branch.decode()),
-        published: plan.decisions.selected_remote.is_some(),
-        narrowed: false,
-    })
-    .into_bytes()
 }
 
 fn raw_path(raw: &RawBytes) -> Result<PathBuf> {
