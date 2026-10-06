@@ -311,8 +311,8 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
 
     let first = temp.path().join("first");
     let second = temp.path().join("second");
-    run_packager(&binary, &first);
-    run_packager(&binary, &second);
+    run_packager(&binary, "x86_64-unknown-linux-musl", &first);
+    run_packager(&binary, "x86_64-unknown-linux-musl", &second);
 
     let archive_name = "git-grove_0.6.0_linux_x86_64.tar.gz";
     assert_eq!(
@@ -321,15 +321,9 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
         "same inputs must produce byte-identical archives"
     );
 
-    let checksum = Command::new("sha256sum")
-        .args(["-c", "SHA256SUMS"])
-        .current_dir(&first)
-        .output()
-        .unwrap();
     assert!(
-        checksum.status.success(),
-        "{}",
-        String::from_utf8_lossy(&checksum.stderr)
+        !first.join("SHA256SUMS").exists(),
+        "checksums are written once by the publish job, not per archive"
     );
 
     let listing = Command::new("tar")
@@ -386,11 +380,41 @@ fn release_package_is_deterministic_and_has_the_install_contract() {
     );
 }
 
-fn run_packager(binary: &Path, destination: &Path) {
+#[test]
+fn release_package_names_each_target_and_rejects_unknown_ones() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = temp.path().join("git-grove");
+    fs::write(
+        &binary,
+        "#!/usr/bin/env bash\nset -euo pipefail\nprintf 'completion:%s\\n' \"$2\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let aarch64 = temp.path().join("aarch64");
+    run_packager(&binary, "aarch64-unknown-linux-musl", &aarch64);
+    assert!(aarch64
+        .join("git-grove_0.6.0_linux_aarch64.tar.gz")
+        .is_file());
+
+    let rejected = Command::new(repo_root().join("scripts/package-release.sh"))
+        .args([
+            "0.6.0",
+            "riscv64-unknown-linux-musl",
+            binary.to_str().unwrap(),
+            temp.path().join("riscv").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success(), "accepted an unsupported target");
+}
+
+fn run_packager(binary: &Path, target: &str, destination: &Path) {
     let output = Command::new(repo_root().join("scripts/package-release.sh"))
         .env("SOURCE_DATE_EPOCH", "946684800")
         .args([
             "0.6.0",
+            target,
             binary.to_str().unwrap(),
             destination.to_str().unwrap(),
         ])

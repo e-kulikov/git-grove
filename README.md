@@ -28,19 +28,22 @@ For declarative mise configuration:
 
 ```toml
 [tools]
-"github:e-kulikov/git-grove" = { version = "0.6.0", asset_pattern = "git-grove_{{ version }}_linux_x86_64.tar.gz", strip_components = 1 }
+"github:e-kulikov/git-grove" = { version = "0.6.0", strip_components = 1 }
 ```
 
-The GitHub backend can install this only after the `v0.6.0` release and its
-assets have been published. The release workflow produces an attestation and
-`SHA256SUMS`; mise can lock the published checksum with `mise lock`.
+Each release publishes a static archive for `x86_64` and `aarch64` Linux; mise
+picks the one matching the host. The release workflow produces an attestation
+and a single `SHA256SUMS` covering both archives; mise can lock the published
+checksum with `mise lock`.
 
-For a direct installation, download
-`git-grove_0.6.0_linux_x86_64.tar.gz` and `SHA256SUMS` from the GitHub Release,
-verify the archive, then install its binary:
+For a direct installation, download the archive for your architecture
+(`git-grove_<version>_linux_x86_64.tar.gz` or
+`git-grove_<version>_linux_aarch64.tar.gz`; releases up to 0.5.0 are x86_64 only)
+and `SHA256SUMS` from the GitHub Release, verify the archive, then install its
+binary:
 
 ```sh
-sha256sum --check SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf git-grove_0.6.0_linux_x86_64.tar.gz
 install -m 0755 git-grove_0.6.0_linux_x86_64/git-grove ~/.local/bin/git-grove
 ```
@@ -412,11 +415,60 @@ mise install
 mise exec -- cargo fmt --all -- --check
 mise exec -- cargo test --all-targets --locked
 mise exec -- cargo clippy --all-targets --locked -- -D warnings
+bash -n scripts/*.sh scripts/git-hooks/commit-msg
+shellcheck scripts/*.sh scripts/git-hooks/commit-msg
+scripts/test-release-scripts.sh
 mise exec -- cargo build --release --locked --target x86_64-unknown-linux-musl
-scripts/package-release.sh 0.6.0 \
+scripts/package-release.sh 0.6.0 x86_64-unknown-linux-musl \
   target/x86_64-unknown-linux-musl/release/git-grove dist
 ```
 
-Release tags must be strict `vX.Y.Z` and match the package version exactly.
-For 0.6.0 the uploaded files are
-`git-grove_0.6.0_linux_x86_64.tar.gz` and `SHA256SUMS`.
+### Commit messages
+
+Commit subjects must follow [Conventional Commits](https://www.conventionalcommits.org/)
+(`feat:`, `fix:`, `docs:`, `chore:`, and so on; `!` or a `BREAKING CHANGE:`
+footer marks a breaking change). release-please reads them to choose the next
+version and write the changelog. The rules are in `committed.toml` and are
+enforced by [committed](https://github.com/crate-ci/committed): pull requests
+are checked in CI, and merge commits are exempt.
+
+To catch a bad message before the commit is made, install the `commit-msg` hook
+once per clone:
+
+```sh
+mise install                     # provides committed (pinned in mise.toml)
+scripts/install-git-hooks.sh
+```
+
+The installer writes to the repository's shared hooks directory
+(`git rev-parse --git-common-dir`), so in a git-grove it covers every worktree.
+It is safe to re-run and refuses to overwrite a different `commit-msg` hook.
+
+### Releases
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please);
+nobody tags by hand.
+
+1. Merges to `main` are tracked by release-please, which keeps a release pull
+   request open with the next version and changelog (`release-please-config.json`,
+   `.release-please-manifest.json`). While the version is below 1.0.0, `feat`
+   bumps the minor version and `fix` the patch version.
+2. Merging that release pull request creates the `vX.Y.Z` tag and a draft
+   GitHub Release.
+3. The `release` workflow then verifies the tagged commit and builds a static
+   musl binary for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`,
+   each on a runner of its own architecture. Each packaged binary is smoke-tested
+   natively (completions, `adopt`, `sync`, `publish`) before anything is published.
+4. The `publish` job writes one `SHA256SUMS` over both archives, attests build
+   provenance, uploads the assets to the draft release, verifies the upload,
+   and publishes it.
+5. Finally the `stable` branch is fast-forwarded to the released commit. It only
+   ever moves forward: if `stable` is not an ancestor of the new tag, the job
+   fails instead of moving it.
+
+The workflow needs a `RELEASE_PLEASE_TOKEN` repository secret so the release
+pull request and tag trigger further workflow runs. If a release build fails
+after the draft was created, re-run the `release` workflow manually
+(`workflow_dispatch`) with the draft's tag to rebuild and publish it. The
+files uploaded for each release are `git-grove_<version>_linux_x86_64.tar.gz`,
+`git-grove_<version>_linux_aarch64.tar.gz` and `SHA256SUMS`.

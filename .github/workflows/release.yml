@@ -2,41 +2,79 @@ name: release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to build and publish again (recovery)
+        required: false
+        type: string
 
 permissions: {}
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  release-please:
+    name: Release PR and draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ inputs.tag || steps.rp.outputs.tag_name }}
+      publish: ${{ inputs.tag != '' || steps.rp.outputs.release_created == 'true' }}
+    steps:
+      - id: rp
+        uses: googleapis/release-please-action@v5
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
   verify:
-    name: Verify
+    name: Verify the release
+    needs: release-please
+    if: needs.release-please.outputs.publish == 'true'
     uses: ./.github/workflows/verify.yml
     permissions:
       contents: read
 
-  release:
-    name: Verify and publish static Linux release
-    needs: verify
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [release-please, verify]
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
-      artifact-metadata: write
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            arch: aarch64
     env:
       CARGO_TERM_COLOR: always
       BUILD_TOOLCHAIN: "1.97.1"
-      TARGET: x86_64-unknown-linux-musl
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ needs.release-please.outputs.tag }}
     steps:
       - name: Check out the release tag
         uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
 
       - name: Validate tag and package version
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          version=$(scripts/validate-release-version.sh "$GITHUB_REF_NAME" Cargo.toml)
+          version=$(scripts/validate-release-version.sh "$TAG" Cargo.toml)
           printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
 
       - name: Install Git and build prerequisites
@@ -74,7 +112,7 @@ jobs:
           "$binary" --version
           "$binary" --help >/dev/null
 
-      - name: Build deterministic archive and checksum
+      - name: Build deterministic archive
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -85,21 +123,21 @@ jobs:
           export SOURCE_DATE_EPOCH
           scripts/package-release.sh \
             "$VERSION" \
+            "$TARGET" \
             "target/$TARGET/release/git-grove" \
             dist
 
+      # Each target builds on a runner of its own architecture, so the packaged
+      # binary is executed natively below for both x86_64 and aarch64.
       - name: Verify packaged installation contract
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          stage="git-grove_${VERSION}_linux_x86_64"
+          stage="git-grove_${VERSION}_linux_${ARCH}"
           archive="$stage.tar.gz"
-          (
-            cd dist
-            sha256sum --check SHA256SUMS
-          )
           temp=$(mktemp -d)
           trap 'rm -rf -- "$temp"' EXIT
           tar -xzf "dist/$archive" -C "$temp"
@@ -217,26 +255,85 @@ jobs:
             exit 1
           fi
 
-      - name: Attest release files
-        uses: actions/attest@v4
+      - name: Upload the archive
+        uses: actions/upload-artifact@v7
         with:
-          subject-path: "dist/*"
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
 
-      - name: Create GitHub Release
+  publish:
+    name: Publish the release
+    needs: [release-please, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      TAG: ${{ needs.release-please.outputs.tag }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+
+      - name: Download every target's archive
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists; refusing to overwrite it" >&2
+          sha256sum ./*.tar.gz | sed 's# \./# #' >SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Attest release files
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Upload the assets to the draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+
+      - name: Verify the uploaded assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir verify
+          gh release download "$TAG" --dir verify
+          (cd verify && sha256sum --check SHA256SUMS)
+          archives=(verify/*.tar.gz)
+          test "${#archives[@]}" -eq 2
+
+      - name: Publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --latest
+
+      - name: Fast-forward stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=$(git rev-list -n1 "$TAG")
+          git fetch origin stable || true
+          if git rev-parse --verify --quiet origin/stable >/dev/null &&
+            ! git merge-base --is-ancestor origin/stable "$sha"; then
+            echo "stable is not an ancestor of $TAG; refusing to move it" >&2
             exit 1
           fi
-          gh release create "$GITHUB_REF_NAME" \
-            "dist/git-grove_${VERSION}_linux_x86_64.tar.gz" \
-            dist/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "git-grove $VERSION" \
-            --generate-notes
+          git push origin "$sha:refs/heads/stable"
