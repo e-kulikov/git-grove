@@ -38,6 +38,10 @@ jobs:
     needs: release-please
     if: needs.release-please.outputs.publish == 'true'
     uses: ./.github/workflows/verify.yml
+    concurrency:
+      # Shared with pull-request.yml's "Verify" job: see the comment there.
+      group: verify-${{ github.sha }}
+      cancel-in-progress: true
     permissions:
       contents: read
 
