@@ -469,11 +469,18 @@ fn identity_from_stat(
     mount_id: u64,
     sha256: Option<[u8; 32]>,
 ) -> FileIdentity {
+    // `st_nlink` is `u64` on some targets (e.g. x86_64) and `u32` on others
+    // (e.g. aarch64). `.into()` widens on the latter and is a no-op on the
+    // former; the allow covers only that identity-conversion case, which
+    // clippy otherwise flags on whichever target happens to already be
+    // `u64`.
+    #[allow(clippy::useless_conversion)]
+    let nlink: u64 = stat.st_nlink.into();
     FileIdentity {
         dev: stat.st_dev,
         ino: stat.st_ino,
         mode: stat.st_mode,
-        nlink: stat.st_nlink,
+        nlink,
         size: stat.st_size.max(0) as u64,
         mtime: Timespec {
             seconds: stat.st_mtime,
