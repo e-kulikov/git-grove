@@ -11,9 +11,15 @@ fn repo_root() -> &'static Path {
 fn release_version_requires_a_strict_matching_tag() {
     let script = repo_root().join("scripts/validate-release-version.sh");
     let manifest = repo_root().join("Cargo.toml");
+    // The crate's actual current version, not a literal -- release-please
+    // bumps Cargo.toml on every release, and a hardcoded tag here would fail
+    // this test on every single bump instead of only when the validator
+    // itself regresses.
+    let current_version = env!("CARGO_PKG_VERSION");
+    let current_tag = format!("v{current_version}");
 
     let valid = Command::new(&script)
-        .args(["v0.6.0", manifest.to_str().unwrap()])
+        .args([&current_tag, manifest.to_str().unwrap()])
         .output()
         .expect("run version validator");
     assert!(
@@ -21,11 +27,21 @@ fn release_version_requires_a_strict_matching_tag() {
         "{}",
         String::from_utf8_lossy(&valid.stderr)
     );
-    assert_eq!(valid.stdout, b"0.6.0\n");
+    assert_eq!(valid.stdout, format!("{current_version}\n").into_bytes());
 
-    for tag in ["0.6.0", "v01.6.0", "v0.6", "v0.6.0-rc.1", "v0.5.0"] {
+    // "v0.0.0" is deliberately well-formed but wrong: unlike a literal prior
+    // version, it can never coincide with `current_version` as releases
+    // proceed, so this case keeps testing a mismatch rather than drifting
+    // into a second valid-tag assertion.
+    for tag in [
+        current_version.to_string(),
+        "v01.6.0".to_string(),
+        "v0.6".to_string(),
+        "v0.6.0-rc.1".to_string(),
+        "v0.0.0".to_string(),
+    ] {
         let invalid = Command::new(&script)
-            .args([tag, manifest.to_str().unwrap()])
+            .args([&tag, manifest.to_str().unwrap()])
             .output()
             .expect("run version validator");
         assert!(!invalid.status.success(), "accepted invalid tag {tag}");

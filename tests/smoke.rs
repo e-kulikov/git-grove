@@ -4,12 +4,15 @@ use predicates::prelude::PredicateBooleanExt;
 
 #[test]
 fn reports_its_version() {
+    // Not a literal: release-please bumps Cargo.toml on every release, and a
+    // hardcoded version here would fail this test on every single bump.
+    let expected = format!("git-grove {}", env!("CARGO_PKG_VERSION"));
     let sandbox = Sandbox::new();
     sandbox
         .grove(&["--version"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("git-grove 0.6.0"));
+        .stdout(predicates::str::contains(expected));
 }
 
 #[test]
