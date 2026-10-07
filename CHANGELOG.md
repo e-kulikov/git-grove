@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.1](https://github.com/e-kulikov/git-grove/compare/v0.6.0...v0.6.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* **fsx:** widen nlink to u64 so this builds on aarch64 ([8e4a2a6](https://github.com/e-kulikov/git-grove/commit/8e4a2a6933be4ea2c1c6823825e48103a7795859))
+* **fsx:** widen nlink to u64 so this builds on aarch64 ([2621f26](https://github.com/e-kulikov/git-grove/commit/2621f26164eb5c2262d9f81712629b769e352a8f))
+* **tests:** stop hardcoding the crate version in release/smoke tests ([#12](https://github.com/e-kulikov/git-grove/issues/12)) ([314e071](https://github.com/e-kulikov/git-grove/commit/314e0712bf8f5d197d22df2d1e0f3ef22286a49d))
+
 ## [0.6.0](https://github.com/e-kulikov/git-grove/compare/v0.5.0...v0.6.0) (2026-10-06)
 
 
