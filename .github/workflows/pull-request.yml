@@ -13,13 +13,26 @@ permissions: {}
 jobs:
   verify:
     name: Verify
+    # release-please's own PR carries nothing but the version/changelog bump
+    # release-please-action itself computed; release.yml re-verifies that
+    # exact commit under its own "Verify the release" job once the PR merges
+    # and publish is possible, so running the full suite here too is pure
+    # duplication, not an extra safety check.
     if: >-
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'),
-               github.event.pull_request.author_association)
-      || contains(github.event.pull_request.labels.*.name, 'safe-to-test')
+      !startsWith(github.event.pull_request.head.ref, 'release-please--')
+      && (contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'),
+                   github.event.pull_request.author_association)
+          || contains(github.event.pull_request.labels.*.name, 'safe-to-test'))
     uses: ./.github/workflows/verify.yml
     permissions:
       contents: read
+    concurrency:
+      # Shared with release.yml's "Verify the release" job: if the exact
+      # same commit is (or becomes, after merge) verified by both workflows
+      # while one is still running, the newer trigger wins rather than both
+      # running to completion.
+      group: verify-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: true
 
   checks:
     name: Pull request checks
@@ -30,6 +43,8 @@ jobs:
     steps:
       - name: Report a definite conclusion
         shell: bash
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
         run: |
           set -euo pipefail
           result="${{ needs.verify.result }}"
@@ -39,7 +54,11 @@ jobs:
               exit 0
               ;;
             skipped)
-              echo "verify was skipped: author association '${{ github.event.pull_request.author_association }}' is outside the trusted set (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR) and this pull request is not labelled safe-to-test"
+              if [[ "${{ startsWith(github.event.pull_request.head.ref, 'release-please--') }}" == true ]]; then
+                echo "verify was skipped: this is release-please's own branch ($HEAD_REF); release.yml verifies that commit instead, once merging makes a release possible"
+              else
+                echo "verify was skipped: author association '${{ github.event.pull_request.author_association }}' is outside the trusted set (OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR) and this pull request is not labelled safe-to-test"
+              fi
               exit 0
               ;;
             *)
